@@ -1,0 +1,35 @@
+{
+  "baseline_commit": "f1f7084b51f033ba5b2225203a0e215126d8142b",
+  "dependencies": {
+    "googletest": "a35bc7693c117a048152beeb34f6aac354b9423f",
+    "benchmark": "1a54956777ba672764db09a51960056ea042af7e"
+  },
+  "regression_files": {
+    "db/autocompact_test.cc": "5f98df105c2b66366b5a8201e2fd2ae1fb6ee7b5eb45b89f6a23f574c6e1852e",
+    "db/c_test.c": "287416b35cf186c6b44e8bf55d9c00e61e2d95cb1175e632a65d011b6344be8c",
+    "db/corruption_test.cc": "bf4a3263f2c8e23e64b17940228940275c4102ec72a782e851ddd8de71fad612",
+    "db/db_test.cc": "8252ff35d801b6a962807533f8f9a90a11e482737b9c8ea51a9db22a26058ef0",
+    "db/dbformat_test.cc": "e62eab02b1562c553f143cd749e1969098e47541eef02f306d5bb3c297f0902f",
+    "db/filename_test.cc": "bc2befd946afc0647681ec8cf51275d78f340ecd0f946423c1eace0c962a1409",
+    "db/log_test.cc": "b88e49180139a38c98b03ecb5ee34b3e9d8631145474621ba8ae03a51cfcb48b",
+    "db/recovery_test.cc": "34a3758ed368004819409723b29a85badb119f504d8369a5c4a6e1bea07bde28",
+    "db/skiplist_test.cc": "92a561696f6e57f10034c7c7bcb7b810b8ce47d2cc3c002a8d02c0a1adbd3152",
+    "db/version_edit_test.cc": "98649789468d382d04a146205389dd038abd4aa0a7d9dd64182eee7235ffa23c",
+    "db/version_set_test.cc": "dbde073fc85b99e8aef7ac20f4f48a08a7908c1f58c1847356fca04f169e1889",
+    "db/write_batch_test.cc": "4140e4467daec1a8166f69f7cf00bf3797385d5167d4467f15ee56577a5f27f7",
+    "helpers/memenv/memenv_test.cc": "301bc6b4170634cf0b33ba5ce03e9e0840bea8e8b3dabd61141e92904bc1266b",
+    "table/filter_block_test.cc": "fac8bb48fa1c89c36bd9a81e9ea23a113137a3d16491d6bb2d6a2ee2800ff05d",
+    "table/table_test.cc": "daad1e98e59af49e9df2431dd9c1e29d0f75c687912b291600dd58d76296d9e2",
+    "util/arena_test.cc": "6924d6eaa4dedc709fcc9be1bff5738326f1e74a775fbc4d96ae208e1b6a6a7d",
+    "util/bloom_test.cc": "80a2a443f884500b4365e33d2af4f94e8e056b55f3f56c71be7eaeb1c534f29b",
+    "util/cache_test.cc": "0f4ecbb63b01864c082651f5a93123bb92234d5128a134e73b28ce54a50f867e",
+    "util/coding_test.cc": "9a8938e3653108f2b46ba78933121e4b9f087a086159cd7445f10a526295aed2",
+    "util/crc32c_test.cc": "682442b65921262821d82cd8e9f22a8d5a241d68f11be889c5acacccf100548e",
+    "util/env_posix_test.cc": "57699061975e32b200e1db414b2cf8bd4a05b85461a719ac236eb6369261d24a",
+    "util/hash_test.cc": "e82833ff461a1dfcd12061e394744eee66413de5730c5ba3304c2fc6b67b7c65",
+    "util/logging_test.cc": "5ddcf28f952cd041ef8b50c29832d8c65b3d55da3466526ffe05f27e4e1dda1a",
+    "util/no_destructor_test.cc": "0f89c30b1b87b47b2a6dc56a723f280509fccac65566111a2ffc38a638cfa192",
+    "util/status_test.cc": "88e0c8b6e7d4c8cc061f13630790bba755ea144f93f7b64ebecb88c18e0f0649",
+    "util/testutil.cc": "8480532d2a7850ba9942a76f7104b10f238da3e7e24cd2ca9c639fe8a21b605f"
+  }
+}
