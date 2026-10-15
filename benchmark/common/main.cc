@@ -6,6 +6,9 @@
 #ifdef HW_METADATA
 #include "metadata/cases.h"
 #endif
+#ifdef HW_COMBINED
+#include "combined/cases.h"
+#endif
 #ifdef HW_TEACHER
 #include "hidden.h"
 #endif
@@ -17,6 +20,9 @@ int main(int argc,char** argv){
 #endif
 #ifdef HW_METADATA
   AddMetadata(cases);
+#endif
+#ifdef HW_COMBINED
+  AddCombined(cases);
 #endif
 #ifdef HW_TEACHER
   AddHidden(cases);

@@ -96,9 +96,32 @@ def summarize(records, out):
                               median_p99_us=statistics.median(x['p99_us'] for x in vals)))
     dump(out/'aggregate.json', aggregate)
 
+def select_cases(available, requested):
+    names = requested.split(',') if requested is not None else [
+        name for name in available if not name.endswith('_writer')]
+    if (not names or len(set(names)) != len(names) or
+            any(name not in available or name.endswith('_writer') for name in names)):
+        raise ValueError('Unknown, duplicate, or child-only case selected')
+    return names
+
+
+def case_variants(name, cfg, matrix, expired_percent):
+    if not matrix or not name.startswith('perf_'):
+        return [(cfg['keys'], cfg['threads'], expired_percent)]
+    sizes = sorted({max(1, cfg['keys'] // 10), cfg['keys']})
+    concurrent = name in ('perf_concurrent', 'perf_stats_under_write',
+                          'perf_combined_stats_under_write')
+    threads = sorted({1, cfg['threads']}) if concurrent else [1]
+    ttl_mix = name in ('perf_ttl_mixed', 'perf_combined_stats_under_write',
+                       'perf_combined_gc')
+    ratios = [0, 50, 100] if ttl_mix else [expired_percent]
+    return [(n, t, expiry) for n in sizes for t in threads for expiry in ratios]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--kind', choices=['ttl', 'metadata', 'baseline'], required=True)
+    ap.add_argument('--kind', choices=['combined', 'ttl', 'metadata', 'baseline'], required=True,
+                    help='combined runs both feature suites and their integration scenarios')
     ap.add_argument('--source', type=Path, required=True)
     ap.add_argument('--output', type=Path, required=True)
     ap.add_argument('--profile', choices=PROFILES, default='quick')
@@ -180,16 +203,13 @@ def main():
         if args.sanitize:
             listing_env.update(ASAN_OPTIONS='detect_leaks=0:halt_on_error=1', UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1')
         available=subprocess.check_output([binary,'--list'],text=True,env=listing_env,timeout=args.timeout).splitlines()
-        names=args.cases.split(',') if args.cases else [x for x in available if not x.endswith('_writer')]
-        if not names or any(n not in available or n.endswith('_writer') for n in names):
-            raise ValueError('Unknown case or child-only case selected')
+        names=select_cases(available,args.cases)
+        summary['available_cases']=[x for x in available if not x.endswith('_writer')]
+        summary['executed_cases']=names
+        summary['full_suite']=set(names)==set(summary['available_cases'])
+        dump(out/'summary.json',summary)
         for name in names:
-            variants=[(cfg['keys'],cfg['threads'],args.expired_percent)]
-            if args.matrix and name.startswith('perf_'):
-                sizes=sorted({max(100,cfg['keys']//10),cfg['keys']})
-                threads=sorted({1,cfg['threads']}) if name in ('perf_concurrent','perf_stats_under_write') else [1]
-                ratios=[0,50,100] if name=='perf_ttl_mixed' else [args.expired_percent]
-                variants=[(n,t,e) for n in sizes for t in threads for e in ratios]
+            variants=case_variants(name,cfg,args.matrix,args.expired_percent)
             for n,t,expiry in variants:
                 for repeat in range(cfg['repeat']):
                     label=f'{name}-n{n}-t{t}-e{expiry}-r{repeat+1}'

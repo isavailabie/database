@@ -18,6 +18,8 @@ def compare(base, candidate):
                 for x in json.loads((path/'aggregate.json').read_text())}
     bi,ci=index(base),index(candidate);rows=[]
     for key in sorted(bi.keys()&ci.keys()):
+        if not key[0].startswith('perf_'):
+            continue
         x,y=bi[key],ci[key]
         if x['repeats']!=y['repeats']:raise ValueError('Repeat counts differ')
         rate=x['median_ops_per_second']
