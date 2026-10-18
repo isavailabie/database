@@ -13,6 +13,7 @@
 #include "leveldb/db.h"
 #include "leveldb/filter_policy.h"
 #include "leveldb/slice.h"
+#include "leveldb/status.h"
 #include "leveldb/table_builder.h"
 #include "util/coding.h"
 #include "util/logging.h"
@@ -51,14 +52,40 @@ class InternalKey;
 // Value types encoded as the last component of internal keys.
 // DO NOT CHANGE THESE ENUM VALUES: they are embedded in the on-disk
 // data structures.
-enum ValueType { kTypeDeletion = 0x0, kTypeValue = 0x1 };
+enum ValueType {
+  kTypeDeletion = 0x0,
+  kTypeValue = 0x1,
+  // Only TTL values carry a fixed64 absolute deadline before the user value.
+  kTypeTTLValue = 0x2
+};
 // kValueTypeForSeek defines the ValueType that should be passed when
 // constructing a ParsedInternalKey object for seeking to a particular
 // sequence number (since we sort sequence numbers in decreasing order
 // and the value type is embedded as the low 8 bits in the sequence
 // number in internal keys, we need to use the highest-numbered
 // ValueType, not the lowest).
-static const ValueType kValueTypeForSeek = kTypeValue;
+static const ValueType kValueTypeForSeek = kTypeTTLValue;
+
+inline std::string EncodeTTLValue(const Slice& value, uint64_t expiration_micros) {
+  std::string encoded;
+  PutFixed64(&encoded, expiration_micros);
+  encoded.append(value.data(), value.size());
+  return encoded;
+}
+
+// An expired value is a deletion barrier: callers must not look for older values.
+inline Status DecodeValueForRead(ValueType type, Slice* value,
+                                 uint64_t read_time_micros) {
+  if (type == kTypeDeletion) return Status::NotFound(Slice());
+  if (type == kTypeValue) return Status::OK();
+  if (type != kTypeTTLValue || value->size() < 8) {
+    return Status::Corruption("invalid TTL value");
+  }
+  const uint64_t expiration_micros = DecodeFixed64(value->data());
+  value->remove_prefix(8);
+  return read_time_micros >= expiration_micros ? Status::NotFound(Slice())
+                                               : Status::OK();
+}
 
 typedef uint64_t SequenceNumber;
 
@@ -177,7 +204,7 @@ inline bool ParseInternalKey(const Slice& internal_key,
   result->sequence = num >> 8;
   result->type = static_cast<ValueType>(c);
   result->user_key = Slice(internal_key.data(), n - 8);
-  return (c <= static_cast<uint8_t>(kTypeValue));
+  return (c <= static_cast<uint8_t>(kTypeTTLValue));
 }
 
 // A helper class useful for DBImpl::Get()

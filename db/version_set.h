@@ -73,7 +73,7 @@ class Version {
   // return OK.  Else return a non-OK status.  Fills *stats.
   // REQUIRES: lock is not held
   Status Get(const ReadOptions&, const LookupKey& key, std::string* val,
-             GetStats* stats);
+             GetStats* stats, uint64_t read_time_micros = 0);
 
   // Adds "stats" into the current state.  Returns true if a new
   // compaction may need to be triggered, false otherwise.
@@ -238,7 +238,7 @@ class VersionSet {
   // level that overlaps the specified range.  Caller should delete
   // the result.
   Compaction* CompactRange(int level, const InternalKey* begin,
-                           const InternalKey* end);
+                           const InternalKey* end, bool rewrite = false);
 
   // Return the maximum overlapping data (in bytes) at next level for any
   // file at a level >= 1.
@@ -320,9 +320,10 @@ class Compaction {
  public:
   ~Compaction();
 
-  // Return the level that is being compacted.  Inputs from "level"
-  // and "level+1" will be merged to produce a set of "level+1" files.
+  // Normal compaction merges level() and output_level(). Same-level rewrites
+  // use only the first input set and also work for the deepest SST level.
   int level() const { return level_; }
+  int output_level() const { return output_level_; }
 
   // Return the object that holds the edits to the descriptor done
   // by this compaction.
@@ -331,7 +332,7 @@ class Compaction {
   // "which" must be either 0 or 1
   int num_input_files(int which) const { return inputs_[which].size(); }
 
-  // Return the ith input file at "level()+which" ("which" must be 0 or 1).
+  // Group 0 is at level(), group 1 at output_level() (empty for rewrites).
   FileMetaData* input(int which, int i) const { return inputs_[which][i]; }
 
   // Maximum size of files to build during this compaction.
@@ -345,8 +346,7 @@ class Compaction {
   void AddInputDeletions(VersionEdit* edit);
 
   // Returns true if the information we have available guarantees that
-  // the compaction is producing data in "level+1" for which no data exists
-  // in levels greater than "level+1".
+  // no file beyond output_level() contains data for this user key.
   bool IsBaseLevelForKey(const Slice& user_key);
 
   // Returns true iff we should stop building the current output
@@ -361,9 +361,10 @@ class Compaction {
   friend class Version;
   friend class VersionSet;
 
-  Compaction(const Options* options, int level);
+  Compaction(const Options* options, int level, bool rewrite = false);
 
   int level_;
+  int output_level_;
   uint64_t max_output_file_size_;
   Version* input_version_;
   VersionEdit edit_;

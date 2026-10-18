@@ -24,9 +24,13 @@ struct WriteOptions;
 class WriteBatch;
 
 struct Stats {
-    uint64_t total_entries = 0;   
-    uint64_t distinct_keys = 0;   
-    uint64_t seq = 0;     
+  // Internal records in mem, imm and current SSTs, including tombstones and
+  // expired TTLs until collected. WAL copies and obsolete Versions are excluded.
+  uint64_t total_entries = 0;
+  // User keys represented by these records, using the database comparator.
+  uint64_t distinct_keys = 0;
+  // Latest published database-wide sequence; compaction never advances it.
+  uint64_t seq = 0;
 };
 
 
@@ -93,6 +97,8 @@ class LEVELDB_EXPORT DB {
   // May return some other Status on an error.
   virtual Status Get(const ReadOptions& options, const Slice& key,
                      std::string* value) = 0;
+  // Return current physical record counts and their latest published sequence
+  // atomically. options.snapshot is ignored; null stats is InvalidArgument.
   virtual Status GetCurrentStats(const ReadOptions& options, Stats* stats);
 
   // Return a heap-allocated iterator over the contents of the database.
@@ -145,8 +151,11 @@ class LEVELDB_EXPORT DB {
   // Compact the underlying storage for the key range [*begin,*end].
   // In particular, deleted and overwritten versions are discarded,
   // and the data is rearranged to reduce the cost of operations
-  // needed to access the data.  This operation should typically only
-  // be invoked by users who understand the underlying implementation.
+  // needed to access the data. Expired TTL records are also reclaimed when
+  // no active snapshot needs them and no deeper old value needs their barrier.
+  // The deepest overlapping SSTs are rewritten even without a lower level.
+  // This operation should typically only be invoked by users who understand
+  // the underlying implementation.
   //
   // begin==nullptr is treated as a key before all keys in the database.
   // end==nullptr is treated as a key after all keys in the database.
@@ -154,7 +163,10 @@ class LEVELDB_EXPORT DB {
   //    db->CompactRange(nullptr, nullptr);
   virtual void CompactRange(const Slice* begin, const Slice* end) = 0;
 
-  // TODO: Implement TTL writes. The starter returns NotSupported.
+  // Store a value with a TTL in seconds, using options.env's absolute time.
+  // ttl==0 publishes an immediately expired version. Deadline overflow returns
+  // InvalidArgument without writing or advancing the sequence number.
+  // Ordinary Put values never expire.
   virtual Status Put(const WriteOptions& options, const Slice& key,
                      const Slice& value, uint64_t ttl);
 };

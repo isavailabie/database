@@ -37,6 +37,10 @@ class WriteBatchInternal {
 
   static Status InsertInto(const WriteBatch* batch, MemTable* memtable);
 
+  // Encode a TTL write once; WAL recovery reuses this absolute deadline.
+  static void PutWithExpiration(WriteBatch* batch, const Slice& key,
+                                const Slice& value, uint64_t expiration_micros);
+
   static void Append(WriteBatch* dst, const WriteBatch* src);
 };
 
