@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <set>
 #include <string>
 #include <vector>
@@ -39,6 +40,17 @@ namespace leveldb {
 
 const int kNumNonTableCacheFiles = 10;
 
+namespace {
+// Validate before WAL/mem insertion so malformed batches cannot publish a
+// prefix. Slices borrow the immutable batch until its statistics are committed.
+class BatchKeys : public WriteBatch::Handler {
+ public:
+  void Put(const Slice& key, const Slice&) override { keys.push_back(key); }
+  void Delete(const Slice& key) override { keys.push_back(key); }
+  std::vector<Slice> keys;
+};
+}  // namespace
+
 // Information kept for every waiting writer
 struct DBImpl::Writer {
   explicit Writer(port::Mutex* mu)
@@ -61,12 +73,14 @@ struct DBImpl::CompactionState {
 
   Output* current_output() { return &outputs[outputs.size() - 1]; }
 
-  explicit CompactionState(Compaction* c)
+  CompactionState(Compaction* c, const Comparator* comparator)
       : compaction(c),
         smallest_snapshot(0),
+        expiration_cutoff_micros(0),
         outfile(nullptr),
         builder(nullptr),
-        total_bytes(0) {}
+        total_bytes(0),
+        dropped_entries(UserKeyLess{comparator}) {}
 
   Compaction* const compaction;
 
@@ -75,6 +89,7 @@ struct DBImpl::CompactionState {
   // Therefore if we have seen a sequence number S <= smallest_snapshot,
   // we can drop all entries for the same key with sequence numbers < S.
   SequenceNumber smallest_snapshot;
+  uint64_t expiration_cutoff_micros;
 
   std::vector<Output> outputs;
 
@@ -83,6 +98,7 @@ struct DBImpl::CompactionState {
   TableBuilder* builder;
 
   uint64_t total_bytes;
+  KeyCounts dropped_entries;
 };
 
 // Fix user-supplied options to be reasonable
@@ -126,6 +142,7 @@ static int TableCacheSize(const Options& sanitized_options) {
 DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
     : env_(raw_options.env),
       internal_comparator_(raw_options.comparator),
+      user_comparator_name_(raw_options.comparator->Name()),
       internal_filter_policy_(raw_options.filter_policy),
       options_(SanitizeOptions(dbname, &internal_comparator_,
                                &internal_filter_policy_, raw_options)),
@@ -147,7 +164,8 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       background_compaction_scheduled_(false),
       manual_compaction_(nullptr),
       versions_(new VersionSet(dbname_, &options_, table_cache_,
-                               &internal_comparator_)) {}
+                               &internal_comparator_)),
+      key_counts_(UserKeyLess{raw_options.comparator}) {}
 
 DBImpl::~DBImpl() {
   // Wait for background work to finish.
@@ -156,6 +174,8 @@ DBImpl::~DBImpl() {
   while (background_compaction_scheduled_) {
     background_work_finished_signal_.Wait();
   }
+  // Best-effort checkpoint; a failure never changes authoritative DB state.
+  SaveStatsCache();
   mutex_.Unlock();
 
   if (db_lock_ != nullptr) {
@@ -264,6 +284,7 @@ void DBImpl::RemoveObsoleteFiles() {
         case kCurrentFile:
         case kDBLockFile:
         case kInfoLogFile:
+        case kStatsCacheFile:
           keep = true;
           break;
       }
@@ -502,8 +523,51 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
   return status;
 }
 
-Status DBImpl::GetCurrentStats(const ReadOptions& options, Stats* stats){
-  return DB::GetCurrentStats(options, stats);
+Status DBImpl::GetCurrentStats(const ReadOptions&, Stats* stats) {
+  if (stats == nullptr) return Status::InvalidArgument("null stats");
+  MutexLock lock(&mutex_);
+  stats->total_entries = total_entries_;
+  stats->distinct_keys = key_counts_.size();
+  stats->seq = versions_->LastSequence();
+  return Status::OK();
+}
+
+void DBImpl::AddStatsEntry(const Slice& key, uint64_t count) {
+  mutex_.AssertHeld();
+  auto found = key_counts_.find(key);
+  if (found == key_counts_.end()) {
+    key_counts_.emplace(key.ToString(), count);
+  } else {
+    found->second += count;
+  }
+  total_entries_ += count;
+}
+
+Status DBImpl::RebuildStats() {
+  mutex_.AssertHeld();
+  total_entries_ = 0;
+  key_counts_.clear();
+  ReadOptions read;
+  read.verify_checksums = true;
+  read.fill_cache = false;
+  std::vector<Iterator*> sources;
+  sources.push_back(mem_->NewIterator());
+  if (imm_ != nullptr) sources.push_back(imm_->NewIterator());
+  versions_->current()->AddIterators(read, &sources);
+  Status status;
+  for (Iterator* source : sources) {
+    for (source->SeekToFirst(); source->Valid(); source->Next()) {
+      ParsedInternalKey key;
+      if (!ParseInternalKey(source->key(), &key)) {
+        status = Status::Corruption("invalid internal key rebuilding stats");
+        break;
+      }
+      AddStatsEntry(key.user_key);
+    }
+    if (status.ok()) status = source->status();
+    delete source;
+  }
+  return status;
 }
 
 Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
@@ -598,17 +662,32 @@ void DBImpl::CompactRange(const Slice* begin, const Slice* end) {
   for (int level = 0; level < max_level_with_files; level++) {
     TEST_CompactRange(level, begin, end);
   }
+  // Rewrite the actual deepest overlapping files, including newly flushed
+  // tables. Normal compaction can otherwise leave those SSTs untouched forever.
+  int rewrite_level = -1;
+  {
+    MutexLock l(&mutex_);
+    for (int level = 0; level < config::kNumLevels; ++level) {
+      if (versions_->current()->OverlapInLevel(level, begin, end)) {
+        rewrite_level = level;
+      }
+    }
+  }
+  if (rewrite_level >= 0) TEST_CompactRange(rewrite_level, begin, end, true);
 }
 
 void DBImpl::TEST_CompactRange(int level, const Slice* begin,
-                               const Slice* end) {
+                               const Slice* end, bool rewrite) {
   assert(level >= 0);
-  assert(level + 1 < config::kNumLevels);
+  assert(level < config::kNumLevels);
 
   InternalKey begin_storage, end_storage;
 
   ManualCompaction manual;
   manual.level = level;
+  // L0 lookup orders files by number, not by sequence across files. Rewriting
+  // old L0 data into newer-numbered L0 files could hide concurrent newer writes.
+  manual.rewrite = level > 0 && (rewrite || level == config::kNumLevels - 1);
   manual.done = false;
   if (begin == nullptr) {
     manual.begin = nullptr;
@@ -721,8 +800,8 @@ void DBImpl::BackgroundCompaction() {
   InternalKey manual_end;
   if (is_manual) {
     ManualCompaction* m = manual_compaction_;
-    c = versions_->CompactRange(m->level, m->begin, m->end);
-    m->done = (c == nullptr);
+    c = versions_->CompactRange(m->level, m->begin, m->end, m->rewrite);
+    m->done = (c == nullptr || m->rewrite);
     if (c != nullptr) {
       manual_end = c->input(0, c->num_input_files(0) - 1)->largest;
     }
@@ -755,7 +834,7 @@ void DBImpl::BackgroundCompaction() {
         static_cast<unsigned long long>(f->file_size),
         status.ToString().c_str(), versions_->LevelSummary(&tmp));
   } else {
-    CompactionState* compact = new CompactionState(c);
+    CompactionState* compact = new CompactionState(c, user_comparator());
     status = DoCompactionWork(compact);
     if (!status.ok()) {
       RecordBackgroundError(status);
@@ -884,18 +963,30 @@ Status DBImpl::InstallCompactionResults(CompactionState* compact) {
   mutex_.AssertHeld();
   Log(options_.info_log, "Compacted %d@%d + %d@%d files => %lld bytes",
       compact->compaction->num_input_files(0), compact->compaction->level(),
-      compact->compaction->num_input_files(1), compact->compaction->level() + 1,
+      compact->compaction->num_input_files(1), compact->compaction->output_level(),
       static_cast<long long>(compact->total_bytes));
 
   // Add compaction outputs
   compact->compaction->AddInputDeletions(compact->compaction->edit());
-  const int level = compact->compaction->level();
+  const int level = compact->compaction->output_level();
   for (size_t i = 0; i < compact->outputs.size(); i++) {
     const CompactionState::Output& out = compact->outputs[i];
-    compact->compaction->edit()->AddFile(level + 1, out.number, out.file_size,
+    compact->compaction->edit()->AddFile(level, out.number, out.file_size,
                                          out.smallest, out.largest);
   }
-  return versions_->LogAndApply(compact->compaction->edit(), &mutex_);
+  const Status status =
+      versions_->LogAndApply(compact->compaction->edit(), &mutex_);
+  if (status.ok()) {
+    // Version installation and removal of its reclaimed refs are one publication.
+    for (const auto& dropped : compact->dropped_entries) {
+      auto found = key_counts_.find(dropped.first);
+      assert(found != key_counts_.end() && found->second >= dropped.second);
+      found->second -= dropped.second;
+      total_entries_ -= dropped.second;
+      if (found->second == 0) key_counts_.erase(found);
+    }
+  }
+  return status;
 }
 
 Status DBImpl::DoCompactionWork(CompactionState* compact) {
@@ -905,7 +996,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   Log(options_.info_log, "Compacting %d@%d + %d@%d files",
       compact->compaction->num_input_files(0), compact->compaction->level(),
       compact->compaction->num_input_files(1),
-      compact->compaction->level() + 1);
+      compact->compaction->output_level());
 
   assert(versions_->NumLevelFiles(compact->compaction->level()) > 0);
   assert(compact->builder == nullptr);
@@ -915,6 +1006,10 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   } else {
     compact->smallest_snapshot = snapshots_.oldest()->sequence_number();
   }
+
+  // Keep TTL records visible at any active snapshot time. Iterators and
+  // in-flight Gets pin their own immutable Version/MemTable instead.
+  compact->expiration_cutoff_micros = snapshots_.OldestReadTime(start_micros);
 
   Iterator* input = versions_->MakeInputIterator(compact->compaction);
 
@@ -970,7 +1065,10 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
       if (last_sequence_for_key <= compact->smallest_snapshot) {
         // Hidden by an newer entry for same user key
         drop = true;  // (A)
-      } else if (ikey.type == kTypeDeletion &&
+      } else if ((ikey.type == kTypeDeletion ||
+                  (ikey.type == kTypeTTLValue && input->value().size() >= 8 &&
+                   DecodeFixed64(input->value().data()) <=
+                       compact->expiration_cutoff_micros)) &&
                  ikey.sequence <= compact->smallest_snapshot &&
                  compact->compaction->IsBaseLevelForKey(ikey.user_key)) {
         // For this user key:
@@ -995,6 +1093,14 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
         (int)last_sequence_for_key, (int)compact->smallest_snapshot);
 #endif
 
+    if (drop) {
+      auto found = compact->dropped_entries.find(ikey.user_key);
+      if (found == compact->dropped_entries.end()) {
+        compact->dropped_entries.emplace(ikey.user_key.ToString(), 1);
+      } else {
+        ++found->second;
+      }
+    }
     if (!drop) {
       // Open output file if necessary
       if (compact->builder == nullptr) {
@@ -1046,10 +1152,17 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   }
 
   mutex_.Lock();
-  stats_[compact->compaction->level() + 1].Add(stats);
+  stats_[compact->compaction->output_level()].Add(stats);
 
   if (status.ok()) {
-    status = InstallCompactionResults(compact);
+    // A wall-clock rollback can create a snapshot older in time while the
+    // compaction is unlocked. Discard this output instead of breaking its view.
+    if (snapshots_.OldestReadTime(env_->NowMicros()) <
+        compact->expiration_cutoff_micros) {
+      Log(options_.info_log, "discarding compaction after TTL clock rollback");
+    } else {
+      status = InstallCompactionResults(compact);
+    }
   }
   if (!status.ok()) {
     RecordBackgroundError(status);
@@ -1085,9 +1198,16 @@ static void CleanupIteratorState(void* arg1, void* arg2) {
 
 Iterator* DBImpl::NewInternalIterator(const ReadOptions& options,
                                       SequenceNumber* latest_snapshot,
-                                      uint32_t* seed) {
+                                      uint32_t* seed,
+                                      uint64_t* read_time_micros) {
   mutex_.Lock();
   *latest_snapshot = versions_->LastSequence();
+  if (read_time_micros != nullptr) {
+    *read_time_micros = options.snapshot != nullptr
+                           ? static_cast<const SnapshotImpl*>(options.snapshot)
+                                 ->read_time_micros()
+                           : env_->NowMicros();
+  }
 
   // Collect together all needed child iterators
   std::vector<Iterator*> list;
@@ -1126,11 +1246,14 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
   Status s;
   MutexLock l(&mutex_);
   SequenceNumber snapshot;
+  uint64_t read_time_micros;
   if (options.snapshot != nullptr) {
-    snapshot =
-        static_cast<const SnapshotImpl*>(options.snapshot)->sequence_number();
+    const auto* view = static_cast<const SnapshotImpl*>(options.snapshot);
+    snapshot = view->sequence_number();
+    read_time_micros = view->read_time_micros();
   } else {
     snapshot = versions_->LastSequence();
+    read_time_micros = env_->NowMicros();
   }
 
   MemTable* mem = mem_;
@@ -1148,12 +1271,12 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
     mutex_.Unlock();
     // First look in the memtable, then in the immutable memtable (if any).
     LookupKey lkey(key, snapshot);
-    if (mem->Get(lkey, value, &s)) {
+    if (mem->Get(lkey, value, &s, read_time_micros)) {
       // Done
-    } else if (imm != nullptr && imm->Get(lkey, value, &s)) {
+    } else if (imm != nullptr && imm->Get(lkey, value, &s, read_time_micros)) {
       // Done
     } else {
-      s = current->Get(options, lkey, value, &stats);
+      s = current->Get(options, lkey, value, &stats, read_time_micros);
       have_stat_update = true;
     }
     mutex_.Lock();
@@ -1171,13 +1294,15 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
 Iterator* DBImpl::NewIterator(const ReadOptions& options) {
   SequenceNumber latest_snapshot;
   uint32_t seed;
-  Iterator* iter = NewInternalIterator(options, &latest_snapshot, &seed);
+  uint64_t read_time_micros;
+  Iterator* iter =
+      NewInternalIterator(options, &latest_snapshot, &seed, &read_time_micros);
   return NewDBIterator(this, user_comparator(), iter,
                        (options.snapshot != nullptr
                             ? static_cast<const SnapshotImpl*>(options.snapshot)
                                   ->sequence_number()
                             : latest_snapshot),
-                       seed);
+                       seed, read_time_micros);
 }
 
 void DBImpl::RecordReadSample(Slice key) {
@@ -1189,7 +1314,7 @@ void DBImpl::RecordReadSample(Slice key) {
 
 const Snapshot* DBImpl::GetSnapshot() {
   MutexLock l(&mutex_);
-  return snapshots_.New(versions_->LastSequence());
+  return snapshots_.New(versions_->LastSequence(), env_->NowMicros());
 }
 
 void DBImpl::ReleaseSnapshot(const Snapshot* snapshot) {
@@ -1200,6 +1325,21 @@ void DBImpl::ReleaseSnapshot(const Snapshot* snapshot) {
 // Convenience methods
 Status DBImpl::Put(const WriteOptions& o, const Slice& key, const Slice& val) {
   return DB::Put(o, key, val);
+}
+
+Status DBImpl::Put(const WriteOptions& options, const Slice& key,
+                   const Slice& value, uint64_t ttl) {
+  const uint64_t now = env_->NowMicros();
+  const uint64_t micros_per_second = 1000000;
+  // Check both multiplication and addition before entering the write queue.
+  // Invalid TTLs neither append to the WAL nor consume a sequence number.
+  if (ttl > (std::numeric_limits<uint64_t>::max() - now) / micros_per_second) {
+    return Status::InvalidArgument("TTL deadline overflow");
+  }
+  WriteBatch batch;
+  WriteBatchInternal::PutWithExpiration(&batch, key, value,
+                                       now + ttl * micros_per_second);
+  return Write(options, &batch);
 }
 
 Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
@@ -1234,9 +1374,15 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
     // during this phase since &w is currently responsible for logging
     // and protects against concurrent loggers and concurrent writes
     // into mem_.
+    BatchKeys batch_keys;
+    bool valid_batch = false;
     {
       mutex_.Unlock();
-      status = log_->AddRecord(WriteBatchInternal::Contents(write_batch));
+      status = write_batch->Iterate(&batch_keys);
+      valid_batch = status.ok();
+      if (status.ok()) {
+        status = log_->AddRecord(WriteBatchInternal::Contents(write_batch));
+      }
       bool sync_error = false;
       if (status.ok() && options.sync) {
         status = logfile_->Sync();
@@ -1255,9 +1401,13 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
         RecordBackgroundError(status);
       }
     }
+    // Commit the complete group and sequence under the same lock. WAL copies
+    // are not counted, and queries cannot observe a half-published batch.
+    if (status.ok()) {
+      for (const Slice& key : batch_keys.keys) AddStatsEntry(key);
+    }
+    if (valid_batch) versions_->SetLastSequence(last_sequence);
     if (write_batch == tmp_batch_) tmp_batch_->Clear();
-
-    versions_->SetLastSequence(last_sequence);
   }
 
   while (true) {
@@ -1489,10 +1639,9 @@ void DBImpl::GetApproximateSizes(const Range* range, int n, uint64_t* sizes) {
 
 // Default implementations of convenience methods that subclasses of DB
 // can call if they wish
-Status DB::GetCurrentStats(const ReadOptions& options, Stats* stats) {
-  (void)options;
-  (void)stats;
-  return Status::OK();
+Status DB::GetCurrentStats(const ReadOptions&, Stats* stats) {
+  if (stats == nullptr) return Status::InvalidArgument("null stats");
+  return Status::NotSupported("statistics are not implemented by this DB");
 }
 
 Status DB::Put(const WriteOptions& opt, const Slice& key, const Slice& value) {
@@ -1543,7 +1692,11 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
     edit.SetLogNumber(impl->logfile_number_);
     s = impl->versions_->LogAndApply(&edit, &impl->mutex_);
   }
+  // WAL recovery and its SST edit must finish before counting: only the final
+  // recovered sources own records, never the WAL copies or intermediate tables.
+  if (s.ok() && !impl->LoadStatsCache()) s = impl->RebuildStats();
   if (s.ok()) {
+    impl->stats_ready_ = true;
     impl->RemoveObsoleteFiles();
     impl->MaybeScheduleCompaction();
   }

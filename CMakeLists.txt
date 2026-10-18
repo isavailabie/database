@@ -126,6 +126,7 @@ target_sources(leveldb
     "db/c.cc"
     "db/db_impl.cc"
     "db/db_impl.h"
+    "db/stats_cache.cc"
     "db/db_iter.cc"
     "db/db_iter.h"
     "db/dbformat.cc"
@@ -529,4 +530,11 @@ if(LEVELDB_BUILD_TESTS)
     add_executable(${course_test} "test/${course_test}.cc")
     target_link_libraries(${course_test} PRIVATE leveldb gtest)
   endforeach()
+  if(NOT BUILD_SHARED_LIBS)
+    leveldb_test("test/ttl_read_view_test.cc")
+    leveldb_test("test/ttl_gc_test.cc")
+    leveldb_test("test/metadata_consistency_test.cc")
+    leveldb_test("test/compaction_recovery_test.cc")
+    leveldb_test("test/stats_cache_test.cc")
+  endif()
 endif()

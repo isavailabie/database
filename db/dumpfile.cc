@@ -82,6 +82,17 @@ class WriteBatchItemPrinter : public WriteBatch::Handler {
     r += "'\n";
     dst_->Append(r);
   }
+  void PutWithExpiration(const Slice& key, const Slice& value,
+                         uint64_t expiration_micros) override {
+    std::string r = "  ttl-put '";
+    AppendEscapedStringTo(&r, key);
+    r += "' expires_us=";
+    AppendNumberTo(&r, expiration_micros);
+    r += " '";
+    AppendEscapedStringTo(&r, value);
+    r += "'\n";
+    dst_->Append(r);
+  }
   void Delete(const Slice& key) override {
     std::string r = "  del '";
     AppendEscapedStringTo(&r, key);

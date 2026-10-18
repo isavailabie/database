@@ -99,7 +99,8 @@ void MemTable::Add(SequenceNumber s, ValueType type, const Slice& key,
   table_.Insert(buf);
 }
 
-bool MemTable::Get(const LookupKey& key, std::string* value, Status* s) {
+bool MemTable::Get(const LookupKey& key, std::string* value, Status* s,
+                   uint64_t read_time_micros) {
   Slice memkey = key.memtable_key();
   Table::Iterator iter(&table_);
   iter.Seek(memkey.data());
@@ -120,16 +121,12 @@ bool MemTable::Get(const LookupKey& key, std::string* value, Status* s) {
             Slice(key_ptr, key_length - 8), key.user_key()) == 0) {
       // Correct user key
       const uint64_t tag = DecodeFixed64(key_ptr + key_length - 8);
-      switch (static_cast<ValueType>(tag & 0xff)) {
-        case kTypeValue: {
-          Slice v = GetLengthPrefixedSlice(key_ptr + key_length);
-          value->assign(v.data(), v.size());
-          return true;
-        }
-        case kTypeDeletion:
-          *s = Status::NotFound(Slice());
-          return true;
-      }
+      Slice v = GetLengthPrefixedSlice(key_ptr + key_length);
+      *s = DecodeValueForRead(static_cast<ValueType>(tag & 0xff), &v,
+                              read_time_micros);
+      if (s->ok()) value->assign(v.data(), v.size());
+      // Found but expired also stops lookup in older memory tables and SSTs.
+      return true;
     }
   }
   return false;

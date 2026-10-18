@@ -13,13 +13,14 @@ namespace leveldb {
 class SnapshotList;
 
 // Snapshots are kept in a doubly-linked list in the DB.
-// Each SnapshotImpl corresponds to a particular sequence number.
+// Each SnapshotImpl fixes a sequence number and its TTL read time.
 class SnapshotImpl : public Snapshot {
  public:
-  SnapshotImpl(SequenceNumber sequence_number)
-      : sequence_number_(sequence_number) {}
+  SnapshotImpl(SequenceNumber sequence_number, uint64_t read_time_micros = 0)
+      : sequence_number_(sequence_number), read_time_micros_(read_time_micros) {}
 
   SequenceNumber sequence_number() const { return sequence_number_; }
+  uint64_t read_time_micros() const { return read_time_micros_; }
 
  private:
   friend class SnapshotList;
@@ -30,6 +31,7 @@ class SnapshotImpl : public Snapshot {
   SnapshotImpl* next_;
 
   const SequenceNumber sequence_number_;
+  const uint64_t read_time_micros_;
 
 #if !defined(NDEBUG)
   SnapshotList* list_ = nullptr;
@@ -53,11 +55,20 @@ class SnapshotList {
     return head_.prev_;
   }
 
+  // Snapshot sequence order does not imply time order for a custom Env.
+  uint64_t OldestReadTime(uint64_t now) const {
+    for (const SnapshotImpl* view = head_.next_; view != &head_;
+         view = view->next_) {
+      if (view->read_time_micros_ < now) now = view->read_time_micros_;
+    }
+    return now;
+  }
+
   // Creates a SnapshotImpl and appends it to the end of the list.
-  SnapshotImpl* New(SequenceNumber sequence_number) {
+  SnapshotImpl* New(SequenceNumber sequence_number, uint64_t read_time_micros = 0) {
     assert(empty() || newest()->sequence_number_ <= sequence_number);
 
-    SnapshotImpl* snapshot = new SnapshotImpl(sequence_number);
+    SnapshotImpl* snapshot = new SnapshotImpl(sequence_number, read_time_micros);
 
 #if !defined(NDEBUG)
     snapshot->list_ = this;

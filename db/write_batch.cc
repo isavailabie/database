@@ -8,7 +8,9 @@
 //    data: record[count]
 // record :=
 //    kTypeValue varstring varstring         |
+//    kTypeTTLValue varstring varstring      |
 //    kTypeDeletion varstring
+// TTL values contain a fixed64 absolute expiration followed by the user value.
 // varstring :=
 //    len: varint32
 //    data: uint8[len]
@@ -31,6 +33,11 @@ WriteBatch::WriteBatch() { Clear(); }
 WriteBatch::~WriteBatch() = default;
 
 WriteBatch::Handler::~Handler() = default;
+
+void WriteBatch::Handler::PutWithExpiration(const Slice& key, const Slice& value,
+                                          uint64_t) {
+  Put(key, value);
+}
 
 void WriteBatch::Clear() {
   rep_.clear();
@@ -59,6 +66,16 @@ Status WriteBatch::Iterate(Handler* handler) const {
           handler->Put(key, value);
         } else {
           return Status::Corruption("bad WriteBatch Put");
+        }
+        break;
+      case kTypeTTLValue:
+        if (GetLengthPrefixedSlice(&input, &key) &&
+            GetLengthPrefixedSlice(&input, &value) && value.size() >= 8) {
+          const uint64_t expiration_micros = DecodeFixed64(value.data());
+          value.remove_prefix(8);
+          handler->PutWithExpiration(key, value, expiration_micros);
+        } else {
+          return Status::Corruption("bad WriteBatch TTL Put");
         }
         break;
       case kTypeDeletion:
@@ -102,6 +119,15 @@ void WriteBatch::Put(const Slice& key, const Slice& value) {
   PutLengthPrefixedSlice(&rep_, value);
 }
 
+void WriteBatchInternal::PutWithExpiration(WriteBatch* batch, const Slice& key,
+                                         const Slice& value,
+                                         uint64_t expiration_micros) {
+  SetCount(batch, Count(batch) + 1);
+  batch->rep_.push_back(static_cast<char>(kTypeTTLValue));
+  PutLengthPrefixedSlice(&batch->rep_, key);
+  PutLengthPrefixedSlice(&batch->rep_, EncodeTTLValue(value, expiration_micros));
+}
+
 void WriteBatch::Delete(const Slice& key) {
   WriteBatchInternal::SetCount(this, WriteBatchInternal::Count(this) + 1);
   rep_.push_back(static_cast<char>(kTypeDeletion));
@@ -120,6 +146,12 @@ class MemTableInserter : public WriteBatch::Handler {
 
   void Put(const Slice& key, const Slice& value) override {
     mem_->Add(sequence_, kTypeValue, key, value);
+    sequence_++;
+  }
+  void PutWithExpiration(const Slice& key, const Slice& value,
+                         uint64_t expiration_micros) override {
+    mem_->Add(sequence_, kTypeTTLValue, key,
+              EncodeTTLValue(value, expiration_micros));
     sequence_++;
   }
   void Delete(const Slice& key) override {

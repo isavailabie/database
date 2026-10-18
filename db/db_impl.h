@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <deque>
+#include <map>
 #include <set>
 #include <string>
 
@@ -39,6 +40,8 @@ class DBImpl : public DB {
   // Implementations of the DB interface
   Status Put(const WriteOptions&, const Slice& key,
              const Slice& value) override;
+  Status Put(const WriteOptions&, const Slice& key, const Slice& value,
+             uint64_t ttl) override;
   Status Delete(const WriteOptions&, const Slice& key) override;
   Status Write(const WriteOptions& options, WriteBatch* updates) override;
   Status Get(const ReadOptions& options, const Slice& key,
@@ -55,8 +58,10 @@ class DBImpl : public DB {
 
   // Extra methods (for testing) that are not in the public DB interface
 
-  // Compact any files in the named level that overlap [*begin,*end]
-  void TEST_CompactRange(int level, const Slice* begin, const Slice* end);
+  // Compact overlapping files; rewrite keeps outputs in levels >= 1.
+  // L0 always merges into L1; the deepest level is always rewritten in place.
+  void TEST_CompactRange(int level, const Slice* begin, const Slice* end,
+                         bool rewrite = false);
 
   // Force current memtable contents to be compacted.
   Status TEST_CompactMemTable();
@@ -65,6 +70,7 @@ class DBImpl : public DB {
   // The keys of this iterator are internal keys (see format.h).
   // The returned iterator should be deleted when no longer needed.
   Iterator* TEST_NewInternalIterator();
+  bool TEST_StatsCacheLoaded() const { return stats_cache_loaded_; }
 
   // Return the maximum overlapping data (in bytes) at next level for any
   // file at a level >= 1.
@@ -80,9 +86,27 @@ class DBImpl : public DB {
   struct CompactionState;
   struct Writer;
 
+  struct UserKeyLess {
+    using is_transparent = void;
+    const Comparator* comparator;
+    bool operator()(const Slice& a, const Slice& b) const {
+      return comparator->Compare(a, b) < 0;
+    }
+  };
+  using KeyCounts = std::map<std::string, uint64_t, UserKeyLess>;
+
+  void AddStatsEntry(const Slice& key, uint64_t count = 1)
+      EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  Status RebuildStats() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  bool StatsCacheEligible() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  std::string StatsFingerprint() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  bool LoadStatsCache() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void SaveStatsCache() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
   // Information for a manual compaction
   struct ManualCompaction {
     int level;
+    bool rewrite;
     bool done;
     const InternalKey* begin;  // null means beginning of key range
     const InternalKey* end;    // null means end of key range
@@ -107,7 +131,8 @@ class DBImpl : public DB {
 
   Iterator* NewInternalIterator(const ReadOptions&,
                                 SequenceNumber* latest_snapshot,
-                                uint32_t* seed);
+                                uint32_t* seed,
+                                uint64_t* read_time_micros = nullptr);
 
   Status NewDB();
 
@@ -162,6 +187,7 @@ class DBImpl : public DB {
   // Constant after construction
   Env* const env_;
   const InternalKeyComparator internal_comparator_;
+  const std::string user_comparator_name_;
   const InternalFilterPolicy internal_filter_policy_;
   const Options options_;  // options_.comparator == &internal_comparator_
   const bool owns_info_log_;
@@ -207,6 +233,13 @@ class DBImpl : public DB {
   Status bg_error_ GUARDED_BY(mutex_);
 
   CompactionStats stats_[config::kNumLevels] GUARDED_BY(mutex_);
+
+  // One ref per internal record in mem/imm/current Version. A flush moves
+  // ownership without adding a ref; only committed compaction drops remove it.
+  KeyCounts key_counts_ GUARDED_BY(mutex_);
+  uint64_t total_entries_ GUARDED_BY(mutex_) = 0;
+  bool stats_ready_ GUARDED_BY(mutex_) = false;
+  bool stats_cache_loaded_ = false;  // Fixed before DB::Open publishes this DB.
 };
 
 // Sanitize db options.  The caller should delete result.info_log if
