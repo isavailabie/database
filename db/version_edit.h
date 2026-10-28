@@ -15,6 +15,14 @@ namespace leveldb {
 
 class VersionSet;
 
+static constexpr uint32_t kCurrentDatabaseFormatVersion = 2;
+
+struct StatsDelta {
+  std::string key;
+  uint64_t count;
+  bool add;
+};
+
 struct FileMetaData {
   FileMetaData() : refs(0), allowed_seeks(1 << 30), file_size(0) {}
 
@@ -53,6 +61,22 @@ class VersionEdit {
     has_last_sequence_ = true;
     last_sequence_ = seq;
   }
+  void SetFormatVersion(uint32_t version) {
+    has_format_version_ = true;
+    format_version_ = version;
+  }
+  void SetStatsSnapshot(uint64_t total,
+                        const std::vector<std::pair<std::string, uint64_t>>&
+                            entries) {
+    has_stats_snapshot_ = true;
+    stats_snapshot_total_ = total;
+    stats_snapshot_ = entries;
+  }
+  void AddStatsDelta(const Slice& key, uint64_t count, bool add) {
+    has_stats_delta_ = true;
+    stats_deltas_.push_back({key.ToString(), count, add});
+  }
+  void MarkStatsDelta() { has_stats_delta_ = true; }
   void SetCompactPointer(int level, const InternalKey& key) {
     compact_pointers_.push_back(std::make_pair(level, key));
   }
@@ -90,13 +114,20 @@ class VersionEdit {
   uint64_t prev_log_number_;
   uint64_t next_file_number_;
   SequenceNumber last_sequence_;
+  uint32_t format_version_;
+  uint64_t stats_snapshot_total_;
   bool has_comparator_;
   bool has_log_number_;
   bool has_prev_log_number_;
   bool has_next_file_number_;
   bool has_last_sequence_;
+  bool has_format_version_;
+  bool has_stats_snapshot_;
+  bool has_stats_delta_;
 
   std::vector<std::pair<int, InternalKey>> compact_pointers_;
+  std::vector<std::pair<std::string, uint64_t>> stats_snapshot_;
+  std::vector<StatsDelta> stats_deltas_;
   DeletedFileSet deleted_files_;
   std::vector<std::pair<int, FileMetaData>> new_files_;
 };

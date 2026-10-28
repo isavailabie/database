@@ -23,6 +23,7 @@ Reader::Reader(SequentialFile* file, Reporter* reporter, bool checksum,
       backing_store_(new char[kBlockSize]),
       buffer_(),
       eof_(false),
+      has_corruption_or_truncated_tail_(false),
       last_record_offset_(0),
       end_of_buffer_offset_(0),
       initial_offset_(initial_offset),
@@ -147,6 +148,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
           // writing a physical record but before completing the next; don't
           // treat it as a corruption, just ignore the entire logical record.
           scratch->clear();
+          has_corruption_or_truncated_tail_ = true;
         }
         return false;
 
@@ -180,6 +182,7 @@ void Reader::ReportCorruption(uint64_t bytes, const char* reason) {
 }
 
 void Reader::ReportDrop(uint64_t bytes, const Status& reason) {
+  has_corruption_or_truncated_tail_ = true;
   if (reporter_ != nullptr &&
       end_of_buffer_offset_ - buffer_.size() - bytes >= initial_offset_) {
     reporter_->Corruption(static_cast<size_t>(bytes), reason);
@@ -208,6 +211,7 @@ unsigned int Reader::ReadPhysicalRecord(Slice* result) {
         // end of the file, which can be caused by the writer crashing in the
         // middle of writing the header. Instead of considering this an error,
         // just report EOF.
+        if (!buffer_.empty()) has_corruption_or_truncated_tail_ = true;
         buffer_.clear();
         return kEof;
       }
@@ -229,6 +233,7 @@ unsigned int Reader::ReadPhysicalRecord(Slice* result) {
       // If the end of the file has been reached without reading |length| bytes
       // of payload, assume the writer died in the middle of writing the record.
       // Don't report a corruption.
+      has_corruption_or_truncated_tail_ = true;
       return kEof;
     }
 

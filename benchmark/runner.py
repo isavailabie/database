@@ -67,6 +67,19 @@ def package_info():
         raise RuntimeError('Packaged regression baseline does not match runner')
     return info
 
+def host_hardware_info():
+    cpuinfo = Path('/proc/cpuinfo')
+    meminfo = Path('/proc/meminfo')
+    if cpuinfo.is_file() and meminfo.is_file():
+        return cpuinfo.read_text().splitlines()[:30], meminfo.read_text()
+    if platform.system() == 'Darwin':
+        cpu = subprocess.check_output(
+            ['sysctl', '-n', 'machdep.cpu.brand_string'], text=True).strip()
+        memory = subprocess.check_output(
+            ['sysctl', '-n', 'hw.memsize'], text=True).strip()
+        return [cpu], 'hw.memsize: ' + memory + ' bytes\n'
+    raise RuntimeError('hardware provenance requires /proc/cpuinfo and /proc/meminfo')
+
 def regression_sources(dest):
     source = HERE/'regression-source'
     if hashes(source) != package_info()['regression_files']:
@@ -175,11 +188,11 @@ def main():
         teacher = None
         if args.teacher_suite:
             teacher=out/'teacher-suite';shutil.copytree(args.teacher_suite.resolve(),teacher,ignore=shutil.ignore_patterns('__pycache__'))
+        cpu_info, memory_info = host_hardware_info()
         dump(out/'provenance.json',dict(source_files=hashes(out/'source'),suite_files=hashes(suite),
             teacher_files=hashes(teacher) if teacher else {}, regression_files=hashes(out/'regression-source'),
             baseline_commit=BASE_COMMIT, platform=platform.platform(), python=sys.version,
-            cpu_count=os.cpu_count(),cpu_info=Path('/proc/cpuinfo').read_text().splitlines()[:30],
-            memory_info=Path('/proc/meminfo').read_text(),
+            cpu_count=os.cpu_count(),cpu_info=cpu_info,memory_info=memory_info,
             compiler=subprocess.check_output(['c++','--version'],text=True),
             cmake=subprocess.check_output(['cmake','--version'],text=True),
             submodules=json.dumps(package_info()['dependencies'],sort_keys=True)))

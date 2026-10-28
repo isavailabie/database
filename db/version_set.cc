@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <limits>
 
 #include "db/filename.h"
 #include "db/log_reader.h"
@@ -744,6 +745,9 @@ VersionSet::VersionSet(const std::string& dbname, const Options* options,
       options_(options),
       table_cache_(table_cache),
       icmp_(*cmp),
+      stats_counts_(StatsKeyLess{cmp->user_comparator()}),
+      stats_total_(0),
+      has_stats_snapshot_(false),
       next_file_number_(2),
       manifest_file_number_(0),  // Filled by Recover()
       last_sequence_(0),
@@ -761,6 +765,72 @@ VersionSet::~VersionSet() {
   assert(dummy_versions_.next_ == &dummy_versions_);  // List must be empty
   delete descriptor_log_;
   delete descriptor_file_;
+}
+
+void VersionSet::GetStatsSnapshot(
+    std::vector<std::pair<std::string, uint64_t>>* entries,
+    uint64_t* total) const {
+  entries->assign(stats_counts_.begin(), stats_counts_.end());
+  *total = stats_total_;
+}
+
+Status VersionSet::ApplyStatsEdit(const VersionEdit& edit,
+                                  StatsCounts* counts, uint64_t* total,
+                                  bool* valid) const {
+  if (edit.has_stats_snapshot_) {
+    StatsCounts restored(StatsKeyLess{icmp_.user_comparator()});
+    uint64_t restored_total = 0;
+    std::string previous;
+    bool have_previous = false;
+    for (const auto& entry : edit.stats_snapshot_) {
+      if (entry.second == 0 ||
+          (have_previous &&
+           icmp_.user_comparator()->Compare(previous, entry.first) >= 0) ||
+          entry.second > std::numeric_limits<uint64_t>::max() -
+                             restored_total) {
+        return Status::Corruption("invalid stats snapshot ordering or count");
+      }
+      restored.emplace(entry.first, entry.second);
+      restored_total += entry.second;
+      previous = entry.first;
+      have_previous = true;
+    }
+    if (restored_total != edit.stats_snapshot_total_) {
+      return Status::Corruption("stats snapshot total mismatch");
+    }
+    counts->swap(restored);
+    *total = restored_total;
+    *valid = true;
+  }
+
+  if (!*valid) return Status::OK();
+  for (const StatsDelta& delta : edit.stats_deltas_) {
+    auto found = counts->find(delta.key);
+    if (delta.add) {
+      if (delta.count > std::numeric_limits<uint64_t>::max() - *total) {
+        return Status::Corruption("stats delta total overflow");
+      }
+      if (found == counts->end()) {
+        counts->emplace(delta.key, delta.count);
+      } else {
+        if (delta.count >
+            std::numeric_limits<uint64_t>::max() - found->second) {
+          return Status::Corruption("stats key count overflow");
+        }
+        found->second += delta.count;
+      }
+      *total += delta.count;
+    } else {
+      if (found == counts->end() || found->second < delta.count ||
+          *total < delta.count) {
+        return Status::Corruption("stats delta underflow");
+      }
+      found->second -= delta.count;
+      *total -= delta.count;
+      if (found->second == 0) counts->erase(found);
+    }
+  }
+  return Status::OK();
 }
 
 void VersionSet::AppendVersion(Version* v) {
@@ -792,8 +862,39 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
     edit->SetPrevLogNumber(prev_log_number_);
   }
 
-  edit->SetNextFile(next_file_number_);
   edit->SetLastSequence(last_sequence_);
+  edit->SetFormatVersion(kCurrentDatabaseFormatVersion);
+
+  bool create_new_manifest = descriptor_log_ == nullptr;
+  uint64_t new_manifest_number = manifest_file_number_;
+  if (!create_new_manifest) {
+    uint64_t manifest_size = 0;
+    Status size_status = env_->GetFileSize(
+        DescriptorFileName(dbname_, manifest_file_number_), &manifest_size);
+    if (!size_status.ok()) return size_status;
+    if (manifest_size >= TargetFileSize(options_)) {
+      create_new_manifest = true;
+      new_manifest_number = NewFileNumber();
+    }
+  }
+  edit->SetNextFile(next_file_number_);
+
+  StatsCounts next_stats = stats_counts_;
+  uint64_t next_stats_total = stats_total_;
+  bool next_has_stats_snapshot = has_stats_snapshot_;
+  Status s = ApplyStatsEdit(*edit, &next_stats, &next_stats_total,
+                            &next_has_stats_snapshot);
+  const bool changes_files =
+      !edit->deleted_files_.empty() || !edit->new_files_.empty();
+  if (s.ok() && has_stats_snapshot_ && changes_files &&
+      !edit->has_stats_delta_) {
+    s = Status::Corruption("file edit is missing its stats delta marker");
+  }
+  if (!s.ok()) {
+    Log(options_->info_log, "Rejecting MANIFEST statistics edit: %s\n",
+        s.ToString().c_str());
+    return s;
+  }
 
   Version* v = new Version(this);
   {
@@ -803,19 +904,18 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
   }
   Finalize(v);
 
-  // Initialize new descriptor log file if necessary by creating
-  // a temporary file that contains a snapshot of the current version.
+  // Create a replacement manifest before switching CURRENT so a failed
+  // write leaves the old committed manifest available for recovery.
   std::string new_manifest_file;
-  Status s;
-  if (descriptor_log_ == nullptr) {
-    // No reason to unlock *mu here since we only hit this path in the
-    // first call to LogAndApply (when opening the database).
-    assert(descriptor_file_ == nullptr);
-    new_manifest_file = DescriptorFileName(dbname_, manifest_file_number_);
-    s = env_->NewWritableFile(new_manifest_file, &descriptor_file_);
+  WritableFile* new_descriptor_file = nullptr;
+  log::Writer* new_descriptor_log = nullptr;
+  s = Status::OK();
+  if (create_new_manifest) {
+    new_manifest_file = DescriptorFileName(dbname_, new_manifest_number);
+    s = env_->NewWritableFile(new_manifest_file, &new_descriptor_file);
     if (s.ok()) {
-      descriptor_log_ = new log::Writer(descriptor_file_);
-      s = WriteSnapshot(descriptor_log_);
+      new_descriptor_log = new log::Writer(new_descriptor_file);
+      s = WriteSnapshot(new_descriptor_log);
     }
   }
 
@@ -827,9 +927,13 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
     if (s.ok()) {
       std::string record;
       edit->EncodeTo(&record);
-      s = descriptor_log_->AddRecord(record);
+      log::Writer* target_log =
+          create_new_manifest ? new_descriptor_log : descriptor_log_;
+      WritableFile* target_file =
+          create_new_manifest ? new_descriptor_file : descriptor_file_;
+      s = target_log->AddRecord(record);
       if (s.ok()) {
-        s = descriptor_file_->Sync();
+        s = target_file->Sync();
       }
       if (!s.ok()) {
         Log(options_->info_log, "MANIFEST write: %s\n", s.ToString().c_str());
@@ -838,8 +942,8 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
 
     // If we just created a new descriptor file, install it by writing a
     // new CURRENT file that points to it.
-    if (s.ok() && !new_manifest_file.empty()) {
-      s = SetCurrentFile(env_, dbname_, manifest_file_number_);
+    if (s.ok() && create_new_manifest) {
+      s = SetCurrentFile(env_, dbname_, new_manifest_number);
     }
 
     mu->Lock();
@@ -847,16 +951,26 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
 
   // Install the new version
   if (s.ok()) {
+    if (create_new_manifest) {
+      delete descriptor_log_;
+      delete descriptor_file_;
+      descriptor_log_ = new_descriptor_log;
+      descriptor_file_ = new_descriptor_file;
+      new_descriptor_log = nullptr;
+      new_descriptor_file = nullptr;
+      manifest_file_number_ = new_manifest_number;
+    }
     AppendVersion(v);
     log_number_ = edit->log_number_;
     prev_log_number_ = edit->prev_log_number_;
+    stats_counts_.swap(next_stats);
+    stats_total_ = next_stats_total;
+    has_stats_snapshot_ = next_has_stats_snapshot;
   } else {
     delete v;
-    if (!new_manifest_file.empty()) {
-      delete descriptor_log_;
-      delete descriptor_file_;
-      descriptor_log_ = nullptr;
-      descriptor_file_ = nullptr;
+    if (create_new_manifest) {
+      delete new_descriptor_log;
+      delete new_descriptor_file;
       env_->RemoveFile(new_manifest_file);
     }
   }
@@ -902,6 +1016,7 @@ Status VersionSet::Recover(bool* save_manifest) {
   uint64_t last_sequence = 0;
   uint64_t log_number = 0;
   uint64_t prev_log_number = 0;
+  uint32_t format_version = 0;
   Builder builder(this, current_);
   int read_records = 0;
 
@@ -923,6 +1038,38 @@ Status VersionSet::Recover(bool* save_manifest) {
               edit.comparator_ + " does not match existing comparator ",
               icmp_.user_comparator()->Name());
         }
+      }
+      if (s.ok() && edit.has_format_version_) {
+        if (edit.format_version_ > kCurrentDatabaseFormatVersion) {
+          s = Status::NotSupported("database format version",
+                                   std::to_string(edit.format_version_));
+        } else if (edit.format_version_ < format_version) {
+          s = Status::Corruption("database format version regressed");
+        } else {
+          format_version = edit.format_version_;
+        }
+      }
+
+      if (s.ok()) {
+        Status stats_status = ApplyStatsEdit(
+            edit, &stats_counts_, &stats_total_, &has_stats_snapshot_);
+        if (!stats_status.ok()) {
+          Log(options_->info_log,
+              "Ignoring invalid MANIFEST statistics and rebuilding: %s\n",
+              stats_status.ToString().c_str());
+          stats_counts_.clear();
+          stats_total_ = 0;
+          has_stats_snapshot_ = false;
+        }
+      }
+      if (s.ok() && has_stats_snapshot_ &&
+          (!edit.deleted_files_.empty() || !edit.new_files_.empty()) &&
+          !edit.has_stats_delta_ && !edit.has_stats_snapshot_) {
+        Log(options_->info_log,
+            "Ignoring MANIFEST statistics without a matching file delta\n");
+        stats_counts_.clear();
+        stats_total_ = 0;
+        has_stats_snapshot_ = false;
       }
 
       if (s.ok()) {
@@ -964,6 +1111,9 @@ Status VersionSet::Recover(bool* save_manifest) {
 
     if (!have_prev_log_number) {
       prev_log_number = 0;
+    }
+    if (format_version < kCurrentDatabaseFormatVersion) {
+      *save_manifest = true;
     }
 
     MarkFileNumberUsed(prev_log_number);
@@ -1078,6 +1228,12 @@ Status VersionSet::WriteSnapshot(log::Writer* log) {
   // Save metadata
   VersionEdit edit;
   edit.SetComparatorName(icmp_.user_comparator()->Name());
+  edit.SetFormatVersion(kCurrentDatabaseFormatVersion);
+  if (has_stats_snapshot_) {
+    std::vector<std::pair<std::string, uint64_t>> entries(stats_counts_.begin(),
+                                                          stats_counts_.end());
+    edit.SetStatsSnapshot(stats_total_, entries);
+  }
 
   // Save compaction pointers
   for (int level = 0; level < config::kNumLevels; level++) {
