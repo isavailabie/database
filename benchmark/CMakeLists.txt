@@ -42,6 +42,10 @@ if(HW_REGRESSION_SOURCE)
     "${HW_REGRESSION_SOURCE}/table/filter_block_test.cc"
     "${HW_REGRESSION_SOURCE}/table/table_test.cc"
     "${HW_REGRESSION_SOURCE}/util/testutil.cc")
+  set_source_files_properties(
+    "${HW_REGRESSION_SOURCE}/db/db_test.cc"
+    "${HW_REGRESSION_SOURCE}/db/write_batch_test.cc"
+    PROPERTIES COMPILE_OPTIONS "-Wno-error=switch")
   target_include_directories(homework_regression PRIVATE "${HW_SOURCE}" "${CMAKE_BINARY_DIR}/student/include")
   target_compile_definitions(homework_regression PRIVATE LEVELDB_PLATFORM_POSIX=1 LEVELDB_HAS_PORT_CONFIG_H=1)
   target_link_libraries(homework_regression PRIVATE leveldb gmock gtest_main Threads::Threads)

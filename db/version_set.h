@@ -17,6 +17,7 @@
 
 #include <map>
 #include <set>
+#include <string>
 #include <vector>
 
 #include "db/dbformat.h"
@@ -210,6 +211,10 @@ class VersionSet {
 
   // Return the last sequence number.
   uint64_t LastSequence() const { return last_sequence_; }
+  bool HasStatsSnapshot() const { return has_stats_snapshot_; }
+  void GetStatsSnapshot(
+      std::vector<std::pair<std::string, uint64_t>>* entries,
+      uint64_t* total) const;
 
   // Set the last sequence number to s.
   void SetLastSequence(uint64_t s) {
@@ -271,6 +276,13 @@ class VersionSet {
 
  private:
   class Builder;
+  struct StatsKeyLess {
+    const Comparator* comparator;
+    bool operator()(const std::string& a, const std::string& b) const {
+      return comparator->Compare(a, b) < 0;
+    }
+  };
+  using StatsCounts = std::map<std::string, uint64_t, StatsKeyLess>;
 
   friend class Compaction;
   friend class Version;
@@ -290,6 +302,8 @@ class VersionSet {
 
   // Save current contents to *log
   Status WriteSnapshot(log::Writer* log);
+  Status ApplyStatsEdit(const VersionEdit& edit, StatsCounts* counts,
+                        uint64_t* total, bool* valid) const;
 
   void AppendVersion(Version* v);
 
@@ -298,6 +312,9 @@ class VersionSet {
   const Options* const options_;
   TableCache* const table_cache_;
   const InternalKeyComparator icmp_;
+  StatsCounts stats_counts_;
+  uint64_t stats_total_;
+  bool has_stats_snapshot_;
   uint64_t next_file_number_;
   uint64_t manifest_file_number_;
   uint64_t last_sequence_;

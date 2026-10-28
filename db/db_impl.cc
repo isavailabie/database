@@ -204,6 +204,8 @@ Status DBImpl::NewDB() {
   new_db.SetLogNumber(0);
   new_db.SetNextFile(2);
   new_db.SetLastSequence(0);
+  new_db.SetFormatVersion(kCurrentDatabaseFormatVersion);
+  new_db.SetStatsSnapshot(0, {});
 
   const std::string manifest = DescriptorFileName(dbname_, 1);
   WritableFile* file;
@@ -487,10 +489,12 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
     }
   }
 
+  const bool clean_log_tail = !reader.HasCorruptionOrTruncatedTail();
   delete file;
 
   // See if we should keep reusing the last log file.
-  if (status.ok() && options_.reuse_logs && last_log && compactions == 0) {
+  if (status.ok() && clean_log_tail && options_.reuse_logs && last_log &&
+      compactions == 0) {
     assert(logfile_ == nullptr);
     assert(log_ == nullptr);
     assert(mem_ == nullptr);
@@ -570,6 +574,93 @@ Status DBImpl::RebuildStats() {
   return status;
 }
 
+Status DBImpl::RestoreStatsFromManifest() {
+  mutex_.AssertHeld();
+  std::vector<std::pair<std::string, uint64_t>> entries;
+  uint64_t total = 0;
+  versions_->GetStatsSnapshot(&entries, &total);
+  key_counts_.clear();
+  total_entries_ = total;
+  for (const auto& entry : entries) {
+    key_counts_.emplace_hint(key_counts_.end(), entry.first, entry.second);
+  }
+
+  std::vector<MemTable*> memtables;
+  if (mem_ != nullptr) memtables.push_back(mem_);
+  if (imm_ != nullptr) memtables.push_back(imm_);
+  for (MemTable* mem : memtables) {
+    std::unique_ptr<Iterator> iter(mem->NewIterator());
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      ParsedInternalKey key;
+      if (!ParseInternalKey(iter->key(), &key)) {
+        return Status::Corruption("invalid internal key restoring stats");
+      }
+      if (total_entries_ == std::numeric_limits<uint64_t>::max()) {
+        return Status::Corruption("stats total overflow restoring WAL");
+      }
+      auto found = key_counts_.find(key.user_key);
+      if (found == key_counts_.end()) {
+        key_counts_.emplace(key.user_key.ToString(), 1);
+      } else {
+        if (found->second == std::numeric_limits<uint64_t>::max()) {
+          return Status::Corruption("stats key count overflow restoring WAL");
+        }
+        ++found->second;
+      }
+      ++total_entries_;
+    }
+    if (!iter->status().ok()) return iter->status();
+  }
+  return Status::OK();
+}
+
+Status DBImpl::BuildStatsSnapshot(VersionEdit* edit) {
+  mutex_.AssertHeld();
+  KeyCounts counts(UserKeyLess{user_comparator()});
+  uint64_t total = 0;
+  ReadOptions read;
+  read.verify_checksums = true;
+  read.fill_cache = false;
+  std::vector<Iterator*> sources;
+  versions_->current()->AddIterators(read, &sources);
+  Status status;
+  for (size_t i = 0; i < sources.size(); ++i) {
+    Iterator* source = sources[i];
+    for (source->SeekToFirst(); source->Valid(); source->Next()) {
+      ParsedInternalKey key;
+      if (!ParseInternalKey(source->key(), &key)) {
+        status = Status::Corruption("invalid internal key building stats snapshot");
+        break;
+      }
+      auto found = counts.find(key.user_key);
+      if (found == counts.end()) {
+        counts.emplace(key.user_key.ToString(), 1);
+      } else {
+        if (found->second == std::numeric_limits<uint64_t>::max()) {
+          status = Status::Corruption("stats key count overflow");
+          break;
+        }
+        ++found->second;
+      }
+      if (total == std::numeric_limits<uint64_t>::max()) {
+        status = Status::Corruption("stats total overflow");
+        break;
+      }
+      ++total;
+    }
+    if (status.ok()) status = source->status();
+    delete source;
+    if (!status.ok()) {
+      for (++i; i < sources.size(); ++i) delete sources[i];
+      return status;
+    }
+  }
+  std::vector<std::pair<std::string, uint64_t>> entries(counts.begin(),
+                                                        counts.end());
+  edit->SetStatsSnapshot(total, entries);
+  return Status::OK();
+}
+
 Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
                                 Version* base) {
   mutex_.AssertHeld();
@@ -605,6 +696,28 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
     }
     edit->AddFile(level, meta.number, meta.file_size, meta.smallest,
                   meta.largest);
+    KeyCounts counts(UserKeyLess{user_comparator()});
+    std::unique_ptr<Iterator> stats_iter(mem->NewIterator());
+    for (stats_iter->SeekToFirst(); stats_iter->Valid(); stats_iter->Next()) {
+      ParsedInternalKey key;
+      if (!ParseInternalKey(stats_iter->key(), &key)) {
+        s = Status::Corruption("invalid internal key counting flushed stats");
+        break;
+      }
+      auto found = counts.find(key.user_key);
+      if (found == counts.end()) {
+        counts.emplace(key.user_key.ToString(), 1);
+      } else {
+        ++found->second;
+      }
+    }
+    if (s.ok()) s = stats_iter->status();
+    if (s.ok()) {
+      edit->MarkStatsDelta();
+      for (const auto& entry : counts) {
+        edit->AddStatsDelta(entry.first, entry.second, true);
+      }
+    }
   }
 
   CompactionStats stats;
@@ -739,6 +852,11 @@ Status DBImpl::TEST_CompactMemTable() {
   return s;
 }
 
+void DBImpl::TEST_SetLastSequence(SequenceNumber sequence) {
+  MutexLock lock(&mutex_);
+  versions_->SetLastSequence(sequence);
+}
+
 void DBImpl::RecordBackgroundError(const Status& s) {
   mutex_.AssertHeld();
   if (bg_error_.ok()) {
@@ -824,9 +942,12 @@ void DBImpl::BackgroundCompaction() {
     c->edit()->RemoveFile(c->level(), f->number);
     c->edit()->AddFile(c->level() + 1, f->number, f->file_size, f->smallest,
                        f->largest);
+    c->edit()->MarkStatsDelta();
     status = versions_->LogAndApply(c->edit(), &mutex_);
     if (!status.ok()) {
       RecordBackgroundError(status);
+    } else {
+      RemoveObsoleteFiles();
     }
     VersionSet::LevelSummaryStorage tmp;
     Log(options_.info_log, "Moved #%lld to level-%d %lld bytes %s: %s\n",
@@ -973,6 +1094,11 @@ Status DBImpl::InstallCompactionResults(CompactionState* compact) {
     const CompactionState::Output& out = compact->outputs[i];
     compact->compaction->edit()->AddFile(level, out.number, out.file_size,
                                          out.smallest, out.largest);
+  }
+  compact->compaction->edit()->MarkStatsDelta();
+  for (const auto& dropped : compact->dropped_entries) {
+    compact->compaction->edit()->AddStatsDelta(dropped.first, dropped.second,
+                                                false);
   }
   const Status status =
       versions_->LogAndApply(compact->compaction->edit(), &mutex_);
@@ -1367,8 +1493,6 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   Writer* last_writer = &w;
   if (status.ok() && updates != nullptr) {  // nullptr batch is for compactions
     WriteBatch* write_batch = BuildBatchGroup(&last_writer);
-    WriteBatchInternal::SetSequence(write_batch, last_sequence + 1);
-    last_sequence += WriteBatchInternal::Count(write_batch);
 
     // Add to log and apply to memtable.  We can release the lock
     // during this phase since &w is currently responsible for logging
@@ -1376,12 +1500,23 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
     // into mem_.
     BatchKeys batch_keys;
     bool valid_batch = false;
+    bool log_error = false;
     {
       mutex_.Unlock();
       status = write_batch->Iterate(&batch_keys);
       valid_batch = status.ok();
-      if (status.ok()) {
+      const uint64_t batch_count =
+          static_cast<uint64_t>(WriteBatchInternal::Count(write_batch));
+      if (status.ok() && batch_count > 0 &&
+          (last_sequence > kMaxSequenceNumber ||
+           batch_count > kMaxSequenceNumber - last_sequence)) {
+        status = Status::InvalidArgument("sequence number exhausted");
+      }
+      if (status.ok() && batch_count > 0) {
+        WriteBatchInternal::SetSequence(write_batch, last_sequence + 1);
+        last_sequence += batch_count;
         status = log_->AddRecord(WriteBatchInternal::Contents(write_batch));
+        log_error = !status.ok();
       }
       bool sync_error = false;
       if (status.ok() && options.sync) {
@@ -1394,19 +1529,21 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
         status = WriteBatchInternal::InsertInto(write_batch, mem_);
       }
       mutex_.Lock();
-      if (sync_error) {
-        // The state of the log file is indeterminate: the log record we
-        // just added may or may not show up when the DB is re-opened.
-        // So we force the DB into a mode where all future writes fail.
+      if (sync_error || log_error) {
+        // A failed append or sync leaves the WAL position indeterminate.
+        // Refuse subsequent writes until recovery re-establishes the log.
         RecordBackgroundError(status);
       }
     }
     // Commit the complete group and sequence under the same lock. WAL copies
     // are not counted, and queries cannot observe a half-published batch.
-    if (status.ok()) {
+    if (status.ok() && WriteBatchInternal::Count(write_batch) > 0) {
       for (const Slice& key : batch_keys.keys) AddStatsEntry(key);
     }
-    if (valid_batch) versions_->SetLastSequence(last_sequence);
+    if (valid_batch && status.ok() &&
+        WriteBatchInternal::Count(write_batch) > 0) {
+      versions_->SetLastSequence(last_sequence);
+    }
     if (write_batch == tmp_batch_) tmp_batch_->Clear();
   }
 
@@ -1692,9 +1829,17 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
     edit.SetLogNumber(impl->logfile_number_);
     s = impl->versions_->LogAndApply(&edit, &impl->mutex_);
   }
-  // WAL recovery and its SST edit must finish before counting: only the final
-  // recovered sources own records, never the WAL copies or intermediate tables.
-  if (s.ok() && !impl->LoadStatsCache()) s = impl->RebuildStats();
+  // WAL recovery and its SST edit must finish before using persisted stats.
+  if (s.ok() && !impl->LoadStatsCache()) {
+    s = impl->versions_->HasStatsSnapshot()
+            ? impl->RestoreStatsFromManifest()
+            : impl->RebuildStats();
+  }
+  if (s.ok() && !impl->versions_->HasStatsSnapshot()) {
+    VersionEdit stats_snapshot;
+    s = impl->BuildStatsSnapshot(&stats_snapshot);
+    if (s.ok()) s = impl->versions_->LogAndApply(&stats_snapshot, &impl->mutex_);
+  }
   if (s.ok()) {
     impl->stats_ready_ = true;
     impl->RemoveObsoleteFiles();

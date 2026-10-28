@@ -66,6 +66,8 @@ class DBImpl : public DB {
   // Force current memtable contents to be compacted.
   Status TEST_CompactMemTable();
 
+  void TEST_SetLastSequence(SequenceNumber sequence);
+
   // Return an internal iterator over the current state of the database.
   // The keys of this iterator are internal keys (see format.h).
   // The returned iterator should be deleted when no longer needed.
@@ -98,6 +100,9 @@ class DBImpl : public DB {
   void AddStatsEntry(const Slice& key, uint64_t count = 1)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   Status RebuildStats() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  Status RestoreStatsFromManifest() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  Status BuildStatsSnapshot(VersionEdit* edit)
+      EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   bool StatsCacheEligible() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   std::string StatsFingerprint() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   bool LoadStatsCache() EXCLUSIVE_LOCKS_REQUIRED(mutex_);

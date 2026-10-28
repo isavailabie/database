@@ -417,6 +417,9 @@ class DBTest : public testing::Test {
             case kTypeValue:
               result += iter->value().ToString();
               break;
+            case kTypeTTLValue:
+              result += "TTL";
+              break;
             case kTypeDeletion:
               result += "DEL";
               break;

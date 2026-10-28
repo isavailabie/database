@@ -60,6 +60,11 @@ class Reader {
   // Undefined before the first call to ReadRecord.
   uint64_t LastRecordOffset();
 
+  // True if reading encountered corruption or an incomplete final record.
+  bool HasCorruptionOrTruncatedTail() const {
+    return has_corruption_or_truncated_tail_;
+  }
+
  private:
   // Extend record types with the following special values
   enum {
@@ -91,6 +96,7 @@ class Reader {
   char* const backing_store_;
   Slice buffer_;
   bool eof_;  // Last Read() indicated EOF by returning < kBlockSize
+  bool has_corruption_or_truncated_tail_;
 
   // Offset of the last record returned by ReadRecord.
   uint64_t last_record_offset_;

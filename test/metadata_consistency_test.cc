@@ -13,7 +13,10 @@
 #include "db/db_impl.h"
 #include "db/dbformat.h"
 #include "db/filename.h"
+#include "db/log_reader.h"
+#include "db/log_writer.h"
 #include "db/snapshot.h"
+#include "db/version_edit.h"
 #include "db/write_batch_internal.h"
 #include "gtest/gtest.h"
 #include "leveldb/comparator.h"
@@ -35,10 +38,14 @@ class StatsEnv : public EnvWrapper {
   class File : public WritableFile {
    public:
     File(WritableFile* file, StatsEnv* env, FileType type)
-        : file_(file), env_(env), type_(type) {}
+        : file_(file), env_(env), type_(type), log_appends_(0) {}
     Status Append(const Slice& data) override {
       if (type_ == kDescriptorFile && env_->fail_manifest_append) {
         return Status::IOError("injected manifest append failure");
+      }
+      if (type_ == kLogFile && log_appends_++ == 1 &&
+          env_->fail_log_payload_append.exchange(false)) {
+        return Status::IOError("injected partial WAL append failure");
       }
       return file_->Append(data);
     }
@@ -54,6 +61,7 @@ class StatsEnv : public EnvWrapper {
     std::unique_ptr<WritableFile> file_;
     StatsEnv* env_;
     FileType type_;
+    int log_appends_;
   };
 
   Status NewWritableFile(const std::string& path, WritableFile** result) override {
@@ -109,6 +117,7 @@ class StatsEnv : public EnvWrapper {
   }
   std::atomic<uint64_t> now{kEpoch};
   std::atomic<bool> fail_manifest_append{false};
+  std::atomic<bool> fail_log_payload_append{false};
   std::atomic<bool> fail_table_sync{false};
 
  private:
@@ -231,6 +240,170 @@ TEST_F(MetadataConsistencyTest, StepwiseOperationsBatchAndIgnoredSnapshot) {
   GC();
   Expected(1, 1, 8);
   PhysicalOracle(8);
+}
+
+TEST_F(MetadataConsistencyTest, FailedWALAppendDoesNotPublishSequenceOrStats) {
+  WriteBatch batch;
+  batch.Put("not-published", "value");
+  env_.fail_log_payload_append = true;
+  EXPECT_TRUE(db_->Write(WriteOptions(), &batch).IsIOError());
+  Expected(0, 0, 0);
+
+  EXPECT_TRUE(db_->Put(WriteOptions(), "must-not-append", "value").IsIOError());
+  Expected(0, 0, 0);
+
+  options_.reuse_logs = true;
+  Reopen();
+  Expected(0, 0, 0);
+  std::string value;
+  EXPECT_TRUE(db_->Get(ReadOptions(), "not-published", &value).IsNotFound());
+  ASSERT_TRUE(db_->Put(WriteOptions(), "published", "value").ok());
+  Expected(1, 1, 1);
+  Reopen();
+  Expected(1, 1, 1);
+  ASSERT_TRUE(db_->Get(ReadOptions(), "published", &value).ok());
+  EXPECT_EQ("value", value);
+}
+
+TEST_F(MetadataConsistencyTest, SequenceExhaustionAndEmptyBatchDoNotWrap) {
+  Impl()->TEST_SetLastSequence(kMaxSequenceNumber - 1);
+  ASSERT_TRUE(db_->Put(WriteOptions(), "last", "value").ok());
+  Expected(1, 1, kMaxSequenceNumber);
+
+  EXPECT_TRUE(db_->Put(WriteOptions(), "overflow", "value").IsInvalidArgument());
+  Expected(1, 1, kMaxSequenceNumber);
+  std::string value;
+  EXPECT_TRUE(db_->Get(ReadOptions(), "overflow", &value).IsNotFound());
+
+  WriteBatch empty;
+  ASSERT_TRUE(db_->Write(WriteOptions(), &empty).ok());
+  Reopen();
+  Expected(1, 1, kMaxSequenceNumber);
+}
+
+TEST_F(MetadataConsistencyTest, FutureDatabaseFormatIsRejected) {
+  db_.reset();
+  env_.Wait();
+
+  std::string current;
+  ASSERT_TRUE(ReadFileToString(&env_, CurrentFileName(name_), &current).ok());
+  ASSERT_FALSE(current.empty());
+  ASSERT_EQ('\n', current.back());
+  current.pop_back();
+  const std::string manifest = name_ + "/" + current;
+
+  uint64_t manifest_size = 0;
+  ASSERT_TRUE(env_.GetFileSize(manifest, &manifest_size).ok());
+  WritableFile* file = nullptr;
+  ASSERT_TRUE(env_.NewAppendableFile(manifest, &file).ok());
+  log::Writer writer(file, manifest_size);
+  VersionEdit edit;
+  edit.SetFormatVersion(kCurrentDatabaseFormatVersion + 1);
+  std::string record;
+  edit.EncodeTo(&record);
+  ASSERT_TRUE(writer.AddRecord(record).ok());
+  ASSERT_TRUE(file->Sync().ok());
+  ASSERT_TRUE(file->Close().ok());
+  delete file;
+
+  options_.create_if_missing = false;
+  DB* unsupported = nullptr;
+  const Status status = DB::Open(options_, name_, &unsupported);
+  EXPECT_TRUE(status.IsNotSupportedError()) << status.ToString();
+  EXPECT_EQ(nullptr, unsupported);
+}
+
+TEST_F(MetadataConsistencyTest, DatabaseFormatRegressionIsRejected) {
+  db_.reset();
+  env_.Wait();
+
+  std::string current;
+  ASSERT_TRUE(ReadFileToString(&env_, CurrentFileName(name_), &current).ok());
+  ASSERT_FALSE(current.empty());
+  ASSERT_EQ('\n', current.back());
+  current.pop_back();
+  const std::string manifest = name_ + "/" + current;
+
+  uint64_t manifest_size = 0;
+  ASSERT_TRUE(env_.GetFileSize(manifest, &manifest_size).ok());
+  WritableFile* file = nullptr;
+  ASSERT_TRUE(env_.NewAppendableFile(manifest, &file).ok());
+  log::Writer writer(file, manifest_size);
+  VersionEdit edit;
+  edit.SetFormatVersion(kCurrentDatabaseFormatVersion - 1);
+  std::string record;
+  edit.EncodeTo(&record);
+  ASSERT_TRUE(writer.AddRecord(record).ok());
+  ASSERT_TRUE(file->Sync().ok());
+  ASSERT_TRUE(file->Close().ok());
+  delete file;
+
+  options_.create_if_missing = false;
+  DB* invalid = nullptr;
+  const Status status = DB::Open(options_, name_, &invalid);
+  EXPECT_TRUE(status.IsCorruption()) << status.ToString();
+  EXPECT_EQ(nullptr, invalid);
+}
+
+TEST_F(MetadataConsistencyTest, LegacyManifestIsUpgradedOnOpen) {
+  db_.reset();
+  env_.Wait();
+
+  std::string current;
+  ASSERT_TRUE(ReadFileToString(&env_, CurrentFileName(name_), &current).ok());
+  ASSERT_FALSE(current.empty());
+  ASSERT_EQ('\n', current.back());
+  current.pop_back();
+  const std::string legacy_manifest_name = current;
+  const std::string legacy_manifest = name_ + "/" + current;
+
+  WritableFile* file = nullptr;
+  ASSERT_TRUE(env_.NewWritableFile(legacy_manifest, &file).ok());
+  {
+    log::Writer writer(file);
+    VersionEdit legacy;
+    legacy.SetComparatorName(options_.comparator->Name());
+    legacy.SetLogNumber(0);
+    legacy.SetNextFile(2);
+    legacy.SetLastSequence(0);
+    std::string record;
+    legacy.EncodeTo(&record);
+    ASSERT_TRUE(writer.AddRecord(record).ok());
+  }
+  ASSERT_TRUE(file->Sync().ok());
+  ASSERT_TRUE(file->Close().ok());
+  delete file;
+
+  options_.create_if_missing = false;
+  options_.reuse_logs = true;
+  Open();
+  Expected(0, 0, 0);
+  db_.reset();
+
+  ASSERT_TRUE(ReadFileToString(&env_, CurrentFileName(name_), &current).ok());
+  ASSERT_FALSE(current.empty());
+  ASSERT_EQ('\n', current.back());
+  current.pop_back();
+  EXPECT_EQ(legacy_manifest_name, current);
+  SequentialFile* manifest_file = nullptr;
+  ASSERT_TRUE(
+      env_.NewSequentialFile(name_ + "/" + current, &manifest_file).ok());
+  bool found_format_version = false;
+  {
+    log::Reader reader(manifest_file, nullptr, true, 0);
+    Slice record;
+    std::string scratch;
+    while (reader.ReadRecord(&record, &scratch)) {
+      VersionEdit edit;
+      ASSERT_TRUE(edit.DecodeFrom(record).ok());
+      if (edit.DebugString().find("FormatVersion:") != std::string::npos) {
+        found_format_version = true;
+      }
+    }
+    EXPECT_FALSE(reader.HasCorruptionOrTruncatedTail());
+  }
+  delete manifest_file;
+  EXPECT_TRUE(found_format_version);
 }
 
 TEST_F(MetadataConsistencyTest, TTLExpiryAndInvalidDeadlineOnlyChangeOnGC) {

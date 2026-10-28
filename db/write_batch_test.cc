@@ -31,6 +31,12 @@ static std::string PrintContents(WriteBatch* b) {
         state.append(")");
         count++;
         break;
+      case kTypeTTLValue:
+        state.append("PutWithExpiration(");
+        state.append(ikey.user_key.ToString());
+        state.append(")");
+        count++;
+        break;
       case kTypeDeletion:
         state.append("Delete(");
         state.append(ikey.user_key.ToString());

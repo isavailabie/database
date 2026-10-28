@@ -20,7 +20,12 @@ enum Tag {
   kDeletedFile = 6,
   kNewFile = 7,
   // 8 was used for large value refs
-  kPrevLogNumber = 9
+  kPrevLogNumber = 9,
+  kFormatVersion = 10,
+  kStatsSnapshotTotal = 11,
+  kStatsSnapshotEntry = 12,
+  kStatsDelta = 13,
+  kStatsDeltaMarker = 14
 };
 
 void VersionEdit::Clear() {
@@ -28,13 +33,20 @@ void VersionEdit::Clear() {
   log_number_ = 0;
   prev_log_number_ = 0;
   last_sequence_ = 0;
+  format_version_ = 0;
+  stats_snapshot_total_ = 0;
   next_file_number_ = 0;
   has_comparator_ = false;
   has_log_number_ = false;
   has_prev_log_number_ = false;
   has_next_file_number_ = false;
   has_last_sequence_ = false;
+  has_format_version_ = false;
+  has_stats_snapshot_ = false;
+  has_stats_delta_ = false;
   compact_pointers_.clear();
+  stats_snapshot_.clear();
+  stats_deltas_.clear();
   deleted_files_.clear();
   new_files_.clear();
 }
@@ -59,6 +71,28 @@ void VersionEdit::EncodeTo(std::string* dst) const {
   if (has_last_sequence_) {
     PutVarint32(dst, kLastSequence);
     PutVarint64(dst, last_sequence_);
+  }
+  if (has_format_version_) {
+    PutVarint32(dst, kFormatVersion);
+    PutVarint32(dst, format_version_);
+  }
+  if (has_stats_snapshot_) {
+    PutVarint32(dst, kStatsSnapshotTotal);
+    PutVarint64(dst, stats_snapshot_total_);
+    for (const auto& entry : stats_snapshot_) {
+      PutVarint32(dst, kStatsSnapshotEntry);
+      PutLengthPrefixedSlice(dst, entry.first);
+      PutVarint64(dst, entry.second);
+    }
+  }
+  for (const StatsDelta& delta : stats_deltas_) {
+    PutVarint32(dst, kStatsDelta);
+    PutLengthPrefixedSlice(dst, delta.key);
+    PutVarint32(dst, delta.add ? 1 : 0);
+    PutVarint64(dst, delta.count);
+  }
+  if (has_stats_delta_ && stats_deltas_.empty()) {
+    PutVarint32(dst, kStatsDeltaMarker);
   }
 
   for (size_t i = 0; i < compact_pointers_.size(); i++) {
@@ -159,6 +193,56 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
         }
         break;
 
+      case kFormatVersion:
+        if (GetVarint32(&input, &format_version_)) {
+          has_format_version_ = true;
+        } else {
+          msg = "format version";
+        }
+        break;
+
+      case kStatsSnapshotTotal:
+        if (!has_stats_snapshot_ &&
+            GetVarint64(&input, &stats_snapshot_total_)) {
+          has_stats_snapshot_ = true;
+        } else {
+          msg = "stats snapshot total";
+        }
+        break;
+
+      case kStatsSnapshotEntry: {
+        uint64_t count;
+        if (GetLengthPrefixedSlice(&input, &str) &&
+            GetVarint64(&input, &count) && count != 0) {
+          stats_snapshot_.emplace_back(str.ToString(), count);
+        } else {
+          msg = "stats snapshot entry";
+        }
+        break;
+      }
+
+      case kStatsDelta: {
+        uint32_t add;
+        uint64_t count;
+        if (GetLengthPrefixedSlice(&input, &str) &&
+            GetVarint32(&input, &add) && add <= 1 &&
+            GetVarint64(&input, &count) && count != 0) {
+          stats_deltas_.push_back({str.ToString(), count, add != 0});
+          has_stats_delta_ = true;
+        } else {
+          msg = "stats delta";
+        }
+        break;
+      }
+
+      case kStatsDeltaMarker:
+        if (has_stats_delta_) {
+          msg = "duplicate stats delta marker";
+        } else {
+          has_stats_delta_ = true;
+        }
+        break;
+
       case kCompactPointer:
         if (GetLevel(&input, &level) && GetInternalKey(&input, &key)) {
           compact_pointers_.push_back(std::make_pair(level, key));
@@ -195,6 +279,9 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
   if (msg == nullptr && !input.empty()) {
     msg = "invalid tag";
   }
+  if (msg == nullptr && !has_stats_snapshot_ && !stats_snapshot_.empty()) {
+    msg = "stats snapshot entries without total";
+  }
 
   Status result;
   if (msg != nullptr) {
@@ -225,6 +312,20 @@ std::string VersionEdit::DebugString() const {
   if (has_last_sequence_) {
     r.append("\n  LastSeq: ");
     AppendNumberTo(&r, last_sequence_);
+  }
+  if (has_format_version_) {
+    r.append("\n  FormatVersion: ");
+    AppendNumberTo(&r, format_version_);
+  }
+  if (has_stats_snapshot_) {
+    r.append("\n  StatsSnapshotTotal: ");
+    AppendNumberTo(&r, stats_snapshot_total_);
+    r.append("\n  StatsSnapshotEntries: ");
+    AppendNumberTo(&r, stats_snapshot_.size());
+  }
+  if (!stats_deltas_.empty()) {
+    r.append("\n  StatsDeltas: ");
+    AppendNumberTo(&r, stats_deltas_.size());
   }
   for (size_t i = 0; i < compact_pointers_.size(); i++) {
     r.append("\n  CompactPointer: ");
