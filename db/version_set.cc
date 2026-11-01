@@ -833,11 +833,12 @@ void VersionSet::ResetStats() {
 }
 
 void VersionSet::SetSstStatsFromCache(
-    const std::vector<std::pair<std::string, uint64_t>>& entries,
+    std::vector<std::pair<std::string, uint64_t>>&& entries,
     uint64_t total) {
   ResetStats();
-  for (const auto& entry : entries) {
-    stats_counts_.emplace(entry.first, StatsEntry{entry.second, 0});
+  for (auto& entry : entries) {
+    stats_counts_.emplace_hint(stats_counts_.end(), std::move(entry.first),
+                               StatsEntry{entry.second, 0});
   }
   stats_total_ = total;
 }

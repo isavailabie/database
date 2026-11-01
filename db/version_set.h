@@ -240,7 +240,7 @@ class VersionSet {
   Status AddSstStats(const Slice& key, uint64_t count = 1);
   void ResetStats();
   void SetSstStatsFromCache(
-      const std::vector<std::pair<std::string, uint64_t>>& entries,
+      std::vector<std::pair<std::string, uint64_t>>&& entries,
       uint64_t total);
 
   // Set the last sequence number to s.

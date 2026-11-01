@@ -52,6 +52,17 @@ std::string DBImpl::StatsFingerprint() {
 bool DBImpl::LoadStatsCache() {
   mutex_.AssertHeld();
   const std::string path = dbname_ + "/STATS";
+  if (versions_->HasStatsSnapshot()) {
+    env_->RemoveFile(path);
+    env_->RemoveFile(dbname_ + "/STATS.tmp");
+    return false;
+  }
+  if (versions_->HasStatsSnapshot()) {
+    env_->RemoveFile(path);
+    env_->RemoveFile(dbname_ + "/STATS.tmp");
+    return false;
+  }
+
   std::string encoded;
   const bool eligible = StatsCacheEligible();
   const Status read = eligible ? ReadFileToString(env_, path, &encoded)
@@ -78,7 +89,8 @@ bool DBImpl::LoadStatsCache() {
   const uint64_t distinct = DecodeFixed64(input.data() + 8);
   input.remove_prefix(16);
   if (distinct > expected_total || distinct > input.size() / 9) return false;
-  KeyCounts restored(UserKeyLess{user_comparator()});
+  std::vector<std::pair<std::string, uint64_t>> entries;
+  entries.reserve(static_cast<size_t>(distinct));
   uint64_t total = 0;
   for (uint64_t i = 0; i < distinct; ++i) {
     Slice key;
@@ -86,19 +98,15 @@ bool DBImpl::LoadStatsCache() {
     const uint64_t count = DecodeFixed64(input.data());
     input.remove_prefix(8);
     if (count == 0 || count > std::numeric_limits<uint64_t>::max() - total ||
-        (!restored.empty() &&
-         user_comparator()->Compare(restored.rbegin()->first, key) >= 0)) {
+        (!entries.empty() &&
+         user_comparator()->Compare(entries.back().first, key) >= 0)) {
       return false;
     }
-    // Serialized user keys are ordered: a correct hint avoids N log N startup
-    // comparisons while retaining support for custom comparator equivalence.
-    restored.emplace_hint(restored.end(), key.ToString(), count);
+    entries.emplace_back(key.ToString(), count);
     total += count;
   }
   if (!input.empty() || total != expected_total) return false;
-  std::vector<std::pair<std::string, uint64_t>> entries(restored.begin(),
-                                                        restored.end());
-  versions_->SetSstStatsFromCache(entries, total);
+  versions_->SetSstStatsFromCache(std::move(entries), total);
   stats_cache_loaded_ = true;
   return true;
 }

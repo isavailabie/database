@@ -238,7 +238,7 @@ class StatsCacheTest : public testing::Test {
   std::unique_ptr<DB> db_;
 };
 
-TEST_F(StatsCacheTest, ValidCacheSkipsSSTDataReadsAcrossRepeatedOpens) {
+TEST_F(StatsCacheTest, ManifestStatsAvoidRebuildingFromCacheAcrossRepeatedOpens) {
   Prepare();
   for (bool reuse : {false, true, false, true}) {
     Close();
@@ -246,7 +246,7 @@ TEST_F(StatsCacheTest, ValidCacheSkipsSSTDataReadsAcrossRepeatedOpens) {
     options_.reuse_logs = reuse;
     env_.tables_opened = 0;
     Open();
-    EXPECT_TRUE(Impl()->TEST_StatsCacheLoaded());
+    EXPECT_FALSE(Impl()->TEST_StatsCacheLoaded());
     EXPECT_EQ(uint64_t{0}, env_.tables_opened.load());
     EXPECT_FALSE(env_.FileExists(env_.cache_path));
     Expected(2, 2, 2);
@@ -258,7 +258,7 @@ TEST_F(StatsCacheTest, ExpiryDoesNotInvalidatePhysicalCounts) {
   Close();
   env_.now += 1000000;
   Open();
-  EXPECT_TRUE(Impl()->TEST_StatsCacheLoaded());
+  EXPECT_FALSE(Impl()->TEST_StatsCacheLoaded());
   Expected(2, 2, 2);
   std::string value;
   EXPECT_TRUE(db_->Get(ReadOptions(), "ttl", &value).IsNotFound());
@@ -268,7 +268,7 @@ TEST_F(StatsCacheTest, ExpiryDoesNotInvalidatePhysicalCounts) {
   Expected(1, 1, 2);
   Close();
   Open();
-  EXPECT_TRUE(Impl()->TEST_StatsCacheLoaded());
+  EXPECT_FALSE(Impl()->TEST_StatsCacheLoaded());
   Expected(1, 1, 2);
 }
 
@@ -335,7 +335,7 @@ TEST_F(StatsCacheTest, StaleSequenceCacheCannotHideNewWrites) {
   Close();
   const std::string old_cache = ReadCache();
   Open();
-  ASSERT_TRUE(Impl()->TEST_StatsCacheLoaded());
+  ASSERT_FALSE(Impl()->TEST_StatsCacheLoaded());
   ASSERT_TRUE(db_->Put(WriteOptions(), "new", "x").ok());
   Flush();
   Close();
@@ -416,10 +416,9 @@ TEST_F(StatsCacheTest, ManifestStatsTrackFlushCompactionAndWALRecovery) {
   Expected(2, 2, 4);
 }
 
-TEST_F(StatsCacheTest, ManifestStatsDeltaUnderflowFallsBackToSSTScan) {
+TEST_F(StatsCacheTest, ManifestStatsDeltaUnderflowUsesValidLegacyCache) {
   Prepare();
   Close();
-  ASSERT_TRUE(env_.RemoveFile(env_.cache_path).ok());
 
   std::string current;
   ASSERT_TRUE(ReadFileToString(&env_, CurrentFileName(path_), &current).ok());
@@ -446,8 +445,8 @@ TEST_F(StatsCacheTest, ManifestStatsDeltaUnderflowFallsBackToSSTScan) {
   options_.create_if_missing = false;
   env_.tables_opened = 0;
   Open();
-  EXPECT_FALSE(Impl()->TEST_StatsCacheLoaded());
-  EXPECT_GT(env_.tables_opened.load(), uint64_t{0});
+  EXPECT_TRUE(Impl()->TEST_StatsCacheLoaded());
+  EXPECT_EQ(uint64_t{0}, env_.tables_opened.load());
   Expected(2, 2, 2);
 }
 
@@ -621,7 +620,7 @@ TEST_F(StatsCacheTest, OptionalCacheWriteFailureDoesNotDamageDatabase) {
   ExpectManifestRecovery();
   Close();
   Open();
-  EXPECT_TRUE(Impl()->TEST_StatsCacheLoaded());
+  EXPECT_FALSE(Impl()->TEST_StatsCacheLoaded());
   Expected(2, 2, 2);
 }
 
