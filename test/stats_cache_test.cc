@@ -516,6 +516,54 @@ TEST_F(StatsCacheTest, ManifestRolloverKeepsStatsSnapshotAndReclaimsOldLog) {
   Expected(3, 3, 3);
 }
 
+TEST_F(StatsCacheTest, LargeStatsSnapshotDoesNotRolloverOnEveryFlush) {
+  Close();
+  options_.write_buffer_size = 1 << 20;
+  Open();
+
+  for (int i = 0; i < 75000; ++i) {
+    ASSERT_TRUE(db_->Put(WriteOptions(),
+                         "large-key-" + std::to_string(i), "value").ok())
+        << i;
+  }
+  Flush();
+
+  auto current_manifest = [this]() {
+    std::string current;
+    EXPECT_TRUE(ReadFileToString(&env_, CurrentFileName(path_), &current).ok());
+    EXPECT_FALSE(current.empty());
+    EXPECT_EQ('\n', current.back());
+    if (!current.empty() && current.back() == '\n') current.pop_back();
+    return current;
+  };
+  const std::string manifest = current_manifest();
+  uint64_t manifest_size = 0;
+  ASSERT_TRUE(env_.GetFileSize(path_ + "/" + manifest, &manifest_size).ok());
+  ASSERT_GT(manifest_size, uint64_t{1 << 20});
+
+  for (int batch = 0; batch < 3; ++batch) {
+    for (int i = 0; i < 100; ++i) {
+      const int key = 75000 + batch * 100 + i;
+      ASSERT_TRUE(db_->Put(WriteOptions(),
+                           "large-key-" + std::to_string(key), "value").ok());
+    }
+    Flush();
+    EXPECT_EQ(manifest, current_manifest());
+  }
+
+  Close();
+  options_.create_if_missing = false;
+  Open();
+  const std::string reopened_manifest = current_manifest();
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_TRUE(db_->Put(WriteOptions(),
+                         "large-key-" + std::to_string(75300 + i), "value")
+                    .ok());
+  }
+  Flush();
+  EXPECT_EQ(reopened_manifest, current_manifest());
+}
+
 TEST_F(StatsCacheTest, FailedManifestRolloverKeepsOldRecoveryPoint) {
   Prepare();
   std::string current;

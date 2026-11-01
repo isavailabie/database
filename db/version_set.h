@@ -315,6 +315,7 @@ class VersionSet {
   StatsCounts stats_counts_;
   uint64_t stats_total_;
   bool has_stats_snapshot_;
+  uint64_t manifest_rollover_threshold_;
   uint64_t next_file_number_;
   uint64_t manifest_file_number_;
   uint64_t last_sequence_;

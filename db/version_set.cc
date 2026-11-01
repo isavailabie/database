@@ -26,6 +26,17 @@ static size_t TargetFileSize(const Options* options) {
   return options->max_file_size;
 }
 
+// A large snapshot needs append space proportional to its size before another
+// full checkpoint is worthwhile.
+static uint64_t ManifestRolloverThreshold(uint64_t snapshot_size,
+                                          uint64_t target_size) {
+  const uint64_t growth = std::max(snapshot_size, target_size);
+  if (snapshot_size > std::numeric_limits<uint64_t>::max() - growth) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return snapshot_size + growth;
+}
+
 // Maximum bytes of overlaps in grandparent (i.e., level+2) before we
 // stop building a single file in a level->level+1 compaction.
 static int64_t MaxGrandParentOverlapBytes(const Options* options) {
@@ -748,6 +759,7 @@ VersionSet::VersionSet(const std::string& dbname, const Options* options,
       stats_counts_(StatsKeyLess{cmp->user_comparator()}),
       stats_total_(0),
       has_stats_snapshot_(false),
+      manifest_rollover_threshold_(0),
       next_file_number_(2),
       manifest_file_number_(0),  // Filled by Recover()
       last_sequence_(0),
@@ -872,18 +884,59 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
     Status size_status = env_->GetFileSize(
         DescriptorFileName(dbname_, manifest_file_number_), &manifest_size);
     if (!size_status.ok()) return size_status;
-    if (manifest_size >= TargetFileSize(options_)) {
+    if (manifest_size >= manifest_rollover_threshold_) {
       create_new_manifest = true;
       new_manifest_number = NewFileNumber();
     }
   }
   edit->SetNextFile(next_file_number_);
 
-  StatsCounts next_stats = stats_counts_;
   uint64_t next_stats_total = stats_total_;
   bool next_has_stats_snapshot = has_stats_snapshot_;
-  Status s = ApplyStatsEdit(*edit, &next_stats, &next_stats_total,
-                            &next_has_stats_snapshot);
+  StatsCounts pending_stats(StatsKeyLess{icmp_.user_comparator()});
+  StatsCounts replacement_stats(StatsKeyLess{icmp_.user_comparator()});
+  Status s;
+  if (edit->has_stats_snapshot_) {
+    next_stats_total = 0;
+    next_has_stats_snapshot = false;
+    s = ApplyStatsEdit(*edit, &replacement_stats, &next_stats_total,
+                       &next_has_stats_snapshot);
+  } else {
+    s = Status::OK();
+    if (has_stats_snapshot_) {
+      for (const StatsDelta& delta : edit->stats_deltas_) {
+        const auto pending = pending_stats.find(delta.key);
+        const auto current = stats_counts_.find(delta.key);
+        const bool found = pending != pending_stats.end() ||
+                           current != stats_counts_.end();
+        uint64_t count = 0;
+        if (pending != pending_stats.end()) {
+          count = pending->second;
+        } else if (current != stats_counts_.end()) {
+          count = current->second;
+        }
+        if (delta.add) {
+          if (delta.count >
+                  std::numeric_limits<uint64_t>::max() - next_stats_total ||
+              delta.count > std::numeric_limits<uint64_t>::max() - count) {
+            s = Status::Corruption("stats delta overflow");
+            break;
+          }
+          count += delta.count;
+          next_stats_total += delta.count;
+        } else {
+          if (!found || count < delta.count ||
+              next_stats_total < delta.count) {
+            s = Status::Corruption("stats delta underflow");
+            break;
+          }
+          count -= delta.count;
+          next_stats_total -= delta.count;
+        }
+        pending_stats.insert_or_assign(delta.key, count);
+      }
+    }
+  }
   const bool changes_files =
       !edit->deleted_files_.empty() || !edit->new_files_.empty();
   if (s.ok() && has_stats_snapshot_ && changes_files &&
@@ -909,6 +962,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
   std::string new_manifest_file;
   WritableFile* new_descriptor_file = nullptr;
   log::Writer* new_descriptor_log = nullptr;
+  uint64_t new_manifest_rollover_threshold = manifest_rollover_threshold_;
   s = Status::OK();
   if (create_new_manifest) {
     new_manifest_file = DescriptorFileName(dbname_, new_manifest_number);
@@ -916,6 +970,14 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
     if (s.ok()) {
       new_descriptor_log = new log::Writer(new_descriptor_file);
       s = WriteSnapshot(new_descriptor_log);
+    }
+    if (s.ok()) {
+      uint64_t snapshot_size = 0;
+      s = env_->GetFileSize(new_manifest_file, &snapshot_size);
+      if (s.ok()) {
+        new_manifest_rollover_threshold = ManifestRolloverThreshold(
+            snapshot_size, TargetFileSize(options_));
+      }
     }
   }
 
@@ -959,11 +1021,27 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
       new_descriptor_log = nullptr;
       new_descriptor_file = nullptr;
       manifest_file_number_ = new_manifest_number;
+      manifest_rollover_threshold_ = new_manifest_rollover_threshold;
     }
     AppendVersion(v);
     log_number_ = edit->log_number_;
     prev_log_number_ = edit->prev_log_number_;
-    stats_counts_.swap(next_stats);
+    if (edit->has_stats_snapshot_) {
+      stats_counts_.swap(replacement_stats);
+    } else {
+      for (const auto& change : pending_stats) {
+        if (change.second == 0) {
+          stats_counts_.erase(change.first);
+        } else {
+          const auto existing = stats_counts_.find(change.first);
+          if (existing == stats_counts_.end()) {
+            stats_counts_.emplace(change.first, change.second);
+          } else {
+            existing->second = change.second;
+          }
+        }
+      }
+    }
     stats_total_ = next_stats_total;
     has_stats_snapshot_ = next_has_stats_snapshot;
   } else {
@@ -1017,6 +1095,7 @@ Status VersionSet::Recover(bool* save_manifest) {
   uint64_t log_number = 0;
   uint64_t prev_log_number = 0;
   uint32_t format_version = 0;
+  uint64_t stats_snapshot_size = 0;
   Builder builder(this, current_);
   int read_records = 0;
 
@@ -1061,6 +1140,11 @@ Status VersionSet::Recover(bool* save_manifest) {
           stats_total_ = 0;
           has_stats_snapshot_ = false;
         }
+      }
+      if (s.ok() && edit.has_stats_snapshot_ && has_stats_snapshot_) {
+        stats_snapshot_size = record.size();
+      } else if (!has_stats_snapshot_) {
+        stats_snapshot_size = 0;
       }
       if (s.ok() && has_stats_snapshot_ &&
           (!edit.deleted_files_.empty() || !edit.new_files_.empty()) &&
@@ -1131,6 +1215,8 @@ Status VersionSet::Recover(bool* save_manifest) {
     last_sequence_ = last_sequence;
     log_number_ = log_number;
     prev_log_number_ = prev_log_number;
+    manifest_rollover_threshold_ = ManifestRolloverThreshold(
+        stats_snapshot_size, TargetFileSize(options_));
 
     // See if we can reuse the existing MANIFEST file.
     if (ReuseManifest(dscname, current)) {
@@ -1159,7 +1245,7 @@ bool VersionSet::ReuseManifest(const std::string& dscname,
       manifest_type != kDescriptorFile ||
       !env_->GetFileSize(dscname, &manifest_size).ok() ||
       // Make new compacted MANIFEST if old one is too big
-      manifest_size >= TargetFileSize(options_)) {
+      manifest_size >= manifest_rollover_threshold_) {
     return false;
   }
 

@@ -12,6 +12,15 @@
 #ifdef HW_TEACHER
 #include "hidden.h"
 #endif
+
+static long PeakRssKiB(const rusage& usage) {
+#ifdef __APPLE__
+  return usage.ru_maxrss / 1024;
+#else
+  return usage.ru_maxrss;
+#endif
+}
+
 int main(int argc,char** argv){
   using namespace hw;
   Config c;Cases cases;AddPerformance(cases);
@@ -40,7 +49,7 @@ int main(int argc,char** argv){
     Check(c.keys>0&&c.threads>0&&c.rounds>0&&c.value_bytes>=16&&c.expired_percent<=100&&!c.path.empty(),"invalid config");
     auto it=cases.find(c.name);Check(it!=cases.end(),"unknown case "+c.name);it->second(c);
     rusage usage{};getrusage(RUSAGE_SELF,&usage);
-    std::cout<<"HW_RESULT {\"case\":"<<Json(c.name)<<",\"status\":\"pass\",\"peak_rss_kib\":"<<usage.ru_maxrss<<",\"metrics\":[";
+    std::cout<<"HW_RESULT {\"case\":"<<Json(c.name)<<",\"status\":\"pass\",\"peak_rss_kib\":"<<PeakRssKiB(usage)<<",\"metrics\":[";
     bool first=true;for(const auto& m:Metrics()){if(!first)std::cout<<',';first=false;
       std::cout<<"{\"phase\":"<<Json(m.name)<<",\"ops\":"<<m.ops<<",\"seconds\":"<<m.seconds
         <<",\"ops_per_second\":"<<(m.seconds>0?m.ops/m.seconds:0)<<",\"p50_us\":"<<m.p50<<",\"p95_us\":"<<m.p95<<",\"p99_us\":"<<m.p99

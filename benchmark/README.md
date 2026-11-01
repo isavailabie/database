@@ -88,6 +88,6 @@ python3 benchmark/compare.py build/evaluation-baseline build/evaluation-combined
 
 下载源码 ZIP 的用户可以从 Google LevelDB 仓库按上述固定提交下载基线源码，将其解压到仓库之外，再将 `--source` 指向该目录。运行器本身不依赖 Git 历史。
 
-报告应给出三轮测量的中位数和波动。吞吐包含驱动中的数据生成和校验，峰值 RSS 包含测试模型和缓存。
+报告应给出三轮测量的中位数和波动。吞吐包含驱动中的数据生成和校验，峰值 RSS 包含测试模型和缓存，并统一以 KiB 报告（Linux 的 `ru_maxrss` 原本为 KiB，macOS 的字节值会转换为 KiB）。
 
 `regression-source/` 仅保存固定版本的原生回归测试文件；`package.json` 提供其校验信息和依赖版本。
