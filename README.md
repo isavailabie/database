@@ -221,11 +221,12 @@ standard 默认每组重复三次。性能测量建议将输出放在原生 Linu
 - combined standard matrix：168/168 场景通过，三次重复及固定原生回归通过。100,000 键 `perf_reopen` 的 open 阶段中位数约 54.5 ms；这是本机诊断数据，不与历史 Intel/Linux 数字直接比较，也不作为课程机器的性能成绩。
 - benchmark runner 的硬件信息收集现支持 Linux `/proc` 与 macOS `sysctl`。本轮在 macOS 原生环境执行；课程正式验收仍需在 Linux/WSL2 环境按要求复跑。没有可用性能基线源码，因此本轮未运行 baseline 对比。
 
-**重开优化复验（2026-11-02，Ubuntu 22 容器）：**
+**当前源码复验（2026-11-02，Ubuntu 22 容器）：**
 
-- 同一容器、100,000 键、三轮 `perf_reopen` 的中位数从提交 `6587650` 的 50.8 ms 降至当前实现的 26.8 ms，约快 47%。该场景只计 Open，不包括关闭和 STATS 写入。
-- 完整 CTest 8/8、公开 combined quick 22/22，以及 stats cache 和 metadata 专项均通过。combined quick 本轮跳过固定原生回归子套件。
-- 这是单一环境的诊断性对照，不代表其他机器或完整打开/关闭周期的性能保证。
+- 当前源码快照下，combined quick 22/22 和 100,000 键 standard matrix 168/168 均通过；两轮的固定原生、C、POSIX Env 回归也均通过。
+- 一百万键 `perf_write` 与 `perf_reopen` 各运行三轮，6/6 通过。测试为单线程、256 字节值、50% TTL 过期比例；写入阶段中位数 3.67 s（3.53–3.80 s），进程峰值 RSS 中位数约 392 MiB（392.0–392.1 MiB），阶段内 MANIFEST 追加量每轮约 47.25 MiB。
+- 重开阶段中位数 305 ms（303–306 ms），进程峰值 RSS 中位数约 533 MiB（532.7–533.3 MiB）。重开阶段追加 MANIFEST 约 18.14 MiB；这项指标包括 Open 期间的 MANIFEST 追加，不包含设备层物理写放大。
+- 写入场景排空后的数据库目录约 279.5 MiB，重开场景约 279.7 MiB。吞吐和 RSS 是本 Docker 配置下的诊断值；峰值 RSS 包含 benchmark 进程、数据模型与缓存，不代表目标机器容量保证。
 
 以下 2026-10-19 的结果是在 Intel Mac 的 Ubuntu 24.04 容器中（4 CPU、6 GiB、GCC 13.3、CMake 3.28.3、Python 3.12.3）对较早实现版本取得的历史数据，不是本轮 MANIFEST 统计增量实现的重新验收：
 
@@ -251,21 +252,20 @@ standard 默认每组重复三次。性能测量建议将输出放在原生 Linu
 - 新格式版本 2 的增量会校验正负计数和总数边界；未知未来格式与版本回退明确拒绝。MANIFEST 日志记录本身损坏仍按元数据恢复错误处理，不能把不可解析的文件版本变更当作有效状态。
 - `LogAndApply` 对增量只暂存本次涉及的键，MANIFEST 提交成功后才应用到内存统计表；不再为每次 flush/compaction 复制整张 SST 统计映射。完整快照按需构造，并将已构造的条目向量移动到 `VersionEdit`，避免再复制一份；重开时直接遍历 MANIFEST 统计映射构造运行时映射，不再创建中间全量向量。序列化缓冲和两份常驻映射的高基数内存成本仍存在。
 
-测试覆盖旧格式升级、无 STATS 缓存的 MANIFEST 恢复、WAL 记录合并、flush/compaction 计数变化、语义计数 underflow/overflow 扫描回退、rollover 后检查点恢复及旧 MANIFEST 回收。现另覆盖高基数检查点下多个小 flush 不会反复重写完整统计映射，以及 rollover 的新 MANIFEST 创建失败、本次 edit 的 header/payload append 失败、Sync 失败和 CURRENT rename 失败；每种失败注入都检查旧恢复入口仍有效，并在移除注入后重开验证 WAL 数据与统计。真实磁盘空间耗尽、断电/进程崩溃切点与目录元数据持久性仍待验证；极大键映射的峰值快照内存与长期写放大仍需在目标数据规模下进一步测量。
+测试覆盖旧格式升级、无 STATS 缓存的 MANIFEST 恢复、WAL 记录合并、flush/compaction 计数变化、语义计数 underflow/overflow 扫描回退、rollover 后检查点恢复及旧 MANIFEST 回收。现另覆盖高基数检查点下多个小 flush 不会反复重写完整统计映射，以及 rollover 的新 MANIFEST 创建失败、本次 edit 的 header/payload append 失败、Sync 失败和 CURRENT rename 失败；每种失败注入都检查旧恢复入口仍有效，并在移除注入后重开验证 WAL 数据与统计。Ubuntu 22 的 64 MiB `/dev/shm` 上另验证了实际 ENOSPC 导致 rollover 失败后旧恢复入口仍有效；子进程在新 MANIFEST Sync 后、CURRENT rename 成功后立即退出的两个切点也均验证重开数据和统计。真实块设备故障、断电和目录元数据持久性仍未覆盖。
 
-### 建议实施顺序
+### 剩余边界与后续验证
 
-1. 建立并记录现有 Linux 基线，分别运行课程 TTL、统计测试、combined quick、原生回归和已有故障恢复用例；当前 macOS runner 也可执行，但不能替代课程指定的 Linux/WSL2 环境验收。
-2. 固化统计和 TTL 不变量，补齐 WAL、SST、MANIFEST、统计辅助文件之间的提交/回退故障测试。
-3. 已实现 MANIFEST 统计增量、完整快照与阈值 rollover；I/O 返回错误的 rollover 故障注入和 10 万键标准矩阵已覆盖，真实磁盘空间耗尽、rollover 进程崩溃切点仍待验证。
-4. TTL 使用绝对墙上时钟截止时间；正常前进/回拨、快照固定读取时间，以及 Compaction 解锁期间回拨的安装保护已有可控时钟测试。真实系统调时和休眠/恢复后的行为仍需在目标操作系统确认。
-5. 已为 MANIFEST 增加格式版本标记：缺少标记的旧格式仍可读取、扫描统计并升级；未来版本及版本回退会明确拒绝。旧二进制回滚到新格式数据库不支持。
-6. 已验证部分文件/元数据 I/O 错误和旧 SST 被活跃迭代器/快照引用时的行为；继续验证真实 ENOSPC、断电后的目录元数据持久性和后台 Compaction 持续失败时的反馈及写入影响。
-7. 已有 10 万键课程矩阵及性能场景；仍需专门量化统计映射峰值内存、MANIFEST 快照字节/增长曲线、关闭写放大，以及更大键基数下的恢复耗时。
+当前源码下的 Linux quick、100,000 键 standard matrix、MANIFEST 故障测试和一百万键三轮写入/重开均已完成。尚未覆盖的边界主要是：
 
-上述边界审视是待验证的风险清单，不代表已确认每项都存在缺陷。每个实现阶段都应更新其测试结果和剩余限制，避免把设计目标写成已经完成的功能。
+1. `/dev/shm` 上的实际 ENOSPC 已验证，但真实块设备 ENOSPC、断电后的目录元数据持久性仍未验证。
+2. 百万键三轮已测量峰值 RSS 和 MANIFEST 追加字节；超出百万键的规模、目标部署环境内存上限，以及完整关闭周期成本仍需按实际容量要求评估。
+3. 后台 Compaction 长时间失败时的错误反馈和写入影响，以及目标系统真实调时、休眠/恢复后的 TTL 行为。
+4. MANIFEST 旧格式可迁移到新格式；新格式数据库不支持由旧二进制回滚打开，这是已知兼容边界。
 
-本轮初始审计确认一处发布状态错误：WriteBatch 格式校验通过、但 WAL 追加失败时，原实现仍会推进最新序列号，造成 `seq` 指向未发布的写入。现已改为仅在 WAL 写入和 MemTable 插入均成功后发布序列号；WAL 追加或同步失败后也会拒绝后续写入，直到重开恢复日志状态。新增了 WAL 负载追加中途失败的注入测试，检查失败批次不改变统计/序列号、数据库在重开恢复前拒绝新写，以及恢复后仍可继续写。另增加 MANIFEST 格式回退/未来版本拒绝、旧格式升级、统计增量恢复/回退、rollover 故障切点和旧 MANIFEST 回收测试。2026-10-29 在 macOS 上使用 CMake 4.4.5、AppleClang 21 和 SDK 26.5 完成全量构建；CTest 8/8、rollover 定向注入 5/5、ASan/UBSan combined quick 22/22 和 combined standard matrix 168/168 均通过；固定原生回归 209 项通过、2 个压缩用例按预期跳过，C 回归和 POSIX Env 回归通过。macOS 结果不能替代课程指定的 Linux/WSL2 正式验收或基线比较；本轮未运行 baseline 对比。SDK 27.0 不能由当前 linker 解析，使用系统已有的 SDK 26.5 完成验证，没有替换系统开发工具。真实磁盘空间耗尽、rollover 进程崩溃切点、断电/目录元数据持久性，以及超出 10 万键规模的统计映射内存与写放大仍待验证。
+这些是尚未验证的边界，不代表已确认存在缺陷。继续扩展前应先明确目标数据规模、内存预算和部署环境，再据此设置压力测试阈值。
+
+本轮初始审计确认一处发布状态错误：WriteBatch 格式校验通过、但 WAL 追加失败时，原实现仍会推进最新序列号，造成 `seq` 指向未发布的写入。现已改为仅在 WAL 写入和 MemTable 插入均成功后发布序列号；WAL 追加或同步失败后也会拒绝后续写入，直到重开恢复日志状态。新增了 WAL 负载追加中途失败的注入测试，检查失败批次不改变统计/序列号、数据库在重开恢复前拒绝新写，以及恢复后仍可继续写。另增加 MANIFEST 格式回退/未来版本拒绝、旧格式升级、统计增量恢复/回退、rollover 故障切点和旧 MANIFEST 回收测试。2026-10-29 在 macOS 上使用 CMake 4.4.5、AppleClang 21 和 SDK 26.5 完成全量构建；CTest 8/8、rollover 定向注入 5/5、ASan/UBSan combined quick 22/22 和 combined standard matrix 168/168 均通过；固定原生回归 209 项通过、2 个压缩用例按预期跳过，C 回归和 POSIX Env 回归通过。macOS 结果不能替代课程指定的 Linux/WSL2 正式验收或基线比较；本轮未运行 baseline 对比。SDK 27.0 不能由当前 linker 解析，使用系统已有的 SDK 26.5 完成验证，没有替换系统开发工具。本轮 Ubuntu 22 又完成当前源码 quick 22/22、standard matrix 168/168、stats cache 25/25、compaction crash recovery 2/2，以及一百万键三轮写入和重开；真实块设备 ENOSPC、断电/目录元数据持久性仍待验证。
 
 ## 作者与核验
 

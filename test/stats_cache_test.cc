@@ -1,9 +1,15 @@
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <set>
 #include <string>
+
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #include "db/db_impl.h"
 #include "db/dbformat.h"
@@ -21,6 +27,7 @@ namespace leveldb {
 namespace {
 
 constexpr uint64_t kEpoch = 1700000000000000ULL;
+std::string executable;
 
 class CacheEnv : public EnvWrapper {
  public:
@@ -49,7 +56,14 @@ class CacheEnv : public EnvWrapper {
           env_->fail_manifest_sync.exchange(false)) {
         return Status::IOError("injected MANIFEST sync failure");
       }
-      return file_->Sync();
+      const Status status = file_->Sync();
+#if defined(__unix__) || defined(__APPLE__)
+      if (status.ok() && type_ == kDescriptorFile &&
+          env_->crash_point.load() == 1) {
+        _exit(71);
+      }
+#endif
+      return status;
     }
 
    private:
@@ -67,9 +81,14 @@ class CacheEnv : public EnvWrapper {
     uint64_t number = 0;
     FileType type = kTempFile;
     if (ParseFileName(path.substr(path.find_last_of('/') + 1), &number, &type) &&
-        type == kDescriptorFile && fail_manifest_create.exchange(false)) {
-      *result = nullptr;
-      return Status::IOError("injected MANIFEST creation failure");
+        type == kDescriptorFile) {
+      if (consume_space_on_manifest_create.exchange(false)) {
+        FillFilesystem(path + ".fill");
+      }
+      if (fail_manifest_create.exchange(false)) {
+        *result = nullptr;
+        return Status::IOError("injected MANIFEST creation failure");
+      }
     }
     WritableFile* file = nullptr;
     Status status = target()->NewWritableFile(path, &file);
@@ -102,7 +121,14 @@ class CacheEnv : public EnvWrapper {
     if (target_path == current_path && fail_current_rename.exchange(false)) {
       return Status::IOError("injected CURRENT rename failure");
     }
-    return target()->RenameFile(source, target_path);
+    const Status status = target()->RenameFile(source, target_path);
+#if defined(__unix__) || defined(__APPLE__)
+    if (status.ok() && target_path == current_path &&
+        crash_point.load() == 2) {
+      _exit(72);
+    }
+#endif
+    return status;
   }
   std::atomic<uint64_t> now{kEpoch};
   std::atomic<uint64_t> tables_opened{0};
@@ -111,9 +137,35 @@ class CacheEnv : public EnvWrapper {
   std::atomic<bool> fail_manifest_create{false};
   std::atomic<bool> fail_manifest_sync{false};
   std::atomic<int> fail_manifest_append_index{-1};
+  std::atomic<bool> consume_space_on_manifest_create{false};
+  std::atomic<bool> observed_enospc{false};
+  std::atomic<int> crash_point{0};
   std::string current_path;
+  std::string fill_path;
   bool fail_cache_write = false;
   std::string cache_path;
+
+ private:
+  void FillFilesystem(const std::string& path) {
+    fill_path = path;
+    WritableFile* file = nullptr;
+    Status status = target()->NewWritableFile(fill_path, &file);
+    if (!status.ok()) {
+      observed_enospc =
+          status.ToString().find("No space left on device") != std::string::npos;
+      return;
+    }
+    std::unique_ptr<WritableFile> owned_file(file);
+    const std::string block(1 << 20, 'x');
+    for (uint64_t written = 0;
+         status.ok() && written < uint64_t{64} * 1024 * 1024;
+         written += block.size()) {
+      status = owned_file->Append(block);
+    }
+    observed_enospc =
+        status.ToString().find("No space left on device") != std::string::npos;
+    owned_file->Close();
+  }
 };
 
 class StatsCacheTest : public testing::Test {
@@ -211,6 +263,35 @@ class StatsCacheTest : public testing::Test {
     std::string value;
     ASSERT_TRUE(db_->Get(ReadOptions(), "rollover", &value).ok());
     EXPECT_EQ("value", value);
+  }
+  void VerifyRolloverCrash(int point) {
+#if defined(__unix__) || defined(__APPLE__)
+    Prepare();
+    Close();
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+      const std::string argument = std::to_string(point);
+      execl(executable.c_str(), executable.c_str(), "--crash-rollover",
+            path_.c_str(), argument.c_str(), static_cast<char*>(nullptr));
+      _exit(127);
+    }
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(70 + point, WEXITSTATUS(status));
+
+    options_.create_if_missing = false;
+    options_.reuse_logs = true;
+    Open();
+    Expected(3, 3, 3);
+    std::string value;
+    ASSERT_TRUE(db_->Get(ReadOptions(), "rollover", &value).ok());
+    EXPECT_EQ("value", value);
+#else
+    GTEST_SKIP() << "process crash injection requires POSIX";
+#endif
   }
   std::string ReadCache() {
     std::string contents;
@@ -611,6 +692,56 @@ TEST_F(StatsCacheTest, ManifestRolloverSyncFailureKeepsOldRecoveryPoint) {
   VerifyRolloverFailure(-1, false, true);
 }
 
+TEST_F(StatsCacheTest, RealEnospcDuringManifestRolloverKeepsOldRecoveryPoint) {
+  const char* test_tmpdir = std::getenv("TEST_TMPDIR");
+  if (test_tmpdir == nullptr ||
+      std::string(test_tmpdir).find("/dev/shm/ldb-enospc-test-") != 0 ||
+      path_.find(test_tmpdir) != 0) {
+    GTEST_SKIP() << "requires a dedicated bounded tmpfs test directory";
+  }
+  Prepare();
+  std::string current;
+  ASSERT_TRUE(ReadFileToString(&env_, CurrentFileName(path_), &current).ok());
+  ASSERT_FALSE(current.empty());
+  ASSERT_EQ('\n', current.back());
+  current.pop_back();
+  const std::string previous = current;
+
+  env_.force_manifest_rollover = true;
+  env_.consume_space_on_manifest_create = true;
+  ASSERT_TRUE(db_->Put(WriteOptions(), "rollover", "value").ok());
+  const Status flush = Impl()->TEST_CompactMemTable();
+  const bool observed_enospc = env_.observed_enospc.load();
+  const Status remove_fill = env_.RemoveFile(env_.fill_path);
+  ASSERT_TRUE(remove_fill.ok()) << remove_fill.ToString();
+  ASSERT_TRUE(observed_enospc);
+  ASSERT_TRUE(flush.IsIOError()) << flush.ToString();
+  ASSERT_TRUE(ReadFileToString(&env_, CurrentFileName(path_), &current).ok());
+  ASSERT_FALSE(current.empty());
+  ASSERT_EQ('\n', current.back());
+  current.pop_back();
+  EXPECT_EQ(previous, current);
+  EXPECT_TRUE(env_.FileExists(path_ + "/" + previous));
+
+  env_.force_manifest_rollover = false;
+  env_.consume_space_on_manifest_create = false;
+  Close();
+  options_.reuse_logs = true;
+  Open();
+  Expected(3, 3, 3);
+  std::string value;
+  ASSERT_TRUE(db_->Get(ReadOptions(), "rollover", &value).ok());
+  EXPECT_EQ("value", value);
+}
+
+TEST_F(StatsCacheTest, RolloverCrashAfterManifestSyncKeepsOldRecoveryPoint) {
+  VerifyRolloverCrash(1);
+}
+
+TEST_F(StatsCacheTest, RolloverCrashAfterCurrentRenameUsesNewRecoveryPoint) {
+  VerifyRolloverCrash(2);
+}
+
 TEST_F(StatsCacheTest, OptionalCacheWriteFailureDoesNotDamageDatabase) {
   Prepare();
   env_.fail_cache_write = true;
@@ -639,7 +770,31 @@ TEST_F(StatsCacheTest, DestroyDBRemovesCacheAndAllowsFreshEmptyDatabase) {
 }  // namespace
 }  // namespace leveldb
 
+int CrashRollover(const std::string& path, int point) {
+  leveldb::CacheEnv env;
+  leveldb::Options options;
+  options.env = &env;
+  options.create_if_missing = false;
+  options.reuse_logs = true;
+  env.cache_path = path + "/STATS";
+  env.current_path = leveldb::CurrentFileName(path);
+  leveldb::DB* raw = nullptr;
+  if (!leveldb::DB::Open(options, path, &raw).ok()) return 10;
+  std::unique_ptr<leveldb::DB> db(raw);
+  leveldb::WriteOptions write;
+  write.sync = true;
+  if (!db->Put(write, "rollover", "value").ok()) return 11;
+  env.force_manifest_rollover = true;
+  env.crash_point = point;
+  static_cast<leveldb::DBImpl*>(db.get())->TEST_CompactMemTable();
+  return 12;
+}
+
 int main(int argc, char** argv) {
+  if (argc == 4 && std::string(argv[1]) == "--crash-rollover") {
+    return CrashRollover(argv[2], std::stoi(argv[3]));
+  }
+  leveldb::executable = argv[0];
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }

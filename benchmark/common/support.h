@@ -24,6 +24,7 @@
 #include <sys/resource.h>
 #include <unistd.h>
 #include "db/db_impl.h"
+#include "db/filename.h"
 #include "leveldb/cache.h"
 #include "leveldb/comparator.h"
 #include "leveldb/db.h"
@@ -63,7 +64,7 @@ class TestEnv : public EnvWrapper {
  public:
   explicit TestEnv(bool real=false):EnvWrapper(Env::Default()), real_(real) {}
   uint64_t NowMicros() override { return real_ ? target()->NowMicros() : now.load(); }
-  std::atomic<uint64_t> now{kEpoch}, bytes_written{0};
+  std::atomic<uint64_t> now{kEpoch}, bytes_written{0}, manifest_bytes_written{0};
   void Schedule(void (*fn)(void*), void* arg) override {
     auto* task=new Task{this,fn,arg};
     { std::lock_guard<std::mutex> l(mu_); ++pending_; }
@@ -80,26 +81,39 @@ class TestEnv : public EnvWrapper {
   }
   Status NewWritableFile(const std::string& n, WritableFile** out) override {
     Status s=target()->NewWritableFile(n,out);
-    if(s.ok()) *out=new CountFile(this,*out);
+    if(s.ok()) *out=new CountFile(this,*out,IsManifestFile(n));
     return s;
   }
   Status NewAppendableFile(const std::string& n, WritableFile** out) override {
     Status s=target()->NewAppendableFile(n,out);
-    if(s.ok()) *out=new CountFile(this,*out);
+    if(s.ok()) *out=new CountFile(this,*out,IsManifestFile(n));
     return s;
   }
  private:
+  static bool IsManifestFile(const std::string& path) {
+    uint64_t number = 0;
+    FileType type = kTempFile;
+    const size_t separator = path.find_last_of("/\\");
+    const std::string basename =
+        separator == std::string::npos ? path : path.substr(separator + 1);
+    return ParseFileName(basename, &number, &type) && type == kDescriptorFile;
+  }
   struct Task { TestEnv* env; void (*fn)(void*); void* arg; };
   class CountFile : public WritableFile {
    public:
-    CountFile(TestEnv* e,WritableFile* f):env_(e),file_(f){}
+    CountFile(TestEnv* e,WritableFile* f,bool manifest):env_(e),file_(f),manifest_(manifest){}
     Status Append(const Slice& x) override {
-      Status s=file_->Append(x); if(s.ok()) env_->bytes_written+=x.size(); return s;
+      Status s=file_->Append(x);
+      if(s.ok()) {
+        env_->bytes_written+=x.size();
+        if(manifest_) env_->manifest_bytes_written+=x.size();
+      }
+      return s;
     }
     Status Close() override {return file_->Close();}
     Status Flush() override {return file_->Flush();}
     Status Sync() override {return file_->Sync();}
-   private: TestEnv* env_; std::unique_ptr<WritableFile> file_;
+   private: TestEnv* env_; std::unique_ptr<WritableFile> file_; bool manifest_;
   };
   bool real_; std::mutex mu_; std::condition_variable cv_; size_t pending_=0;
 };
@@ -167,20 +181,20 @@ inline uint64_t DiskBytes(DBState& s){
   for(const auto& n:names){uint64_t z=0;if(s.env.GetFileSize(s.path+"/"+n,&z).ok())sum+=z;}
   return sum;
 }
-struct Metric {std::string name;uint64_t ops=0;double seconds=0,p50=0,p95=0,p99=0;uint64_t bytes=0,disk=0,samples=0;};
+struct Metric {std::string name;uint64_t ops=0;double seconds=0,p50=0,p95=0,p99=0;uint64_t bytes=0,manifest_bytes=0,disk=0,samples=0;};
 inline std::vector<Metric>& Metrics(){static std::vector<Metric> m;return m;}
 class Measure {
  public:
-  Measure(DBState& d,std::string n):s_(d),name_(std::move(n)),start_(Clock::now()),bytes_(d.env.bytes_written){}
+  Measure(DBState& d,std::string n):s_(d),name_(std::move(n)),start_(Clock::now()),bytes_(d.env.bytes_written),manifest_bytes_(d.env.manifest_bytes_written){}
   void Sample(size_t i,Clock::time_point start){if(i%64==0)latencies_.push_back(Micros(start));}
   double Elapsed() const { return Micros(start_)/1e6; }
   void Finish(uint64_t ops, double elapsed=-1){
-    Metric m;m.name=name_;m.ops=ops;m.seconds=elapsed<0?Elapsed():elapsed;m.bytes=s_.env.bytes_written.load()-bytes_;
+    Metric m;m.name=name_;m.ops=ops;m.seconds=elapsed<0?Elapsed():elapsed;m.bytes=s_.env.bytes_written.load()-bytes_;m.manifest_bytes=s_.env.manifest_bytes_written.load()-manifest_bytes_;
     std::sort(latencies_.begin(),latencies_.end());
     auto q=[this](double p){return latencies_.empty()?0.0:latencies_[std::min(latencies_.size()-1,size_t(p*(latencies_.size()-1)))];};
     m.samples=latencies_.size();m.p50=q(.5);m.p95=q(.95);m.p99=q(.99);m.disk=DiskBytes(s_);Metrics().push_back(m);
   }
- private: DBState& s_;std::string name_;Clock::time_point start_;uint64_t bytes_;std::vector<double>latencies_;
+ private: DBState& s_;std::string name_;Clock::time_point start_;uint64_t bytes_,manifest_bytes_;std::vector<double>latencies_;
 };
 inline void Load(DBState& d,const Config& c){for(size_t i=0;i<c.keys;++i)Ok(d.db->Put(WriteOptions(),Key(i),Value(i,c.value_bytes)));}
 using Case=std::function<void(const Config&)>;

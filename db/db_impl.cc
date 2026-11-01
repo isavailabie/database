@@ -1739,7 +1739,6 @@ Status DB::Put(const WriteOptions& opt, const Slice& key, const Slice& value) {
 }
 
 Status DB::Put(const WriteOptions&, const Slice&, const Slice&, uint64_t) {
-  // TODO: Replace this starter stub with TTL-aware storage and reads.
   return Status::NotSupported("TTL Put is not implemented");
 }
 

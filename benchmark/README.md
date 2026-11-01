@@ -56,6 +56,8 @@ python3 benchmark/runner.py --kind combined --source "$PWD" \
 | 场景目录中的 `run.log` | 日志记录具体场景的执行情况，帮助定位功能错误或超时。 |
 | `metrics.csv`、`aggregate.json` | 文件记录已产生的性能指标和重复运行的汇总结果。 |
 
+性能场景的 `append_bytes_during_phase` 统计该阶段成功追加到所有文件的字节数；`manifest_bytes_during_phase` 单独统计成功追加到 MANIFEST 文件的字节数，可用于观察统计检查点和增量日志带来的写入量。它不包括阶段开始前或结束后的后台追加，也不等同于设备层物理写入量。
+
 ## 与原生 LevelDB 比较
 
 课程使用 Google LevelDB 的固定提交 `7ee830d02b623e8ffe0b95d59a74db1e58da04c5` 作为普通读写的对照基线。基线引擎源码与课程原有对照版本一致。
