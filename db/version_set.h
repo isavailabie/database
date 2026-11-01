@@ -212,9 +212,13 @@ class VersionSet {
   // Return the last sequence number.
   uint64_t LastSequence() const { return last_sequence_; }
   bool HasStatsSnapshot() const { return has_stats_snapshot_; }
-  void GetStatsSnapshot(
-      std::vector<std::pair<std::string, uint64_t>>* entries,
-      uint64_t* total) const;
+  template <typename Callback>
+  void ForEachStatsEntry(Callback callback) const {
+    for (const auto& entry : stats_counts_) {
+      callback(entry.first, entry.second);
+    }
+  }
+  uint64_t StatsTotal() const { return stats_total_; }
 
   // Set the last sequence number to s.
   void SetLastSequence(uint64_t s) {

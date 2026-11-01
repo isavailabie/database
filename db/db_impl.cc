@@ -576,14 +576,12 @@ Status DBImpl::RebuildStats() {
 
 Status DBImpl::RestoreStatsFromManifest() {
   mutex_.AssertHeld();
-  std::vector<std::pair<std::string, uint64_t>> entries;
-  uint64_t total = 0;
-  versions_->GetStatsSnapshot(&entries, &total);
   key_counts_.clear();
-  total_entries_ = total;
-  for (const auto& entry : entries) {
-    key_counts_.emplace_hint(key_counts_.end(), entry.first, entry.second);
-  }
+  total_entries_ = versions_->StatsTotal();
+  versions_->ForEachStatsEntry(
+      [this](const std::string& key, uint64_t count) {
+        key_counts_.emplace_hint(key_counts_.end(), key, count);
+      });
 
   std::vector<MemTable*> memtables;
   if (mem_ != nullptr) memtables.push_back(mem_);
@@ -657,7 +655,7 @@ Status DBImpl::BuildStatsSnapshot(VersionEdit* edit) {
   }
   std::vector<std::pair<std::string, uint64_t>> entries(counts.begin(),
                                                         counts.end());
-  edit->SetStatsSnapshot(total, entries);
+  edit->SetStatsSnapshot(total, std::move(entries));
   return Status::OK();
 }
 

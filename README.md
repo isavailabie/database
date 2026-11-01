@@ -237,7 +237,7 @@ standard 默认每组重复三次。性能测量建议将输出放在原生 Linu
 - MANIFEST 的增量日志超过当前检查点大小与 `max_file_size` 所允许的增长预算后，在下一次版本提交时先写入包含当前 SST 版本及完整统计映射的新 MANIFEST，再追加本次 edit、同步并切换 `CURRENT`。大统计检查点不会导致每次 flush 都重写整张映射；切换成功后旧 MANIFEST 随 obsolete-file 回收，未成功切换时旧 MANIFEST 仍是恢复入口。
 - 旧 MANIFEST 没有统计检查点、计数增量 underflow/overflow 或统计版本校验失败时，放弃该辅助状态，扫描恢复后的 SST/MemTable 重建并写入新检查点。数据文件恢复不依赖统计元数据。
 - 新格式版本 2 的增量会校验正负计数和总数边界；未知未来格式与版本回退明确拒绝。MANIFEST 日志记录本身损坏仍按元数据恢复错误处理，不能把不可解析的文件版本变更当作有效状态。
-- `LogAndApply` 对增量只暂存本次涉及的键，MANIFEST 提交成功后才应用到内存统计表；不再为每次 flush/compaction 复制整张 SST 统计映射。完整快照仍按需构造，超大键数下的单表内存成本尚未消除。
+- `LogAndApply` 对增量只暂存本次涉及的键，MANIFEST 提交成功后才应用到内存统计表；不再为每次 flush/compaction 复制整张 SST 统计映射。完整快照按需构造，并将已构造的条目向量移动到 `VersionEdit`，避免再复制一份；重开时直接遍历 MANIFEST 统计映射构造运行时映射，不再创建中间全量向量。序列化缓冲和两份常驻映射的高基数内存成本仍存在。
 
 测试覆盖旧格式升级、无 STATS 缓存的 MANIFEST 恢复、WAL 记录合并、flush/compaction 计数变化、语义计数 underflow/overflow 扫描回退、rollover 后检查点恢复及旧 MANIFEST 回收。现另覆盖高基数检查点下多个小 flush 不会反复重写完整统计映射，以及 rollover 的新 MANIFEST 创建失败、本次 edit 的 header/payload append 失败、Sync 失败和 CURRENT rename 失败；每种失败注入都检查旧恢复入口仍有效，并在移除注入后重开验证 WAL 数据与统计。真实磁盘空间耗尽、断电/进程崩溃切点与目录元数据持久性仍待验证；极大键映射的峰值快照内存与长期写放大仍需在目标数据规模下进一步测量。
 

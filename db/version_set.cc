@@ -779,13 +779,6 @@ VersionSet::~VersionSet() {
   delete descriptor_file_;
 }
 
-void VersionSet::GetStatsSnapshot(
-    std::vector<std::pair<std::string, uint64_t>>* entries,
-    uint64_t* total) const {
-  entries->assign(stats_counts_.begin(), stats_counts_.end());
-  *total = stats_total_;
-}
-
 Status VersionSet::ApplyStatsEdit(const VersionEdit& edit,
                                   StatsCounts* counts, uint64_t* total,
                                   bool* valid) const {
@@ -1318,7 +1311,7 @@ Status VersionSet::WriteSnapshot(log::Writer* log) {
   if (has_stats_snapshot_) {
     std::vector<std::pair<std::string, uint64_t>> entries(stats_counts_.begin(),
                                                           stats_counts_.end());
-    edit.SetStatsSnapshot(stats_total_, entries);
+    edit.SetStatsSnapshot(stats_total_, std::move(entries));
   }
 
   // Save compaction pointers

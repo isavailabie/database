@@ -72,6 +72,13 @@ class VersionEdit {
     stats_snapshot_total_ = total;
     stats_snapshot_ = entries;
   }
+  void SetStatsSnapshot(
+      uint64_t total,
+      std::vector<std::pair<std::string, uint64_t>>&& entries) {
+    has_stats_snapshot_ = true;
+    stats_snapshot_total_ = total;
+    stats_snapshot_ = std::move(entries);
+  }
   void AddStatsDelta(const Slice& key, uint64_t count, bool add) {
     has_stats_delta_ = true;
     stats_deltas_.push_back({key.ToString(), count, add});
