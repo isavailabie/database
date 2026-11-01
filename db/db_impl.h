@@ -97,7 +97,7 @@ class DBImpl : public DB {
   };
   using KeyCounts = std::map<std::string, uint64_t, UserKeyLess>;
 
-  void AddStatsEntry(const Slice& key, uint64_t count = 1)
+  Status AddStatsEntry(const Slice& key, uint64_t count = 1)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   Status RebuildStats() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   Status RestoreStatsFromManifest() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
@@ -161,7 +161,8 @@ class DBImpl : public DB {
                         VersionEdit* edit, SequenceNumber* max_sequence)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
-  Status WriteLevel0Table(MemTable* mem, VersionEdit* edit, Version* base)
+  Status WriteLevel0Table(MemTable* mem, VersionEdit* edit, Version* base,
+                          KeyCounts* runtime_transfers = nullptr)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   Status MakeRoomForWrite(bool force /* compact even if there is room? */)
@@ -241,8 +242,6 @@ class DBImpl : public DB {
 
   // One ref per internal record in mem/imm/current Version. A flush moves
   // ownership without adding a ref; only committed compaction drops remove it.
-  KeyCounts key_counts_ GUARDED_BY(mutex_);
-  uint64_t total_entries_ GUARDED_BY(mutex_) = 0;
   bool stats_ready_ GUARDED_BY(mutex_) = false;
   bool stats_cache_loaded_ = false;  // Fixed before DB::Open publishes this DB.
 };

@@ -96,8 +96,9 @@ bool DBImpl::LoadStatsCache() {
     total += count;
   }
   if (!input.empty() || total != expected_total) return false;
-  key_counts_.swap(restored);
-  total_entries_ = total;
+  std::vector<std::pair<std::string, uint64_t>> entries(restored.begin(),
+                                                        restored.end());
+  versions_->SetSstStatsFromCache(entries, total);
   stats_cache_loaded_ = true;
   return true;
 }
@@ -108,12 +109,13 @@ void DBImpl::SaveStatsCache() {
   std::string encoded;
   PutLengthPrefixedSlice(&encoded, "LDBSTATS1");
   PutLengthPrefixedSlice(&encoded, StatsFingerprint());
-  PutFixed64(&encoded, total_entries_);
-  PutFixed64(&encoded, key_counts_.size());
-  for (const auto& entry : key_counts_) {
-    PutLengthPrefixedSlice(&encoded, entry.first);
-    PutFixed64(&encoded, entry.second);
-  }
+  PutFixed64(&encoded, versions_->StatsTotal());
+  PutFixed64(&encoded, versions_->DistinctStatsKeys());
+  versions_->ForEachCurrentStatsEntry(
+      [&encoded](const std::string& key, uint64_t count) {
+        PutLengthPrefixedSlice(&encoded, key);
+        PutFixed64(&encoded, count);
+      });
   PutFixed32(&encoded, crc32c::Value(encoded.data(), encoded.size()));
   const std::string temporary = dbname_ + "/STATS.tmp";
   Status status = WriteStringToFileSync(env_, encoded, temporary);

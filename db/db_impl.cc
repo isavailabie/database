@@ -164,8 +164,7 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       background_compaction_scheduled_(false),
       manual_compaction_(nullptr),
       versions_(new VersionSet(dbname_, &options_, table_cache_,
-                               &internal_comparator_)),
-      key_counts_(UserKeyLess{raw_options.comparator}) {}
+                               &internal_comparator_)) {}
 
 DBImpl::~DBImpl() {
   // Wait for background work to finish.
@@ -530,27 +529,20 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
 Status DBImpl::GetCurrentStats(const ReadOptions&, Stats* stats) {
   if (stats == nullptr) return Status::InvalidArgument("null stats");
   MutexLock lock(&mutex_);
-  stats->total_entries = total_entries_;
-  stats->distinct_keys = key_counts_.size();
+  stats->total_entries = versions_->StatsTotal();
+  stats->distinct_keys = versions_->DistinctStatsKeys();
   stats->seq = versions_->LastSequence();
   return Status::OK();
 }
 
-void DBImpl::AddStatsEntry(const Slice& key, uint64_t count) {
+Status DBImpl::AddStatsEntry(const Slice& key, uint64_t count) {
   mutex_.AssertHeld();
-  auto found = key_counts_.find(key);
-  if (found == key_counts_.end()) {
-    key_counts_.emplace(key.ToString(), count);
-  } else {
-    found->second += count;
-  }
-  total_entries_ += count;
+  return versions_->AddRuntimeStats(key, count);
 }
 
 Status DBImpl::RebuildStats() {
   mutex_.AssertHeld();
-  total_entries_ = 0;
-  key_counts_.clear();
+  versions_->ResetStats();
   ReadOptions read;
   read.verify_checksums = true;
   read.fill_cache = false;
@@ -559,30 +551,33 @@ Status DBImpl::RebuildStats() {
   if (imm_ != nullptr) sources.push_back(imm_->NewIterator());
   versions_->current()->AddIterators(read, &sources);
   Status status;
+  const size_t runtime_source_count = 1 + (imm_ != nullptr ? 1 : 0);
+  size_t source_index = 0;
   for (Iterator* source : sources) {
-    for (source->SeekToFirst(); source->Valid(); source->Next()) {
-      ParsedInternalKey key;
-      if (!ParseInternalKey(source->key(), &key)) {
-        status = Status::Corruption("invalid internal key rebuilding stats");
-        break;
+    if (status.ok()) {
+      for (source->SeekToFirst(); source->Valid(); source->Next()) {
+        ParsedInternalKey key;
+        if (!ParseInternalKey(source->key(), &key)) {
+          status = Status::Corruption("invalid internal key rebuilding stats");
+          break;
+        }
+        if (source_index < runtime_source_count) {
+          status = versions_->AddRuntimeStats(key.user_key);
+        } else {
+          status = versions_->AddSstStats(key.user_key);
+        }
+        if (!status.ok()) break;
       }
-      AddStatsEntry(key.user_key);
     }
     if (status.ok()) status = source->status();
     delete source;
+    ++source_index;
   }
   return status;
 }
 
 Status DBImpl::RestoreStatsFromManifest() {
   mutex_.AssertHeld();
-  key_counts_.clear();
-  total_entries_ = versions_->StatsTotal();
-  versions_->ForEachStatsEntry(
-      [this](const std::string& key, uint64_t count) {
-        key_counts_.emplace_hint(key_counts_.end(), key, count);
-      });
-
   std::vector<MemTable*> memtables;
   if (mem_ != nullptr) memtables.push_back(mem_);
   if (imm_ != nullptr) memtables.push_back(imm_);
@@ -593,19 +588,8 @@ Status DBImpl::RestoreStatsFromManifest() {
       if (!ParseInternalKey(iter->key(), &key)) {
         return Status::Corruption("invalid internal key restoring stats");
       }
-      if (total_entries_ == std::numeric_limits<uint64_t>::max()) {
-        return Status::Corruption("stats total overflow restoring WAL");
-      }
-      auto found = key_counts_.find(key.user_key);
-      if (found == key_counts_.end()) {
-        key_counts_.emplace(key.user_key.ToString(), 1);
-      } else {
-        if (found->second == std::numeric_limits<uint64_t>::max()) {
-          return Status::Corruption("stats key count overflow restoring WAL");
-        }
-        ++found->second;
-      }
-      ++total_entries_;
+      Status status = versions_->AddRuntimeStats(key.user_key);
+      if (!status.ok()) return status;
     }
     if (!iter->status().ok()) return iter->status();
   }
@@ -614,53 +598,17 @@ Status DBImpl::RestoreStatsFromManifest() {
 
 Status DBImpl::BuildStatsSnapshot(VersionEdit* edit) {
   mutex_.AssertHeld();
-  KeyCounts counts(UserKeyLess{user_comparator()});
-  uint64_t total = 0;
-  ReadOptions read;
-  read.verify_checksums = true;
-  read.fill_cache = false;
-  std::vector<Iterator*> sources;
-  versions_->current()->AddIterators(read, &sources);
-  Status status;
-  for (size_t i = 0; i < sources.size(); ++i) {
-    Iterator* source = sources[i];
-    for (source->SeekToFirst(); source->Valid(); source->Next()) {
-      ParsedInternalKey key;
-      if (!ParseInternalKey(source->key(), &key)) {
-        status = Status::Corruption("invalid internal key building stats snapshot");
-        break;
-      }
-      auto found = counts.find(key.user_key);
-      if (found == counts.end()) {
-        counts.emplace(key.user_key.ToString(), 1);
-      } else {
-        if (found->second == std::numeric_limits<uint64_t>::max()) {
-          status = Status::Corruption("stats key count overflow");
-          break;
-        }
-        ++found->second;
-      }
-      if (total == std::numeric_limits<uint64_t>::max()) {
-        status = Status::Corruption("stats total overflow");
-        break;
-      }
-      ++total;
-    }
-    if (status.ok()) status = source->status();
-    delete source;
-    if (!status.ok()) {
-      for (++i; i < sources.size(); ++i) delete sources[i];
-      return status;
-    }
-  }
-  std::vector<std::pair<std::string, uint64_t>> entries(counts.begin(),
-                                                        counts.end());
-  edit->SetStatsSnapshot(total, std::move(entries));
+  std::vector<std::pair<std::string, uint64_t>> entries;
+  versions_->ForEachSstStatsEntry(
+      [&entries](const std::string& key, uint64_t count) {
+        entries.emplace_back(key, count);
+      });
+  edit->SetStatsSnapshot(versions_->SstStatsTotal(), std::move(entries));
   return Status::OK();
 }
 
 Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
-                                Version* base) {
+                                Version* base, KeyCounts* runtime_transfers) {
   mutex_.AssertHeld();
   const uint64_t start_micros = env_->NowMicros();
   FileMetaData meta;
@@ -715,6 +663,9 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
       for (const auto& entry : counts) {
         edit->AddStatsDelta(entry.first, entry.second, true);
       }
+      if (runtime_transfers != nullptr) {
+        *runtime_transfers = std::move(counts);
+      }
     }
   }
 
@@ -731,9 +682,10 @@ void DBImpl::CompactMemTable() {
 
   // Save the contents of the memtable as a new Table
   VersionEdit edit;
+  KeyCounts runtime_transfers(UserKeyLess{user_comparator()});
   Version* base = versions_->current();
   base->Ref();
-  Status s = WriteLevel0Table(imm_, &edit, base);
+  Status s = WriteLevel0Table(imm_, &edit, base, &runtime_transfers);
   base->Unref();
 
   if (s.ok() && shutting_down_.load(std::memory_order_acquire)) {
@@ -749,6 +701,9 @@ void DBImpl::CompactMemTable() {
 
   if (s.ok()) {
     // Commit to the new state
+    for (const auto& transfer : runtime_transfers) {
+      versions_->RemoveRuntimeStats(transfer.first, transfer.second);
+    }
     imm_->Unref();
     imm_ = nullptr;
     has_imm_.store(false, std::memory_order_release);
@@ -1100,16 +1055,6 @@ Status DBImpl::InstallCompactionResults(CompactionState* compact) {
   }
   const Status status =
       versions_->LogAndApply(compact->compaction->edit(), &mutex_);
-  if (status.ok()) {
-    // Version installation and removal of its reclaimed refs are one publication.
-    for (const auto& dropped : compact->dropped_entries) {
-      auto found = key_counts_.find(dropped.first);
-      assert(found != key_counts_.end() && found->second >= dropped.second);
-      found->second -= dropped.second;
-      total_entries_ -= dropped.second;
-      if (found->second == 0) key_counts_.erase(found);
-    }
-  }
   return status;
 }
 
@@ -1535,12 +1480,20 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
     }
     // Commit the complete group and sequence under the same lock. WAL copies
     // are not counted, and queries cannot observe a half-published batch.
-    if (status.ok() && WriteBatchInternal::Count(write_batch) > 0) {
-      for (const Slice& key : batch_keys.keys) AddStatsEntry(key);
-    }
     if (valid_batch && status.ok() &&
         WriteBatchInternal::Count(write_batch) > 0) {
       versions_->SetLastSequence(last_sequence);
+      for (const Slice& key : batch_keys.keys) {
+        Status stats_status = AddStatsEntry(key);
+        if (!stats_status.ok()) {
+          Log(options_.info_log,
+              "Rebuilding in-memory statistics after write: %s\n",
+              stats_status.ToString().c_str());
+          status = RebuildStats();
+          if (!status.ok()) RecordBackgroundError(status);
+          break;
+        }
+      }
     }
     if (write_batch == tmp_batch_) tmp_batch_->Clear();
   }

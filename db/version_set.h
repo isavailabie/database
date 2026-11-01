@@ -167,6 +167,11 @@ class Version {
 
 class VersionSet {
  public:
+  struct StatsEntry {
+    uint64_t sst_count = 0;
+    uint64_t runtime_count = 0;
+  };
+
   VersionSet(const std::string& dbname, const Options* options,
              TableCache* table_cache, const InternalKeyComparator*);
   VersionSet(const VersionSet&) = delete;
@@ -213,12 +218,30 @@ class VersionSet {
   uint64_t LastSequence() const { return last_sequence_; }
   bool HasStatsSnapshot() const { return has_stats_snapshot_; }
   template <typename Callback>
-  void ForEachStatsEntry(Callback callback) const {
+  void ForEachSstStatsEntry(Callback callback) const {
     for (const auto& entry : stats_counts_) {
-      callback(entry.first, entry.second);
+      if (entry.second.sst_count != 0) {
+        callback(entry.first, entry.second.sst_count);
+      }
     }
   }
-  uint64_t StatsTotal() const { return stats_total_; }
+  template <typename Callback>
+  void ForEachCurrentStatsEntry(Callback callback) const {
+    for (const auto& entry : stats_counts_) {
+      callback(entry.first, entry.second.sst_count +
+                                entry.second.runtime_count);
+    }
+  }
+  uint64_t StatsTotal() const { return stats_total_ + runtime_total_; }
+  uint64_t SstStatsTotal() const { return stats_total_; }
+  uint64_t DistinctStatsKeys() const { return stats_counts_.size(); }
+  Status AddRuntimeStats(const Slice& key, uint64_t count = 1);
+  void RemoveRuntimeStats(const Slice& key, uint64_t count = 1);
+  Status AddSstStats(const Slice& key, uint64_t count = 1);
+  void ResetStats();
+  void SetSstStatsFromCache(
+      const std::vector<std::pair<std::string, uint64_t>>& entries,
+      uint64_t total);
 
   // Set the last sequence number to s.
   void SetLastSequence(uint64_t s) {
@@ -281,12 +304,20 @@ class VersionSet {
  private:
   class Builder;
   struct StatsKeyLess {
+    using is_transparent = void;
     const Comparator* comparator;
     bool operator()(const std::string& a, const std::string& b) const {
       return comparator->Compare(a, b) < 0;
     }
+    bool operator()(const std::string& a, const Slice& b) const {
+      return comparator->Compare(a, b) < 0;
+    }
+    bool operator()(const Slice& a, const std::string& b) const {
+      return comparator->Compare(a, b) < 0;
+    }
   };
-  using StatsCounts = std::map<std::string, uint64_t, StatsKeyLess>;
+  using StatsCounts = std::map<std::string, StatsEntry, StatsKeyLess>;
+  using PendingStats = std::map<std::string, uint64_t, StatsKeyLess>;
 
   friend class Compaction;
   friend class Version;
@@ -318,6 +349,7 @@ class VersionSet {
   const InternalKeyComparator icmp_;
   StatsCounts stats_counts_;
   uint64_t stats_total_;
+  uint64_t runtime_total_ = 0;
   bool has_stats_snapshot_;
   uint64_t manifest_rollover_threshold_;
   uint64_t next_file_number_;

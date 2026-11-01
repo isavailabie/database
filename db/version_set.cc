@@ -779,6 +779,69 @@ VersionSet::~VersionSet() {
   delete descriptor_file_;
 }
 
+Status VersionSet::AddRuntimeStats(const Slice& key, uint64_t count) {
+  if (count == 0) return Status::OK();
+  auto found = stats_counts_.find(key);
+  if (count > std::numeric_limits<uint64_t>::max() - runtime_total_ ||
+      (found != stats_counts_.end() &&
+       count > std::numeric_limits<uint64_t>::max() -
+                   found->second.runtime_count)) {
+    return Status::Corruption("runtime stats count overflow");
+  }
+  if (found == stats_counts_.end()) {
+    stats_counts_.emplace(key.ToString(), StatsEntry{0, count});
+  } else {
+    found->second.runtime_count += count;
+  }
+  runtime_total_ += count;
+  return Status::OK();
+}
+
+void VersionSet::RemoveRuntimeStats(const Slice& key, uint64_t count) {
+  auto found = stats_counts_.find(key);
+  assert(found != stats_counts_.end());
+  assert(found->second.runtime_count >= count);
+  found->second.runtime_count -= count;
+  runtime_total_ -= count;
+  if (found->second.runtime_count == 0 && found->second.sst_count == 0) {
+    stats_counts_.erase(found);
+  }
+}
+
+Status VersionSet::AddSstStats(const Slice& key, uint64_t count) {
+  if (count == 0) return Status::OK();
+  auto found = stats_counts_.find(key);
+  if (count > std::numeric_limits<uint64_t>::max() - stats_total_ ||
+      (found != stats_counts_.end() &&
+       count > std::numeric_limits<uint64_t>::max() -
+                   found->second.sst_count)) {
+    return Status::Corruption("SST stats count overflow");
+  }
+  if (found == stats_counts_.end()) {
+    stats_counts_.emplace(key.ToString(), StatsEntry{count, 0});
+  } else {
+    found->second.sst_count += count;
+  }
+  stats_total_ += count;
+  return Status::OK();
+}
+
+void VersionSet::ResetStats() {
+  stats_counts_.clear();
+  stats_total_ = 0;
+  runtime_total_ = 0;
+}
+
+void VersionSet::SetSstStatsFromCache(
+    const std::vector<std::pair<std::string, uint64_t>>& entries,
+    uint64_t total) {
+  ResetStats();
+  for (const auto& entry : entries) {
+    stats_counts_.emplace(entry.first, StatsEntry{entry.second, 0});
+  }
+  stats_total_ = total;
+}
+
 Status VersionSet::ApplyStatsEdit(const VersionEdit& edit,
                                   StatsCounts* counts, uint64_t* total,
                                   bool* valid) const {
@@ -795,7 +858,7 @@ Status VersionSet::ApplyStatsEdit(const VersionEdit& edit,
                              restored_total) {
         return Status::Corruption("invalid stats snapshot ordering or count");
       }
-      restored.emplace(entry.first, entry.second);
+      restored.emplace(entry.first, StatsEntry{entry.second, 0});
       restored_total += entry.second;
       previous = entry.first;
       have_previous = true;
@@ -816,23 +879,26 @@ Status VersionSet::ApplyStatsEdit(const VersionEdit& edit,
         return Status::Corruption("stats delta total overflow");
       }
       if (found == counts->end()) {
-        counts->emplace(delta.key, delta.count);
+        counts->emplace(delta.key, StatsEntry{delta.count, 0});
       } else {
-        if (delta.count >
-            std::numeric_limits<uint64_t>::max() - found->second) {
+        if (delta.count > std::numeric_limits<uint64_t>::max() -
+                              found->second.sst_count) {
           return Status::Corruption("stats key count overflow");
         }
-        found->second += delta.count;
+        found->second.sst_count += delta.count;
       }
       *total += delta.count;
     } else {
-      if (found == counts->end() || found->second < delta.count ||
+      if (found == counts->end() ||
+          found->second.sst_count < delta.count ||
           *total < delta.count) {
         return Status::Corruption("stats delta underflow");
       }
-      found->second -= delta.count;
+      found->second.sst_count -= delta.count;
       *total -= delta.count;
-      if (found->second == 0) counts->erase(found);
+      if (found->second.sst_count == 0 && found->second.runtime_count == 0) {
+        counts->erase(found);
+      }
     }
   }
   return Status::OK();
@@ -886,7 +952,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
 
   uint64_t next_stats_total = stats_total_;
   bool next_has_stats_snapshot = has_stats_snapshot_;
-  StatsCounts pending_stats(StatsKeyLess{icmp_.user_comparator()});
+  PendingStats pending_stats(StatsKeyLess{icmp_.user_comparator()});
   StatsCounts replacement_stats(StatsKeyLess{icmp_.user_comparator()});
   Status s;
   if (edit->has_stats_snapshot_) {
@@ -906,7 +972,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
         if (pending != pending_stats.end()) {
           count = pending->second;
         } else if (current != stats_counts_.end()) {
-          count = current->second;
+          count = current->second.sst_count;
         }
         if (delta.add) {
           if (delta.count >
@@ -1020,17 +1086,34 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
     log_number_ = edit->log_number_;
     prev_log_number_ = edit->prev_log_number_;
     if (edit->has_stats_snapshot_) {
+      for (const auto& entry : stats_counts_) {
+        if (entry.second.runtime_count == 0) continue;
+        auto replacement = replacement_stats.find(entry.first);
+        if (replacement == replacement_stats.end()) {
+          replacement_stats.emplace(
+              entry.first, StatsEntry{0, entry.second.runtime_count});
+        } else {
+          replacement->second.runtime_count = entry.second.runtime_count;
+        }
+      }
       stats_counts_.swap(replacement_stats);
     } else {
       for (const auto& change : pending_stats) {
         if (change.second == 0) {
-          stats_counts_.erase(change.first);
+          const auto existing = stats_counts_.find(change.first);
+          if (existing != stats_counts_.end()) {
+            existing->second.sst_count = 0;
+            if (existing->second.runtime_count == 0) {
+              stats_counts_.erase(existing);
+            }
+          }
         } else {
           const auto existing = stats_counts_.find(change.first);
           if (existing == stats_counts_.end()) {
-            stats_counts_.emplace(change.first, change.second);
+            stats_counts_.emplace(
+                change.first, StatsEntry{change.second, 0});
           } else {
-            existing->second = change.second;
+            existing->second.sst_count = change.second;
           }
         }
       }
@@ -1131,6 +1214,7 @@ Status VersionSet::Recover(bool* save_manifest) {
               stats_status.ToString().c_str());
           stats_counts_.clear();
           stats_total_ = 0;
+          runtime_total_ = 0;
           has_stats_snapshot_ = false;
         }
       }
@@ -1146,6 +1230,7 @@ Status VersionSet::Recover(bool* save_manifest) {
             "Ignoring MANIFEST statistics without a matching file delta\n");
         stats_counts_.clear();
         stats_total_ = 0;
+        runtime_total_ = 0;
         has_stats_snapshot_ = false;
       }
 
@@ -1309,8 +1394,13 @@ Status VersionSet::WriteSnapshot(log::Writer* log) {
   edit.SetComparatorName(icmp_.user_comparator()->Name());
   edit.SetFormatVersion(kCurrentDatabaseFormatVersion);
   if (has_stats_snapshot_) {
-    std::vector<std::pair<std::string, uint64_t>> entries(stats_counts_.begin(),
-                                                          stats_counts_.end());
+    std::vector<std::pair<std::string, uint64_t>> entries;
+    entries.reserve(stats_counts_.size());
+    for (const auto& entry : stats_counts_) {
+      if (entry.second.sst_count != 0) {
+        entries.emplace_back(entry.first, entry.second.sst_count);
+      }
+    }
     edit.SetStatsSnapshot(stats_total_, std::move(entries));
   }
 
