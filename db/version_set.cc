@@ -859,7 +859,8 @@ Status VersionSet::ApplyStatsEdit(const VersionEdit& edit,
                              restored_total) {
         return Status::Corruption("invalid stats snapshot ordering or count");
       }
-      restored.emplace(entry.first, StatsEntry{entry.second, 0});
+      restored.emplace_hint(restored.end(), entry.first,
+                                StatsEntry{entry.second, 0});
       restored_total += entry.second;
       previous = entry.first;
       have_previous = true;

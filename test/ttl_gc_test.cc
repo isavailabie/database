@@ -395,6 +395,52 @@ TEST_F(TTLGCTest, TTLOverwriteDeletesAndBatchLeaveExactSurvivors) {
   EXPECT_EQ(7, Sequence());
 }
 
+// 第 4 条口径：TTL 保存的是绝对到期时间，数据库关闭期间流逝的时间同样计入，
+// 重开既不能把期限清零，也不能把它重算成“重开时刻 + ttl”。
+TEST_F(TTLGCTest, ClosedTimeCountsTowardDeadlineAndIsNotRenewed) {
+  ASSERT_TRUE(db_->Put(WriteOptions(), "short", "s", 5).ok());
+  ASSERT_TRUE(db_->Put(WriteOptions(), "long", "l", 60).ok());
+  ASSERT_TRUE(db_->Put(WriteOptions(), "plain", "p").ok());
+  Flush();
+  EXPECT_EQ(3, PhysicalCount());
+  const uint64_t seq = Sequence();
+
+  // 关库 4 秒后重开：还没到期，必须仍然可读。
+  db_.reset();
+  env_.Wait();
+  env_.now += 4 * kSecond;
+  options_.create_if_missing = false;
+  Open();
+  env_.Wait();
+  EXPECT_EQ(seq, Sequence());
+  Value("short", "s");
+  Value("long", "l");
+  EXPECT_EQ(3, PhysicalCount());
+
+  // 再走 2 秒（累计 6 秒 > 5 秒 TTL）：必须 NotFound。若重开时把期限
+  // 重算成“重开时刻 + ttl”，此刻仍会读到 "s"，下面的断言就会失败。
+  env_.now += 2 * kSecond;
+  Missing("short");
+  Value("long", "l");
+  Value("plain", "p");
+  // 第 5 条口径：未被 GC 回收的过期记录仍然计入统计。
+  EXPECT_EQ(3, PhysicalCount());
+  {
+    std::unique_ptr<Iterator> it(db_->NewIterator(ReadOptions()));
+    IteratorValues(it.get(), {{"long", "l"}, {"plain", "p"}});
+  }
+
+  // 第 6 条口径：GC 后过期记录在所有位置真正消失，序列号不推进。
+  GC();
+  EXPECT_EQ(2, PhysicalCount());
+  EXPECT_EQ(seq, Sequence());
+  Missing("short");
+  Reopen();
+  EXPECT_EQ(2, PhysicalCount());
+  Missing("short");
+  Value("long", "l");
+}
+
 TEST_F(TTLGCTest, L0RewriteRequestNeverReordersVersionsByFileNumber) {
   options_.write_buffer_size = 8 << 20;
   options_.max_file_size = 1 << 20;
