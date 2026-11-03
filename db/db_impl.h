@@ -10,6 +10,8 @@
 #include <map>
 #include <set>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "db/dbformat.h"
 #include "db/log_writer.h"
@@ -161,8 +163,10 @@ class DBImpl : public DB {
                         VersionEdit* edit, SequenceNumber* max_sequence)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
-  Status WriteLevel0Table(MemTable* mem, VersionEdit* edit, Version* base,
-                          KeyCounts* runtime_transfers = nullptr)
+  Status WriteLevel0Table(
+      MemTable* mem, VersionEdit* edit, Version* base,
+      std::vector<std::pair<std::string, uint64_t>>* runtime_transfers =
+          nullptr)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   Status MakeRoomForWrite(bool force /* compact even if there is room? */)

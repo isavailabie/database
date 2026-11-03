@@ -607,8 +607,9 @@ Status DBImpl::BuildStatsSnapshot(VersionEdit* edit) {
   return Status::OK();
 }
 
-Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
-                                Version* base, KeyCounts* runtime_transfers) {
+Status DBImpl::WriteLevel0Table(
+    MemTable* mem, VersionEdit* edit, Version* base,
+    std::vector<std::pair<std::string, uint64_t>>* runtime_transfers) {
   mutex_.AssertHeld();
   const uint64_t start_micros = env_->NowMicros();
   FileMetaData meta;
@@ -642,20 +643,32 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
     }
     edit->AddFile(level, meta.number, meta.file_size, meta.smallest,
                   meta.largest);
-    KeyCounts counts(UserKeyLess{user_comparator()});
+    // The memtable iterator is ordered by user key, so every version of a key
+    // is adjacent: count runs in one sequential pass instead of building an
+    // intermediate map with one node per record.
+    std::vector<std::pair<std::string, uint64_t>> counts;
     std::unique_ptr<Iterator> stats_iter(mem->NewIterator());
+    std::string current_key;
+    uint64_t current_count = 0;
     for (stats_iter->SeekToFirst(); stats_iter->Valid(); stats_iter->Next()) {
       ParsedInternalKey key;
       if (!ParseInternalKey(stats_iter->key(), &key)) {
         s = Status::Corruption("invalid internal key counting flushed stats");
         break;
       }
-      auto found = counts.find(key.user_key);
-      if (found == counts.end()) {
-        counts.emplace(key.user_key.ToString(), 1);
+      if (current_count == 0 ||
+          user_comparator()->Compare(key.user_key, current_key) != 0) {
+        if (current_count != 0) {
+          counts.emplace_back(std::move(current_key), current_count);
+        }
+        current_key = key.user_key.ToString();
+        current_count = 1;
       } else {
-        ++found->second;
+        ++current_count;
       }
+    }
+    if (s.ok() && current_count != 0) {
+      counts.emplace_back(std::move(current_key), current_count);
     }
     if (s.ok()) s = stats_iter->status();
     if (s.ok()) {
@@ -682,7 +695,7 @@ void DBImpl::CompactMemTable() {
 
   // Save the contents of the memtable as a new Table
   VersionEdit edit;
-  KeyCounts runtime_transfers(UserKeyLess{user_comparator()});
+  std::vector<std::pair<std::string, uint64_t>> runtime_transfers;
   Version* base = versions_->current();
   base->Ref();
   Status s = WriteLevel0Table(imm_, &edit, base, &runtime_transfers);
