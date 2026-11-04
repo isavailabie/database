@@ -8,6 +8,7 @@
 
 课程：CDMS.XuanZhou.2026Fall.Dase · Project1　
 
+github仓库：https://github.com/isavailabie/database.git
 ---
 
 ### 1. 实验要求
