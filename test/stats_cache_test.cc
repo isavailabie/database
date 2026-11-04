@@ -10,6 +10,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
+#if defined(__linux__)
+#include <sys/statvfs.h>
+#endif
 
 #include "db/db_impl.h"
 #include "db/dbformat.h"
@@ -699,6 +702,18 @@ TEST_F(StatsCacheTest, RealEnospcDuringManifestRolloverKeepsOldRecoveryPoint) {
       path_.find(test_tmpdir) != 0) {
     GTEST_SKIP() << "requires a dedicated bounded tmpfs test directory";
   }
+#if defined(__linux__)
+  struct statvfs filesystem_info;
+  ASSERT_EQ(0, statvfs(test_tmpdir, &filesystem_info));
+  const uint64_t available_bytes =
+      static_cast<uint64_t>(filesystem_info.f_bavail) *
+      filesystem_info.f_frsize;
+  if (available_bytes > uint64_t{64} * 1024 * 1024) {
+    GTEST_SKIP() << "tmpfs has more than 64 MiB available";
+  }
+#else
+  GTEST_SKIP() << "requires Linux tmpfs";
+#endif
   Prepare();
   std::string current;
   ASSERT_TRUE(ReadFileToString(&env_, CurrentFileName(path_), &current).ok());

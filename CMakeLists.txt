@@ -536,5 +536,10 @@ if(LEVELDB_BUILD_TESTS)
     leveldb_test("test/metadata_consistency_test.cc")
     leveldb_test("test/compaction_recovery_test.cc")
     leveldb_test("test/stats_cache_test.cc")
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND EXISTS "/dev/shm")
+      set_tests_properties(
+        stats_cache_test
+        PROPERTIES ENVIRONMENT "TEST_TMPDIR=/dev/shm/ldb-enospc-test-ctest")
+    endif()
   endif()
 endif()
