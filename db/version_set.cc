@@ -781,17 +781,26 @@ VersionSet::~VersionSet() {
 
 Status VersionSet::AddRuntimeStats(const Slice& key, uint64_t count) {
   if (count == 0) return Status::OK();
-  auto found = stats_counts_.find(key);
-  if (count > std::numeric_limits<uint64_t>::max() - runtime_total_ ||
-      (found != stats_counts_.end() &&
-       count > std::numeric_limits<uint64_t>::max() -
-                   found->second.runtime_count)) {
+  if (count > std::numeric_limits<uint64_t>::max() - runtime_total_) {
     return Status::Corruption("runtime stats count overflow");
   }
-  if (found == stats_counts_.end()) {
-    stats_counts_.emplace(key.ToString(), StatsEntry{0, count});
+
+  const Comparator* comparator = icmp_.user_comparator();
+  auto position = stats_counts_.end();
+  if (!stats_counts_.empty() &&
+      comparator->Compare(stats_counts_.rbegin()->first, key) >= 0) {
+    position = stats_counts_.lower_bound(key);
+  }
+  if (position != stats_counts_.end() &&
+      comparator->Compare(key, position->first) == 0) {
+    if (count > std::numeric_limits<uint64_t>::max() -
+                    position->second.runtime_count) {
+      return Status::Corruption("runtime stats count overflow");
+    }
+    position->second.runtime_count += count;
   } else {
-    found->second.runtime_count += count;
+    stats_counts_.emplace_hint(position, key.ToString(),
+                               StatsEntry{0, count});
   }
   runtime_total_ += count;
   return Status::OK();

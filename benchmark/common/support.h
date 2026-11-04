@@ -181,7 +181,14 @@ inline uint64_t DiskBytes(DBState& s){
   for(const auto& n:names){uint64_t z=0;if(s.env.GetFileSize(s.path+"/"+n,&z).ok())sum+=z;}
   return sum;
 }
-struct Metric {std::string name;uint64_t ops=0;double seconds=0,p50=0,p95=0,p99=0;uint64_t bytes=0,manifest_bytes=0,disk=0,samples=0;};
+inline uint64_t CurrentManifestBytes(DBState& s){
+  std::string current;Ok(ReadFileToString(&s.env,CurrentFileName(s.path),&current));
+  Check(!current.empty()&&current.back()=='\n',"invalid CURRENT file");
+  current.pop_back();uint64_t number=0;FileType type=kTempFile;
+  Check(ParseFileName(current,&number,&type)&&type==kDescriptorFile,"invalid CURRENT manifest");
+  uint64_t size=0;Ok(s.env.GetFileSize(s.path+"/"+current,&size));return size;
+}
+struct Metric {std::string name;uint64_t ops=0;double seconds=0,p50=0,p95=0,p99=0;uint64_t bytes=0,manifest_bytes=0,disk=0,manifest_file_bytes=0,samples=0;};
 inline std::vector<Metric>& Metrics(){static std::vector<Metric> m;return m;}
 class Measure {
  public:
@@ -192,7 +199,7 @@ class Measure {
     Metric m;m.name=name_;m.ops=ops;m.seconds=elapsed<0?Elapsed():elapsed;m.bytes=s_.env.bytes_written.load()-bytes_;m.manifest_bytes=s_.env.manifest_bytes_written.load()-manifest_bytes_;
     std::sort(latencies_.begin(),latencies_.end());
     auto q=[this](double p){return latencies_.empty()?0.0:latencies_[std::min(latencies_.size()-1,size_t(p*(latencies_.size()-1)))];};
-    m.samples=latencies_.size();m.p50=q(.5);m.p95=q(.95);m.p99=q(.99);m.disk=DiskBytes(s_);Metrics().push_back(m);
+    m.samples=latencies_.size();m.p50=q(.5);m.p95=q(.95);m.p99=q(.99);m.disk=DiskBytes(s_);m.manifest_file_bytes=CurrentManifestBytes(s_);Metrics().push_back(m);
   }
  private: DBState& s_;std::string name_;Clock::time_point start_;uint64_t bytes_,manifest_bytes_;std::vector<double>latencies_;
 };

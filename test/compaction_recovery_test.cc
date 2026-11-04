@@ -42,7 +42,8 @@ class CommitEnv : public EnvWrapper {
       if (status.ok()) {
         const int point = env_->crash_point.load();
         if ((point == 1 && type_ == kTableFile) ||
-            (point == 2 && type_ == kDescriptorFile)) {
+            (point == 2 && type_ == kDescriptorFile) ||
+            (point == 3 && type_ == kLogFile)) {
           // Exit only after the underlying Sync succeeded, without DB cleanup.
           _exit(70 + point);
         }
@@ -103,12 +104,13 @@ class CompactionRecoveryTest : public testing::Test {
     ASSERT_TRUE(status.ok()) << status.ToString();
     db_.reset(raw);
   }
-  void CheckStats(uint64_t entries, uint64_t distinct) {
+  void CheckStats(uint64_t entries, uint64_t distinct,
+                  uint64_t sequence = 3) {
     Stats stats;
     ASSERT_TRUE(db_->GetCurrentStats(ReadOptions(), &stats).ok());
     EXPECT_EQ(entries, stats.total_entries);
     EXPECT_EQ(distinct, stats.distinct_keys);
-    EXPECT_EQ(uint64_t{3}, stats.seq);
+    EXPECT_EQ(sequence, stats.seq);
     std::unique_ptr<Iterator> it(
         static_cast<DBImpl*>(db_.get())->TEST_NewInternalIterator());
     uint64_t count = 0;
@@ -193,6 +195,48 @@ TEST_F(CompactionRecoveryTest, CrashAfterManifestSyncBeforeOldFilesCleanup) {
   Exercise(2);
 }
 
+TEST_F(CompactionRecoveryTest,
+       RepeatedSynchronousWALCrashesRecoverCommittedWrites) {
+#if defined(__unix__) || defined(__APPLE__)
+  options_.reuse_logs = true;
+  constexpr int kCrashCount = 5;
+  for (int i = 0; i < kCrashCount; ++i) {
+    db_.reset();
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+      const std::string key = "crash/" + std::to_string(i);
+      const std::string value = "value/" + std::to_string(i);
+      execl(executable.c_str(), executable.c_str(), "--crash-write",
+            path_.c_str(), key.c_str(), value.c_str(),
+            static_cast<char*>(nullptr));
+      _exit(127);
+    }
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(73, WEXITSTATUS(status));
+
+    options_.create_if_missing = false;
+    Open();
+    const uint64_t expected = static_cast<uint64_t>(i + 1);
+    CheckStats(expected, expected, expected);
+    for (int j = 0; j <= i; ++j) {
+      std::string value;
+      ASSERT_TRUE(db_->Get(ReadOptions(), "crash/" + std::to_string(j),
+                           &value).ok());
+      EXPECT_EQ("value/" + std::to_string(j), value);
+    }
+  }
+  ASSERT_TRUE(static_cast<DBImpl*>(db_.get())->TEST_CompactMemTable().ok());
+  db_.reset();
+  Open();
+  CheckStats(kCrashCount, kCrashCount, kCrashCount);
+#else
+  GTEST_SKIP() << "process crash injection requires POSIX";
+#endif
+}
+
 int CrashCompact(const std::string& path, int point) {
   CommitEnv env;
   env.now = kEpoch + 2000000;
@@ -211,12 +255,32 @@ int CrashCompact(const std::string& path, int point) {
   return 11;
 }
 
+int CrashAfterSyncWrite(const std::string& path, const std::string& key,
+                        const std::string& value) {
+  CommitEnv env;
+  Options options;
+  options.env = &env;
+  options.create_if_missing = false;
+  options.reuse_logs = true;
+  DB* raw = nullptr;
+  if (!DB::Open(options, path, &raw).ok()) return 10;
+  std::unique_ptr<DB> db(raw);
+  env.crash_point = 3;
+  WriteOptions write;
+  write.sync = true;
+  if (!db->Put(write, key, value).ok()) return 11;
+  return 12;
+}
+
 }  // namespace
 }  // namespace leveldb
 
 int main(int argc, char** argv) {
   if (argc == 4 && std::string(argv[1]) == "--crash-compact") {
     return leveldb::CrashCompact(argv[2], std::stoi(argv[3]));
+  }
+  if (argc == 5 && std::string(argv[1]) == "--crash-write") {
+    return leveldb::CrashAfterSyncWrite(argv[2], argv[3], argv[4]);
   }
   leveldb::executable = argv[0];
   testing::InitGoogleTest(&argc, argv);

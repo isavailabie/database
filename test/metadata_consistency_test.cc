@@ -69,6 +69,7 @@ class StatsEnv : public EnvWrapper {
     FileType type = kTempFile;
     ParseFileName(path.substr(path.find_last_of('/') + 1), &number, &type);
     if (type == kTableFile) {
+      ++table_files_created;
       std::unique_lock<std::mutex> lock(mutex_);
       if (block_table_) {
         blocked_ = true;
@@ -119,6 +120,7 @@ class StatsEnv : public EnvWrapper {
   std::atomic<bool> fail_manifest_append{false};
   std::atomic<bool> fail_log_payload_append{false};
   std::atomic<bool> fail_table_sync{false};
+  std::atomic<uint64_t> table_files_created{0};
 
  private:
   struct Task {
@@ -656,6 +658,64 @@ TEST_F(MetadataConsistencyTest, ConcurrentQueriesNeverSeeHalfABatch) {
   PhysicalOracle(2400);
   Reopen();
   Expected(800, 800, 2400);
+}
+
+TEST_F(MetadataConsistencyTest,
+       SustainedWritesRemainConsistentDuringFlushAndCompaction) {
+  options_.write_buffer_size = 32 << 10;
+  options_.max_file_size = 32 << 10;
+  Reopen();
+
+  constexpr int kWriterCount = 4;
+  constexpr int kWritesPerWriter = 10000;
+  std::atomic<int> finished{0};
+  std::atomic<bool> failed{false};
+  std::vector<std::thread> writers;
+  for (int thread = 0; thread < kWriterCount; ++thread) {
+    writers.emplace_back([&, thread] {
+      const std::string value(128, static_cast<char>('a' + thread));
+      for (int i = 0; i < kWritesPerWriter; ++i) {
+        const std::string key = "stress/" + std::to_string(thread) + "/" +
+                                std::to_string(i);
+        if (!db_->Put(WriteOptions(), key, value).ok()) {
+          failed = true;
+          break;
+        }
+      }
+      ++finished;
+    });
+  }
+  std::thread compactor([&] {
+    for (int i = 0; i < 6; ++i) db_->CompactRange(nullptr, nullptr);
+  });
+
+  uint64_t previous_sequence = 0;
+  do {
+    Stats stats;
+    if (!db_->GetCurrentStats(ReadOptions(), &stats).ok() ||
+        stats.total_entries != stats.seq ||
+        stats.distinct_keys != stats.total_entries ||
+        stats.seq < previous_sequence) {
+      failed = true;
+    }
+    previous_sequence = stats.seq;
+    Env::Default()->SleepForMicroseconds(1000);
+  } while (finished != kWriterCount);
+  for (auto& writer : writers) writer.join();
+  compactor.join();
+
+  constexpr uint64_t kExpectedWrites =
+      static_cast<uint64_t>(kWriterCount) * kWritesPerWriter;
+  EXPECT_FALSE(failed.load());
+  EXPECT_GT(env_.table_files_created.load(), uint64_t{10});
+  env_.Wait();
+  Expected(kExpectedWrites, kExpectedWrites, kExpectedWrites);
+  PhysicalOracle(kExpectedWrites);
+  GC();
+  Expected(kExpectedWrites, kExpectedWrites, kExpectedWrites);
+  Reopen();
+  Expected(kExpectedWrites, kExpectedWrites, kExpectedWrites);
+  PhysicalOracle(kExpectedWrites);
 }
 
 }  // namespace

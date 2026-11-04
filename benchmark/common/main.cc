@@ -55,6 +55,7 @@ int main(int argc,char** argv){
         <<",\"ops_per_second\":"<<(m.seconds>0?m.ops/m.seconds:0)<<",\"p50_us\":"<<m.p50<<",\"p95_us\":"<<m.p95<<",\"p99_us\":"<<m.p99
         <<",\"latency_samples\":"<<m.samples<<",\"append_bytes_during_phase\":"<<m.bytes
         <<",\"manifest_bytes_during_phase\":"<<m.manifest_bytes
+        <<",\"current_manifest_file_bytes_after_drain\":"<<m.manifest_file_bytes
         <<",\"db_directory_bytes_after_drain\":"<<m.disk<<'}';}
     std::cout<<"]}"<<std::endl;return 0;
   }catch(const std::exception& e){std::cout<<"HW_RESULT {\"case\":"<<Json(c.name)<<",\"status\":\"fail\",\"error\":"<<Json(e.what())<<"}"<<std::endl;return 1;}
