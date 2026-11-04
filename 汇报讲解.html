@@ -1,0 +1,847 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f8fc">
+  <meta name="description" content="从 LevelDB 的数据路径出发，介绍 TTL、精确统计、故障恢复与性能取舍。">
+  <title>LevelDB 中 TTL 与统计元数据的实现</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #f6f8fc;
+      --white: #fff;
+      --ink: #17243b;
+      --muted: #596a84;
+      --line: #dce4ef;
+      --teal: #087f82;
+      --teal-soft: #e2f5f2;
+      --blue: #3367c7;
+      --blue-soft: #eaf0fc;
+      --orange: #b86114;
+      --orange-soft: #fff1df;
+      --red: #bb4f53;
+      --red-soft: #fff0ef;
+      --shadow: 0 16px 46px rgba(24, 45, 80, .08);
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; scroll-padding-top: 100px; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(ellipse at 92% 3%, rgba(86, 155, 224, .10), transparent 28rem),
+        radial-gradient(ellipse at 2% 25%, rgba(56, 184, 162, .08), transparent 32rem),
+        var(--paper);
+      color: var(--ink);
+      font-family: var(--sans);
+      line-height: 1.65;
+    }
+    a { color: var(--blue); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+    button { font: inherit; }
+    code, .mono { font-family: var(--mono); }
+    code { color: #155d75; background: #eaf5f8; padding: .08em .32em; border-radius: 5px; font-size: .91em; }
+    p { margin: 0 0 1em; color: var(--muted); }
+    h1, h2, h3, h4 { color: var(--ink); line-height: 1.2; margin: 0; letter-spacing: -.025em; }
+    h1 { font-size: clamp(2.7rem, 6vw, 5.2rem); letter-spacing: -.055em; }
+    h2 { font-size: clamp(1.8rem, 3.2vw, 2.8rem); margin-bottom: 14px; }
+    h3 { font-size: 1.16rem; margin-bottom: 9px; }
+    h4 { font-size: .98rem; margin-bottom: 8px; }
+
+    .reading-progress {
+      position: fixed;
+      z-index: 20;
+      inset: 0 0 auto;
+      height: 3px;
+      background: transparent;
+    }
+    .reading-progress span {
+      display: block;
+      width: 0;
+      height: 100%;
+      background: linear-gradient(90deg, #1cae9c, #5488dc);
+    }
+
+    .topbar {
+      position: sticky;
+      z-index: 15;
+      top: 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      min-height: 66px;
+      padding: 10px max(24px, calc((100% - 1220px) / 2));
+      border-bottom: 1px solid rgba(208, 219, 234, .82);
+      background: rgba(250, 251, 254, .92);
+      backdrop-filter: blur(14px);
+    }
+    .brand { display: flex; align-items: center; gap: 11px; color: var(--ink); font-weight: 760; white-space: nowrap; }
+    .brand-mark {
+      display: grid;
+      width: 34px;
+      height: 34px;
+      place-items: center;
+      border-radius: 11px;
+      background: linear-gradient(145deg, #0d9290, #4a83d7);
+      color: white;
+      font: 800 14px var(--mono);
+      box-shadow: 0 5px 12px rgba(24, 123, 151, .2);
+    }
+    .topnav { display: flex; align-items: center; gap: 5px; overflow-x: auto; scrollbar-width: none; }
+    .topnav::-webkit-scrollbar { display: none; }
+    .topnav a {
+      padding: 7px 10px;
+      border-radius: 8px;
+      color: #53647d;
+      font-size: 13px;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+    .topnav a:hover, .topnav a.current { background: var(--blue-soft); color: #244e9a; }
+
+    .wrap { width: min(1120px, calc(100% - 44px)); margin-inline: auto; }
+    .hero {
+      position: relative;
+      display: grid;
+      grid-template-columns: minmax(0, 1.1fr) minmax(300px, .9fr);
+      align-items: center;
+      gap: 54px;
+      min-height: 565px;
+      padding: 78px 0 72px;
+    }
+    .eyebrow {
+      margin-bottom: 18px;
+      color: var(--teal);
+      font: 750 12px/1.3 var(--mono);
+      letter-spacing: .13em;
+      text-transform: uppercase;
+    }
+    .hero h1 span { color: var(--teal); }
+    .hero-lead { max-width: 680px; margin: 22px 0; color: #425570; font-size: clamp(1.15rem, 2vw, 1.38rem); line-height: 1.7; }
+    .hero-visual {
+      position: relative;
+      padding: 24px;
+      border: 1px solid #dce5ef;
+      border-radius: 26px;
+      background: linear-gradient(155deg, rgba(255,255,255,.95), rgba(240,246,253,.92));
+      box-shadow: var(--shadow);
+    }
+    .visual-label { margin-bottom: 15px; color: #61728b; font: 700 11px var(--mono); letter-spacing: .1em; }
+    .system-stack { display: grid; gap: 9px; }
+    .stack-row {
+      display: grid;
+      grid-template-columns: 90px 1fr;
+      align-items: center;
+      gap: 11px;
+      padding: 12px 14px;
+      border: 1px solid transparent;
+      border-radius: 12px;
+    }
+    .stack-row .layer { font: 750 11px var(--mono); letter-spacing: .05em; }
+    .stack-row p { margin: 0; color: #41536d; font-size: 13px; }
+    .stack-row.api { background: var(--blue-soft); border-color: #dce6fa; }
+    .stack-row.api .layer { color: var(--blue); }
+    .stack-row.mem { background: var(--teal-soft); border-color: #d2ece8; }
+    .stack-row.mem .layer { color: var(--teal); }
+    .stack-row.disk { background: var(--orange-soft); border-color: #f5dfc2; }
+    .stack-row.disk .layer { color: var(--orange); }
+    .stack-row.recovery { background: #f0eefb; border-color: #e1dcf5; }
+    .stack-row.recovery .layer { color: #7258a8; }
+    .stack-link { padding-left: 29px; color: #8d9ab0; font: 12px var(--mono); }
+
+    .thesis {
+      margin: 0 auto 60px;
+      padding: 24px 29px;
+      border: 1px solid #cfe7e4;
+      border-left: 5px solid var(--teal);
+      border-radius: 15px;
+      background: linear-gradient(100deg, #eaf8f5, #f8fcff);
+      color: #294c5b;
+      font-size: clamp(1.07rem, 2vw, 1.35rem);
+      font-weight: 670;
+      line-height: 1.6;
+    }
+
+    main { padding-bottom: 90px; }
+    .section { padding: 70px 0 26px; scroll-margin-top: 72px; }
+    .section-head { max-width: 790px; margin-bottom: 29px; }
+    .section-index { display: inline-block; margin-bottom: 11px; color: var(--teal); font: 750 12px var(--mono); letter-spacing: .12em; }
+    .section-intro { margin-top: 13px; font-size: 1.08rem; }
+    .chapter-rule { height: 1px; margin-top: 56px; background: linear-gradient(90deg, #cbd9e7, transparent 90%); }
+
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .card {
+      min-width: 0;
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: rgba(255,255,255,.87);
+      box-shadow: 0 7px 22px rgba(38, 63, 101, .035);
+    }
+    .card p, .card li { font-size: 15px; }
+    .card p:last-child, .card ul:last-child { margin-bottom: 0; }
+    .card ul { padding-left: 19px; margin-bottom: 0; }
+    .card.blue-edge { border-top: 3px solid #6d8ed4; }
+    .card.teal-edge { border-top: 3px solid #38a69c; }
+    .card.orange-edge { border-top: 3px solid #df9946; }
+    .card.red-edge { border-top: 3px solid #cf7475; }
+    .label {
+      display: block;
+      margin-bottom: 9px;
+      color: #66809d;
+      font: 750 11px/1.35 var(--mono);
+      letter-spacing: .09em;
+    }
+
+    .invariant-table, .data-table { width: 100%; border-collapse: collapse; }
+    .invariant-table { overflow: hidden; border-radius: 14px; background: rgba(255,255,255,.88); box-shadow: 0 8px 26px rgba(38,63,101,.04); }
+    .invariant-table th, .invariant-table td, .data-table th, .data-table td { padding: 13px 15px; border-bottom: 1px solid #e4eaf2; text-align: left; vertical-align: top; }
+    .invariant-table th, .data-table th { color: #6a7c94; font: 750 11px var(--mono); letter-spacing: .07em; text-transform: uppercase; }
+    .invariant-table td:first-child { width: 22%; color: var(--ink); font-weight: 700; }
+    .invariant-table td { color: var(--muted); font-size: 14px; }
+    .invariant-table tr:last-child td, .data-table tr:last-child td { border-bottom: 0; }
+
+    .architecture {
+      padding: 24px;
+      border: 1px solid #d8e2ef;
+      border-radius: 20px;
+      background: linear-gradient(155deg, #fff, #f3f7fc);
+      box-shadow: var(--shadow);
+    }
+    .arch-row {
+      display: grid;
+      grid-template-columns: 1.1fr 52px 1fr 52px 1fr 52px 1fr;
+      align-items: center;
+      gap: 8px;
+    }
+    .arch-node {
+      min-height: 90px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      padding: 13px;
+      border: 1px solid #dbe5f0;
+      border-radius: 13px;
+      background: #fff;
+      text-align: center;
+    }
+    .arch-node b { color: #263c5c; font-size: 14px; }
+    .arch-node small { margin-top: 6px; color: #73839a; font-size: 11px; line-height: 1.45; }
+    .arch-node.blue { background: #edf3ff; border-color: #d9e4fa; }
+    .arch-node.teal { background: #e9f8f5; border-color: #d1ece7; }
+    .arch-node.orange { background: #fff5e8; border-color: #f4e1c5; }
+    .arch-node.violet { background: #f2effb; border-color: #e5def4; }
+    .arch-row.recovery-row { grid-template-columns: 1fr 42px 1fr 42px 1fr; }
+    .arrow { color: #6e91c6; font-size: 23px; text-align: center; }
+    .arch-lanes { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 17px; }
+    .lane { padding: 16px 18px; border-radius: 13px; font-size: 14px; }
+    .lane b { display: block; margin-bottom: 5px; }
+    .lane p { margin: 0; font-size: 13px; }
+    .lane.record-lane { background: var(--teal-soft); color: #176f70; }
+    .lane.version-lane { background: var(--orange-soft); color: #895014; }
+
+    .lifecycle {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 13px;
+      counter-reset: flow;
+    }
+    .lifecycle article {
+      position: relative;
+      min-height: 172px;
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 15px;
+      background: white;
+      counter-increment: flow;
+    }
+    .lifecycle article::before {
+      content: "0" counter(flow);
+      display: inline-block;
+      margin-bottom: 15px;
+      color: var(--teal);
+      font: 800 12px var(--mono);
+    }
+    .lifecycle article:not(:last-child)::after {
+      content: "→";
+      position: absolute;
+      top: 47%;
+      right: -17px;
+      z-index: 2;
+      color: #6d8fc2;
+      font-size: 19px;
+    }
+    .lifecycle p { margin: 8px 0 0; font-size: 14px; }
+
+    .record-diagram { display: grid; grid-template-columns: .8fr .8fr 1.2fr 1.4fr; overflow: hidden; border: 1px solid #d8e2ed; border-radius: 12px; }
+    .record-diagram span { display: grid; min-height: 62px; place-items: center; padding: 10px; text-align: center; font: 700 12px/1.4 var(--mono); }
+    .record-diagram .rtype { background: var(--blue-soft); color: #3e63a6; }
+    .record-diagram .sequence { background: #f0f3f8; color: #5c6e86; }
+    .record-diagram .deadline { background: var(--orange-soft); color: #9a5c14; }
+    .record-diagram .value { background: var(--teal-soft); color: #167772; }
+
+    .formula {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 10px;
+      margin: 15px 0;
+    }
+    .formula div { padding: 14px; border: 1px solid #e0e8f1; border-radius: 12px; background: #fff; text-align: center; }
+    .formula b { display: block; color: var(--blue); font: 750 17px var(--mono); }
+    .formula small { display: block; margin-top: 6px; color: #74849a; font-size: 12px; }
+
+    .transition {
+      display: grid;
+      grid-template-columns: 1fr 60px 1fr;
+      align-items: center;
+      gap: 13px;
+      margin: 18px 0;
+    }
+    .transition .state { padding: 18px; border: 1px solid var(--line); border-radius: 13px; background: white; }
+    .transition .state h4 { color: var(--teal); }
+    .transition .move { color: var(--blue); text-align: center; font-size: 22px; }
+    .transition p { margin: 0; font-size: 14px; }
+
+    .optimization {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+      align-items: stretch;
+    }
+    .before-after {
+      display: grid;
+      align-content: center;
+      gap: 19px;
+      padding: 23px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: #fff;
+    }
+    .bar-line { display: grid; grid-template-columns: 78px 1fr 91px; gap: 9px; align-items: center; }
+    .bar-line span { color: #536780; font: 12px var(--mono); }
+    .bar-line .track { height: 17px; overflow: hidden; border-radius: 20px; background: #edf1f6; }
+    .bar-line .fill { height: 100%; border-radius: inherit; background: linear-gradient(90deg, #5381d2, #88a6e2); }
+    .bar-line .fill.after { background: linear-gradient(90deg, #16a18f, #65cdb4); }
+    .bar-line b { color: #334968; font: 700 12px var(--mono); text-align: right; }
+    .metric-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 13px; }
+    .metric { padding: 18px; border: 1px solid var(--line); border-radius: 14px; background: #fff; }
+    .metric small { display: block; color: #6d7f96; font-size: 12px; }
+    .metric b { display: block; margin: 5px 0; color: var(--teal); font: 800 clamp(21px, 2.5vw, 30px) var(--mono); letter-spacing: -.04em; }
+
+    .callout {
+      margin-top: 17px;
+      padding: 15px 18px;
+      border-left: 4px solid var(--teal);
+      border-radius: 0 11px 11px 0;
+      background: #e9f7f4;
+      color: #355c67;
+      font-size: 14px;
+      line-height: 1.65;
+    }
+    .callout.amber { border-color: #d89239; background: #fff4e5; color: #76552d; }
+    .callout.red { border-color: #c6686b; background: #fff0ef; color: #72474a; }
+
+    .speaker {
+      margin-top: 18px;
+      border: 1px dashed #cbd9e8;
+      border-radius: 12px;
+      background: rgba(255,255,255,.55);
+    }
+    .speaker summary { padding: 11px 15px; color: #526b87; cursor: pointer; font-size: 13px; font-weight: 700; }
+    .speaker p { padding: 0 15px 14px; margin: 0; color: #64758c; font-size: 13px; }
+
+    .roadmap { display: grid; gap: 0; }
+    .roadmap article { display: grid; grid-template-columns: 150px 1fr; gap: 20px; padding: 19px 0; border-top: 1px solid #dfe6ef; }
+    .roadmap article:last-child { border-bottom: 1px solid #dfe6ef; }
+    .roadmap time { color: var(--teal); font: 750 12px var(--mono); }
+    .roadmap p { margin: 0; font-size: 14px; }
+
+    .footer {
+      margin-top: 60px;
+      padding: 32px 0 48px;
+      border-top: 1px solid var(--line);
+      color: #718198;
+      font-size: 13px;
+    }
+    .backtop {
+      position: fixed;
+      right: 20px;
+      bottom: 20px;
+      z-index: 10;
+      width: 43px;
+      height: 43px;
+      border: 1px solid #d6e0eb;
+      border-radius: 50%;
+      background: rgba(255,255,255,.93);
+      color: #385b87;
+      box-shadow: 0 5px 18px rgba(30,52,84,.12);
+      cursor: pointer;
+    }
+    .reveal { opacity: 1; transform: none; }
+    .js .reveal { opacity: 0; transform: translateY(14px); transition: opacity .55s ease, transform .55s ease; }
+    .js .reveal.in-view { opacity: 1; transform: none; }
+
+    @media (max-width: 860px) {
+      .hero { grid-template-columns: 1fr; gap: 30px; min-height: auto; padding: 58px 0 48px; }
+      .hero-visual { max-width: 650px; }
+      .topbar { align-items: flex-start; flex-direction: column; gap: 5px; padding: 10px 20px; }
+      .topnav { width: 100%; }
+      .grid.four { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .arch-row { grid-template-columns: 1fr 28px 1fr; }
+      .arch-row.recovery-row { grid-template-columns: 1fr 28px 1fr; }
+      .arch-row .arch-node:nth-of-type(n+4) { margin-top: 8px; }
+      .lifecycle { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .lifecycle article:nth-child(2)::after { display: none; }
+    }
+    @media (max-width: 600px) {
+      .wrap { width: min(100% - 30px, 1120px); }
+      .topbar { padding-inline: 15px; }
+      .hero h1 { font-size: clamp(2.15rem, 8.6vw, 2.55rem); line-height: 1.16; }
+      .grid, .grid.three, .grid.four, .optimization, .arch-lanes { grid-template-columns: 1fr; }
+      .section { padding-top: 50px; }
+      .hero { padding-top: 44px; }
+      .hero-visual { padding: 17px; }
+      .stack-row { grid-template-columns: 72px 1fr; padding: 10px; }
+      .arch-row { grid-template-columns: 1fr; }
+      .arch-row.recovery-row { grid-template-columns: 1fr; }
+      .arch-row .arrow { transform: rotate(90deg); }
+      .lifecycle { grid-template-columns: 1fr; }
+      .lifecycle article { min-height: 0; }
+      .lifecycle article::after { display: none !important; }
+      .record-diagram { grid-template-columns: repeat(2, 1fr); }
+      .formula { grid-template-columns: 1fr; }
+      .transition { grid-template-columns: 1fr; }
+      .transition .move { transform: rotate(90deg); }
+      .metric-grid { grid-template-columns: 1fr; }
+      .invariant-table th, .invariant-table td, .data-table th, .data-table td { padding: 10px 8px; font-size: 12px; }
+      .roadmap article { grid-template-columns: 1fr; gap: 6px; }
+      .bar-line { grid-template-columns: 67px 1fr 84px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      *, *::before, *::after { transition-duration: .01ms !important; animation-duration: .01ms !important; }
+    }
+    @media print {
+      body { background: white; }
+      .topbar, .reading-progress, .backtop { display: none !important; }
+      .wrap { width: 100%; }
+      .hero { min-height: auto; padding: 25px 0; }
+      .section { padding: 24px 0 0; break-inside: avoid; }
+      .card, .architecture, .hero-visual { box-shadow: none; }
+      .js .reveal { opacity: 1; transform: none; }
+      .speaker { display: none; }
+      a { color: inherit; text-decoration: none; }
+    }
+  </style>
+  <script>document.documentElement.classList.add("js");</script>
+</head>
+<body>
+  <div class="reading-progress" aria-hidden="true"><span id="progress"></span></div>
+  <header class="topbar">
+    <a class="brand" href="#top" aria-label="回到页面顶部">
+      <span class="brand-mark">L</span>
+      <span>LevelDB · 数据库系统设计</span>
+    </a>
+    <nav class="topnav" aria-label="页面目录">
+      <a href="#architecture">架构</a>
+      <a href="#lifecycle">TTL</a>
+      <a href="#consistency">统计</a>
+      <a href="#reliability">故障恢复</a>
+      <a href="#performance">性能</a>
+      <a href="#evidence">测试</a>
+      <a href="#limits">结论与边界</a>
+    </nav>
+  </header>
+
+  <main id="top">
+    <div class="wrap">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">数据库系统设计与实现 · LEVELDB PROJECT1</p>
+          <h1>LevelDB 的<br><span>TTL 与统计实现</span></h1>
+          <p class="hero-lead">本次在 LevelDB 中增加 TTL 写入接口和当前统计查询接口，并修改读写、Compaction 与恢复流程，使数据期限和统计在各阶段保持一致。</p>
+        </div>
+        <div class="hero-visual" aria-label="数据库系统各层概览">
+          <p class="visual-label">先看数据怎样进入系统、怎样落盘、怎样恢复</p>
+          <div class="system-stack">
+            <div class="stack-row api"><span class="layer">接口</span><p>Put / WriteBatch · Get · Iterator · Snapshot</p></div>
+            <div class="stack-link">↓ 写入先经过日志，供崩溃后重放</div>
+            <div class="stack-row mem"><span class="layer">内存</span><p>WAL · MemTable · Immutable MemTable</p></div>
+            <div class="stack-link">↓ flush 生成有序数据文件</div>
+            <div class="stack-row disk"><span class="layer">磁盘</span><p>SST 文件 · MANIFEST 文件清单与版本</p></div>
+            <div class="stack-link">↻ 后台 Compaction 合并文件、回收旧记录</div>
+            <div class="stack-row recovery"><span class="layer">重启</span><p>按 MANIFEST 恢复文件版本，再重放需要的 WAL</p></div>
+          </div>
+        </div>
+      </section>
+
+      <div class="thesis reveal">
+        下面先介绍 LevelDB 的数据读写流程，再说明 TTL、统计和恢复相关的实现。
+      </div>
+    </div>
+
+    <section class="section wrap" id="architecture">
+      <div class="section-head reveal">
+        <span class="section-index">01 / 数据组织与读写流程</span>
+        <h2>LevelDB 的数据组织与读写流程</h2>
+        <p class="section-intro">LevelDB 是 LSM-tree 结构的键值数据库。新写入先追加到 WAL 并进入内存表；内存表写满后刷成 SST 文件；后台 Compaction 再合并文件、清理被覆盖或删除的旧版本。读取时，系统按序列号在这些数据源中寻找当前视图下的结果。</p>
+      </div>
+      <div class="architecture reveal">
+        <div class="arch-row" aria-label="LevelDB 主要写入数据流">
+          <div class="arch-node blue"><b>写入接口</b><small>Put / WriteBatch<br>得到序列号</small></div>
+          <span class="arrow">→</span>
+          <div class="arch-node teal"><b>WAL 与内存表</b><small>先记日志，再在内存中读写</small></div>
+          <span class="arrow">→</span>
+          <div class="arch-node orange"><b>SST 与 MANIFEST</b><small>保存数据文件及当前文件版本</small></div>
+          <span class="arrow">→</span>
+          <div class="arch-node violet"><b>后台合并</b><small>整理文件，清除可回收的版本</small></div>
+        </div>
+        <div class="arch-lanes">
+          <div class="lane record-lane"><b>数据怎么读</b><p>Get 和迭代器需要在内存表、不可变内存表与 SST 中找到当前读取视图对应的版本。</p></div>
+          <div class="lane version-lane"><b>系统怎么恢复</b><p>MANIFEST 指明当前有效的 SST 文件；WAL 补回尚未刷入 SST 的写入。</p></div>
+        </div>
+      </div>
+      <div class="grid three reveal" style="margin-top:16px">
+        <article class="card blue-edge">
+          <span class="label">新增功能</span>
+          <h3>记录可以按时间失效</h3>
+          <p>TTL 让数据在截止时间后对读取不可见，并在条件允许时由 Compaction 物理清理。</p>
+        </article>
+        <article class="card teal-edge">
+          <span class="label">新增功能</span>
+          <h3>随时查询当前物理统计</h3>
+          <p>接口返回尚未回收的内部记录数、这些记录涉及的不同键数，以及与统计对应的最新序列号。</p>
+        </article>
+        <article class="card orange-edge">
+          <span class="label">实现范围</span>
+          <h3>同时修改写入、快照和恢复流程</h3>
+          <p>TTL 和统计状态需要与现有的数据记录和文件版本保持一致。</p>
+        </article>
+      </div>
+      <details class="speaker reveal">
+        <summary>讲解提示 · 可以先用一条记录串起架构</summary>
+        <p>一条写入先有 WAL 记录和内存中的版本，之后可能刷成 SST，再参与后台合并。重启时要知道哪些 SST 有效，也要重放尚未刷盘的 WAL。TTL 和统计都要经过这整条路径，下面就分别看它们如何接入。</p>
+      </details>
+      <div class="chapter-rule"></div>
+    </section>
+
+    <section class="section wrap" id="lifecycle">
+      <div class="section-head reveal">
+        <span class="section-index">02 / TTL 读取与回收</span>
+        <h2>TTL 的读取可见性与物理回收</h2>
+        <p class="section-intro">TTL 到期后，记录对读取操作不可见；物理删除则由后台 Compaction 完成，并需确认活跃快照和旧版本不再依赖该记录。</p>
+      </div>
+      <div class="lifecycle reveal">
+        <article><h3>写入时记下截止时间</h3><p>保存绝对到期时间，而不是保存一个会在重启时重新起算的时长。</p></article>
+        <article><h3>读取时确定是否可见</h3><p>Get、迭代器和快照按各自固定的读取时间判断记录。</p></article>
+        <article><h3>过期版本挡住旧值</h3><p>最新值过期后按删除语义处理，不能继续查找并返回更旧版本。</p></article>
+        <article><h3>后台确认后再回收</h3><p>保护活跃快照和仍需遮挡旧值的记录；CompactRange 也能重写最深层 SST。</p></article>
+      </div>
+      <div class="grid" style="margin-top:18px">
+        <article class="card">
+          <span class="label">TTL 在哪里保存</span>
+          <h3>普通值不变，TTL 值带有绝对截止时间</h3>
+          <div class="record-diagram">
+            <span class="rtype">记录类型</span>
+            <span class="sequence">序列号</span>
+            <span class="deadline">fixed64<br>到期时间</span>
+            <span class="value">用户数据<br>原始内容</span>
+          </div>
+          <p style="margin-top:12px">截止时间作为记录的一部分，随着 WAL、内存表和 SST 原样传递；刷盘、合并和重启都不会续期。</p>
+        </article>
+        <article class="card">
+          <span class="label">读写边界</span>
+          <h3>过期、零 TTL 和时间溢出都有明确语义</h3>
+          <ul>
+            <li>到达或超过截止时间后，读取返回 NotFound。</li>
+            <li>TTL 为 0 仍写入新版本并分配序列号，只是立即不可见。</li>
+            <li>期限计算溢出时拒绝写入，不占用序列号。</li>
+            <li>快照固定创建时的序列号和时间；关闭数据库时钟仍继续前进。</li>
+          </ul>
+        </article>
+      </div>
+      <div class="callout amber reveal"><strong>读取与存储的区别：</strong>一条记录过期后可以已经不可读，但在 Compaction 将它移除之前，仍计入物理记录数。</div>
+      <details class="speaker reveal">
+        <summary>讲解提示 · 用一个键的两个版本说明</summary>
+        <p>先写一个普通值，再用短 TTL 的新值覆盖。新值过期后，数据库应返回 NotFound，而不是让老值重新出现。如果在新值到期前创建快照，这个快照仍按自己的创建时间读取。</p>
+      </details>
+      <div class="chapter-rule"></div>
+    </section>
+
+    <section class="section wrap" id="consistency">
+      <div class="section-head reveal">
+        <span class="section-index">03 / 统计口径与维护</span>
+        <h2>统计范围与更新时机</h2>
+        <p class="section-intro">统计包括当前 MemTable、Immutable MemTable 和有效 SST 中尚未回收的内部记录。一个键的多个版本、删除标记及已过期但尚未回收的记录均计入统计，因此需要按数据所在位置维护计数。</p>
+      </div>
+      <div class="formula reveal">
+        <div><b>sst_count(key)</b><small>当前有效 SST 中该键的记录数</small></div>
+        <div><b>runtime_count(key)</b><small>MemTable 与 Immutable MemTable 中的记录数</small></div>
+        <div><b>总数 / 去重键数</b><small>所有记录之和 / 至少有一条记录的键数</small></div>
+      </div>
+      <div class="transition reveal">
+        <div class="state"><h4>Flush：从内存写成 SST</h4><p>计数从 runtime 转到 SST。记录没有增减，所以总数不变。</p></div>
+        <div class="move">→</div>
+        <div class="state"><h4>Compaction：合并并清理</h4><p>只有实际从新版本中移除的记录，才从总数和对应键数中扣除。</p></div>
+      </div>
+      <div class="grid">
+        <article class="card teal-edge">
+          <span class="label">内存中的部分</span>
+          <h3>写入后更新，重启时从 WAL 重算</h3>
+          <p>WAL 已经保存了尚未刷盘的记录，因此不再为每条写入单独落盘统计。重启后重放 WAL，再计入恢复出的 MemTable。</p>
+        </article>
+        <article class="card orange-edge">
+          <span class="label">SST 中的部分</span>
+          <h3>检查点和文件变化一起写入 MANIFEST</h3>
+          <p>MANIFEST 保存逐键统计检查点和后续增减量。SST 文件的新增、删除与对应统计变化放进同一条 VersionEdit 提交。</p>
+        </article>
+      </div>
+      <div class="architecture reveal" style="margin-top:16px">
+        <div class="arch-row recovery-row">
+          <div class="arch-node orange"><b>读取 MANIFEST</b><small>恢复当前 SST<br>及其统计</small></div>
+          <span class="arrow">+</span>
+          <div class="arch-node teal"><b>重放 WAL</b><small>恢复尚未刷盘的记录<br>并重新计数</small></div>
+          <span class="arrow">→</span>
+          <div class="arch-node blue"><b>得到当前统计</b><small>记录总数 · 去重键数<br>最新已发布序列号</small></div>
+        </div>
+      </div>
+      <div class="callout reveal"><strong>查询的一致性：</strong>三个统计字段在同一把锁内读取；WriteBatch 的序列号和统计作为一个完整批次发布，所以查询不会看到半个批次。</div>
+      <details class="speaker reveal">
+        <summary>讲解提示 · 可以把统计理解成跟随数据搬家</summary>
+        <p>写入时记录先在内存里；Flush 只是搬到 SST，不能把记录算多或算少。Compaction 真的删除旧记录时才扣数。重开时把 MANIFEST 中的 SST 统计和 WAL 恢复出的内存记录合起来，就是当前统计。</p>
+      </details>
+      <div class="chapter-rule"></div>
+    </section>
+
+    <section class="section wrap" id="reliability">
+      <div class="section-head reveal">
+        <span class="section-index">04 / 故障恢复</span>
+        <h2>恢复时分别处理数据、文件版本和统计</h2>
+        <p class="section-intro">统计属于派生信息，发现统计校验失败时可以重新扫描记录；MANIFEST 记录当前文件版本，若其记录损坏，则无法可靠确定数据库状态，打开应失败。</p>
+      </div>
+      <div class="grid three reveal">
+        <article class="card blue-edge">
+          <span class="label">写入出错时</span>
+          <h3>不让统计和序列号越过未完成的写入</h3>
+          <p>写入流程先处理 WAL 和 MemTable，再在锁内发布序列号及统计。若 WAL 追加或同步失败，数据库拒绝后续写入，等待重新打开并按日志恢复。</p>
+        </article>
+        <article class="card orange-edge">
+          <span class="label">MANIFEST 滚动时</span>
+          <h3>写好新的 MANIFEST 后再切换 CURRENT</h3>
+          <p>新 MANIFEST 先写全量文件清单和统计检查点，再写本次变更并同步；成功后才更新 CURRENT。失败时保留旧恢复点。</p>
+        </article>
+        <article class="card teal-edge">
+          <span class="label">日志尾部异常时</span>
+          <h3>保留可恢复前缀，不把坏日志继续用下去</h3>
+          <p>若 WAL 尾部有残缺或校验错误，重启时不复用该日志追加新数据，避免后续有效记录被尾部垃圾遮住。</p>
+        </article>
+      </div>
+      <div class="grid" style="margin-top:16px">
+        <article class="card">
+          <span class="label">旧库和辅助数据</span>
+          <h3>统计可重建，文件版本损坏时返回错误</h3>
+          <p>旧格式数据库或统计校验失败时，可以扫描当前记录重建统计；可选的 STATS 缓存只用于加速，写入失败不影响正确性。若 MANIFEST 的版本记录本身损坏，恢复会失败而不是猜测文件状态。</p>
+        </article>
+        <article class="card">
+          <span class="label">Compaction 中的边界</span>
+          <h3>回收前重新确认读取视图仍然安全</h3>
+          <p>合并期间有新的快照、或者系统时钟回拨，都可能改变过期判断。安装新版本前会再次检查；若读取视图不再安全，就放弃本次输出。</p>
+        </article>
+      </div>
+      <div class="callout amber reveal"><strong>恢复原则：</strong>只重建能够从权威数据推导出的统计；文件版本无法确认时，不猜测数据库状态。</div>
+      <details class="speaker reveal">
+        <summary>讲解提示 · 选一个崩溃点说明恢复逻辑</summary>
+        <p>例如，SST 已经写出来、但对应 MANIFEST 变更还没提交时，重启后不能把这份孤儿 SST 当作有效数据。系统按旧 MANIFEST 恢复旧版本，之后清理未引用文件；统计增量也没有提交，因此文件和统计仍然一致。</p>
+      </details>
+      <div class="chapter-rule"></div>
+    </section>
+
+    <section class="section wrap" id="performance">
+      <div class="section-head reveal">
+        <span class="section-index">05 / 写入开销与优化</span>
+        <h2>统计维护开销与写入路径优化</h2>
+        <p class="section-intro">为了知道每个键还有多少条内部记录，写入时要维护一张有序统计表。对按比较器递增的新键，插入时可以利用顺序，少做一次树查找。</p>
+      </div>
+      <div class="optimization reveal">
+        <article class="card blue-edge">
+          <span class="label">原有做法</span>
+          <h3>插入新键前要在有序表中定位</h3>
+          <div class="mini-flow" style="justify-content:flex-start">
+            <b>find(key)</b><span>→</span><b>判断是否存在</b><span>→</span><b>emplace(key)</b>
+          </div>
+          <p style="margin-top:12px">对按比较器递增的新键，先查找再插入会重复定位；这类键可以直接从 map 末尾插入。</p>
+        </article>
+        <article class="card teal-edge">
+          <span class="label">局部优化</span>
+          <h3>递增的新键从末尾插入</h3>
+          <p>先用比较器检查新键是否排在当前最大键之后。若是，就用 <code>end()</code> 提示插入位置；否则仍通过 <code>lower_bound</code> 查找，以正确处理已有键和自定义比较顺序。</p>
+          <p>改动只减少不必要的定位，不改变统计结果和恢复逻辑。</p>
+        </article>
+      </div>
+      <div class="optimization reveal" style="margin-top:16px">
+        <div class="before-after">
+          <div class="bar-line"><span>优化前</span><div class="track"><div class="fill" style="width:84%"></div></div><b>295,040</b></div>
+          <div class="bar-line"><span>优化后</span><div class="track"><div class="fill after" style="width:100%"></div></div><b>351,544</b></div>
+          <p style="margin:2px 0 0;font-size:12px">普通单线程写入 · 每秒操作数 · Ubuntu 22 · 100k 条 · 每组 3 次</p>
+        </div>
+        <div class="metric-grid" style="grid-template-columns:1fr">
+          <div class="metric"><small>中位数变化</small><b>+19.1%</b><small>同一轮 Ubuntu 22 测试中的优化前后对比。</small></div>
+        </div>
+      </div>
+      <div class="callout amber reveal"><strong>系统层面的取舍：</strong>精确去重需要额外状态和写入工作。优化的目标不是牺牲准确性，而是在保持计数、序列号和恢复语义不变的前提下减少不必要的查找。</div>
+      <details class="speaker reveal">
+        <summary>讲解提示 · 说明这组测量的范围</summary>
+        <p>在 Ubuntu 22 容器里，用 100k 条、单线程、256 字节值的 perf_write 各测三次。中位吞吐由 295,040 提升到 351,544 次/秒。它说明这次局部改动在该负载下有效，不代表所有写入模式都会有相同提升。</p>
+      </details>
+      <div class="chapter-rule"></div>
+    </section>
+
+    <section class="section wrap" id="evidence">
+      <div class="section-head reveal">
+        <span class="section-index">06 / 测试与测量</span>
+        <h2>功能、恢复与规模测试结果</h2>
+        <p class="section-intro">除了课程功能用例，还增加了读视图、统计一致性、MANIFEST 故障、并发 Compaction、异常退出和磁盘空间不足测试；公开 benchmark 则用于检查组合功能与性能。</p>
+      </div>
+      <div class="grid four reveal">
+        <div class="metric"><small>新增专项测试</small><b>73</b><small>5 个测试文件，覆盖 TTL、统计、回收和恢复。</small></div>
+        <div class="metric"><small>Ubuntu 22 全量 CTest</small><b>8 / 8</b><small>8 个测试目标全部通过，含真实 ENOSPC 用例。</small></div>
+        <div class="metric"><small>公开标准测试矩阵</small><b>168 / 168</b><small>公开运行器的标准场景全部通过。</small></div>
+        <div class="metric"><small>统计验证规模</small><b>100 万键</b><small>重开后核对统计和键值。</small></div>
+      </div>
+      <div class="section-head reveal" style="margin-top:35px;margin-bottom:15px">
+        <h3>不同键数下的 MANIFEST 大小和开库时间</h3>
+      </div>
+      <div class="card reveal">
+        <table class="data-table">
+          <thead><tr><th>不同键数</th><th>MANIFEST 大小</th><th>开库时间</th><th>测量方式</th></tr></thead>
+          <tbody>
+            <tr><td>100,000</td><td>1,902,085 字节 · 1.81 MiB</td><td>36.1 ms</td><td>perf_reopen，单次</td></tr>
+            <tr><td>500,000</td><td>9,509,637 字节 · 9.07 MiB</td><td>89.7 ms</td><td>perf_reopen，单次</td></tr>
+            <tr><td>1,000,000</td><td>19,019,020 字节 · 18.14 MiB</td><td>184.2 ms</td><td>perf_reopen，单次</td></tr>
+          </tbody>
+        </table>
+        <div class="callout">开库计时不包括建库和 Compaction。各规模是单次测量，适合观察增长趋势，不应视作性能承诺。</div>
+      </div>
+      <div class="grid" style="margin-top:16px">
+        <article class="card">
+          <span class="label">并发与后台整理</span>
+          <h3>在写入过程中检查统计和文件整理</h3>
+          <p>4 个线程写入 40,000 个不同的键，同时查询统计、触发 flush，并运行后台 compaction 和 6 次显式全范围 compaction。</p>
+        </article>
+        <article class="card">
+          <span class="label">崩溃与磁盘空间不足</span>
+          <h3>检查异常退出后的数据能否恢复</h3>
+          <p>5 次在 WAL 同步成功后立即异常退出，再重开检查已写入数据；另测试 MANIFEST 滚动期间崩溃及有界 tmpfs 上的磁盘空间耗尽。</p>
+        </article>
+      </div>
+      <details class="speaker reveal">
+        <summary>讲解提示 · 说明测试数字的范围</summary>
+        <p>73 是 5 个新增专项测试文件中的用例总数，不是整个项目的测试总数。8/8 表示 CTest 中的 8 个测试目标全部通过；168/168 表示公开标准矩阵中的 168 个场景全部通过。</p>
+      </details>
+      <div class="chapter-rule"></div>
+    </section>
+
+    <section class="section wrap" id="limits">
+      <div class="section-head reveal">
+        <span class="section-index">07 / 结论与后续验证</span>
+        <h2>已验证范围与后续测试</h2>
+        <p class="section-intro">测试通过说明这些场景下行为符合预期；它不能代替长时间运行，也不能推断没有覆盖的故障路径。</p>
+      </div>
+      <div class="grid">
+        <article class="card teal-edge">
+          <span class="label">已有测试支持</span>
+          <h3>目前可以确认</h3>
+          <ul>
+            <li>TTL 的写入、读取、回收和恢复行为通过了相应测试。</li>
+            <li>统计在内存与 SST 之间的转移、版本提交和重启恢复有一致性测试。</li>
+            <li>在指定的单线程写入负载中，局部优化的中位吞吐提升约 19.1%。</li>
+            <li>百万键重开、并发写入、重复 WAL 崩溃和一种真实磁盘空间耗尽场景均通过测试。</li>
+          </ul>
+        </article>
+        <article class="card orange-edge">
+          <span class="label">还需要补充验证</span>
+          <h3>目前还不能下结论</h3>
+          <ul>
+            <li>还没有测量统计检查点不可用时，完整重建统计需要多长时间。</li>
+            <li>有限次数的压力测试不能代替长时间运行或真实断电测试。</li>
+            <li>磁盘空间耗尽测试覆盖了 MANIFEST 滚动场景，不代表所有写满磁盘的路径。</li>
+          </ul>
+        </article>
+      </div>
+      <div class="section-head reveal" style="margin-top:40px;margin-bottom:13px">
+        <h3>后续可以补充的测试</h3>
+      </div>
+      <div class="roadmap reveal">
+        <article><time>性能</time><div><h4>补齐一致条件下的基线测量</h4><p>对同一环境、同一负载进行多轮对照，观察性能差异与波动。</p></div></article>
+        <article><time>恢复成本</time><div><h4>测量统计全量重建的时间和内存</h4><p>在不同键数下测试检查点不可用时的恢复过程，再判断是否需要调整检查点策略。</p></div></article>
+        <article><time>持续运行</time><div><h4>延长并发运行并增加故障测试</h4><p>测试写入与 Compaction 长时间并行，以及 WAL、SST 和目录同步失败后的重开结果。</p></div></article>
+      </div>
+      <div class="thesis reveal" style="margin:35px 0 0">
+        TTL 和统计的实现涉及写入、读取、文件合并和重启恢复。本项目补充了这些路径的相应处理和测试；长期运行及更多故障场景仍可继续验证。
+      </div>
+      <details class="speaker reveal">
+        <summary>讲解提示 · 汇报结尾</summary>
+        <p>最后概括功能实现、恢复处理和测试范围，并说明尚未覆盖的场景。</p>
+      </details>
+    </section>
+
+    <footer class="footer wrap">
+      <p><strong>LevelDB Project1 · 从数据路径理解 TTL、统计与恢复</strong></p>
+      <p>实现细节和测试记录见同目录的《实验报告.md》。测试与性能数据按对应运行环境和测量范围理解。</p>
+    </footer>
+  </main>
+
+  <button class="backtop" type="button" aria-label="回到顶部" title="回到顶部">↑</button>
+  <script>
+    (() => {
+      const progress = document.getElementById("progress");
+      const sections = Array.from(document.querySelectorAll("main section[id]"));
+      const links = Array.from(document.querySelectorAll(".topnav a"));
+      const backTop = document.querySelector(".backtop");
+      const reveals = Array.from(document.querySelectorAll(".reveal"));
+
+      const updateProgress = () => {
+        const scrollable = document.documentElement.scrollHeight - window.innerHeight;
+        const amount = scrollable > 0 ? window.scrollY / scrollable : 0;
+        progress.style.width = `${Math.max(0, Math.min(1, amount)) * 100}%`;
+      };
+
+      backTop.addEventListener("click", () => window.scrollTo({ top: 0, behavior: "smooth" }));
+      window.addEventListener("scroll", updateProgress, { passive: true });
+      window.addEventListener("resize", updateProgress);
+      updateProgress();
+
+      if ("IntersectionObserver" in window) {
+        const revealObserver = new IntersectionObserver((entries, observer) => {
+          for (const entry of entries) {
+            if (entry.isIntersecting) {
+              entry.target.classList.add("in-view");
+              observer.unobserve(entry.target);
+            }
+          }
+        }, { threshold: 0.08 });
+        reveals.forEach((element) => revealObserver.observe(element));
+
+        const sectionObserver = new IntersectionObserver((entries) => {
+          for (const entry of entries) {
+            if (entry.isIntersecting) {
+              links.forEach((link) => link.classList.toggle(
+                "current", link.hash === `#${entry.target.id}`));
+            }
+          }
+        }, { rootMargin: "-22% 0px -68% 0px" });
+        sections.forEach((section) => sectionObserver.observe(section));
+      } else {
+        reveals.forEach((element) => element.classList.add("in-view"));
+      }
+    })();
+  </script>
+</body>
+</html>
