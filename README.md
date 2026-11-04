@@ -795,7 +795,7 @@ $ ctest --test-dir build/release
 Total Test time (real) = 79.9 s
 ```
 
-![image-20261104233111174](C:\Users\ASUS\AppData\Roaming\Typora\typora-user-images\image-20261104233111174.png)
+![image-20261104233111174](https://github.com/isavailabie/database/blob/main/image-20261104233111174.png)
 
 #### 5.3 公开 benchmark
 
@@ -831,9 +831,9 @@ python3 benchmark/runner.py --kind combined --source "$PWD" \
 
 - 开库耗时 76.9 ms，主要来自解析 MANIFEST 里的统计检查点；该成本随去重键数线性增长。
 
-![image-20261105012332826](C:\Users\ASUS\AppData\Roaming\Typora\typora-user-images\image-20261105012332826.png)
+![image-20261105012332826](https://github.com/isavailabie/database/blob/main/image-20261105012332826.png)
 
-![image-20261105014350682](C:\Users\ASUS\AppData\Roaming\Typora\typora-user-images\image-20261105014350682.png)
+![image-20261105014350682](https://github.com/isavailabie/database/blob/main/image-20261105014350682.png)
 
 #### 5.5 与基线对比
 
