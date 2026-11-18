@@ -122,6 +122,8 @@ private:
     struct Impl;
     explicit Engine(std::unique_ptr<Impl> impl);
     Status FlushLocked(bool incremental = true);
+    Status CompactLocked(size_t threshold);
+    Status PublishManifestLocked(const std::vector<std::filesystem::path>& files);
     std::unique_ptr<Impl> impl_;
 };
 

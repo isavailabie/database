@@ -41,6 +41,7 @@ struct SstableIndexEntry {
 struct SstableMetadata {
     std::filesystem::path path;
     size_t shard_id{};
+    size_t level{0};
     uint64_t point_count{};
     uint32_t encoding{0};
     int64_t min_timestamp{std::numeric_limits<int64_t>::max()};
@@ -582,15 +583,15 @@ struct Engine::Impl {
         memtable_bytes = 0;
     }
 
-    Status WriteMergedShard(size_t shard_id, SstableWriter* writer) {
+    Status WriteMergedShard(size_t shard_id, size_t level,
+                            SstableWriter* writer) {
         std::vector<std::shared_ptr<SstableMetadata>> sources;
         for (const auto& sstable : sstable_metadata) {
-            if (sstable->shard_id == shard_id) sources.push_back(sstable);
+            if (sstable->shard_id == shard_id && sstable->level == level) {
+                sources.push_back(sstable);
+            }
         }
         std::set<uint64_t> series_ids;
-        for (const auto& [series_id, _] : shards[shard_id]->series) {
-            series_ids.insert(series_id);
-        }
         for (const auto& sstable : sources) {
             for (const auto& [series_id, _] : sstable->series) {
                 series_ids.insert(series_id);
@@ -606,12 +607,6 @@ struct Engine::Impl {
                     it->second = point;
                 }
             };
-            const auto mem_it = shards[shard_id]->series.find(series_id);
-            if (mem_it != shards[shard_id]->series.end()) {
-                for (const auto& [timestamp, point] : mem_it->second) {
-                    insert(timestamp, point);
-                }
-            }
             for (const auto& sstable : sources) {
                 if (sstable->series.find(series_id) ==
                     sstable->series.end()) {
@@ -634,14 +629,19 @@ struct Engine::Impl {
         return Status::Ok();
     }
 
-    size_t MaxSstablesPerShardLocked() const {
-        std::vector<size_t> counts(shards.size(), 0);
-        for (const auto& sstable : sstable_metadata) {
-            if (sstable->shard_id < counts.size()) ++counts[sstable->shard_id];
+    bool ShouldCompactLocked(size_t threshold) const {
+        for (size_t shard_id = 0; shard_id < shards.size(); ++shard_id) {
+            std::map<size_t, size_t> counts;
+            for (const auto& sstable : sstable_metadata) {
+                if (sstable->shard_id == shard_id) {
+                    ++counts[sstable->level];
+                }
+            }
+            for (const auto& [level, count] : counts) {
+                if (count >= threshold) return true;
+            }
         }
-        size_t max_count = 0;
-        for (const size_t count : counts) max_count = std::max(max_count, count);
-        return max_count;
+        return false;
     }
 
     Status GarbageCollectLocked() {
@@ -817,7 +817,6 @@ struct Engine::Impl {
         std::istringstream header_in(header);
         header_in >> cutoff >> next_version;
         if (!(header_in >> next_file_number)) next_file_number = 1;
-        if (next_version > 0) last_flushed_version = next_version - 1;
         std::string manifest_payload = header + "\n";
         std::string line;
         uint64_t recorded_checksum = 0;
@@ -870,6 +869,14 @@ struct Engine::Impl {
             }
             current_files.push_back(root / file);
         }
+        CommitVersion min_covered = 0;
+        if (!covered_commit_versions.empty()) {
+            min_covered = covered_commit_versions[0];
+            for (const CommitVersion covered : covered_commit_versions) {
+                min_covered = std::min(min_covered, covered);
+            }
+        }
+        last_flushed_version = min_covered;
         if (!checksum_seen ||
             recorded_checksum == 0 ||
             recorded_checksum != Checksum(manifest_payload)) {
@@ -1028,8 +1035,8 @@ Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
                 (void)impl_->GarbageCollectLocked();
             }
             if (flushed && impl_->options.enable_background_compaction &&
-                impl_->MaxSstablesPerShardLocked() >=
-                    impl_->options.compaction_sstable_threshold) {
+                impl_->ShouldCompactLocked(
+                    impl_->options.compaction_sstable_threshold)) {
                 impl_->compaction_requested = true;
                 impl_->compaction_cv.notify_one();
             }
@@ -1046,8 +1053,14 @@ Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
                 });
                 if (impl_->stopping_compaction) return;
                 impl_->compaction_requested = false;
-                ++impl_->compaction_count;
-                (void)FlushLocked(false);
+                while (impl_->ShouldCompactLocked(
+                    impl_->options.compaction_sstable_threshold)) {
+                    if (!CompactLocked(
+                             impl_->options.compaction_sstable_threshold)
+                             .ok) {
+                        break;
+                    }
+                }
                 if (impl_->options.enable_background_gc) {
                     (void)impl_->GarbageCollectLocked();
                 }
@@ -1447,12 +1460,61 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
     return Status::Ok();
 }
 
+Status Engine::PublishManifestLocked(
+    const std::vector<std::filesystem::path>& files) {
+    const auto manifest_tmp = impl_->manifest_path.string() + ".tmp";
+    {
+        std::ofstream manifest(manifest_tmp, std::ios::trunc);
+        if (!manifest) return Status::Error("cannot create Manifest");
+        std::string manifest_text;
+        manifest_text += std::to_string(impl_->cutoff) + " " +
+                         std::to_string(impl_->next_version) + " " +
+                         std::to_string(impl_->next_file_number) + "\n";
+        for (size_t shard_id = 0;
+             shard_id < impl_->covered_commit_versions.size(); ++shard_id) {
+            manifest_text += "COVERED " + std::to_string(shard_id) + " " +
+                             std::to_string(
+                                 impl_->covered_commit_versions[shard_id]) +
+                             "\n";
+        }
+        for (size_t i = 0; i < files.size(); ++i) {
+            manifest_text += std::to_string(i) + " " +
+                             std::filesystem::relative(files[i], impl_->root)
+                                 .string() +
+                             "\n";
+        }
+        manifest << manifest_text;
+        manifest << "CHECKSUM " << Checksum(manifest_text) << '\n';
+    }
+    if (!SyncFile(manifest_tmp)) return Status::Error("Manifest sync failed");
+    std::error_code ec;
+    std::filesystem::rename(manifest_tmp, impl_->manifest_path, ec);
+    if (ec) return Status::Error("Manifest publish failed");
+    if (!SyncDirectory(impl_->root)) {
+        return Status::Error("Manifest directory sync failed");
+    }
+    const auto current_tmp = impl_->root / "CURRENT.tmp";
+    {
+        std::ofstream current(current_tmp, std::ios::trunc);
+        if (!current) return Status::Error("cannot create CURRENT");
+        current << "MANIFEST\n";
+        current.close();
+    }
+    if (!SyncFile(current_tmp)) return Status::Error("CURRENT sync failed");
+    std::error_code current_ec;
+    std::filesystem::rename(current_tmp, impl_->root / "CURRENT", current_ec);
+    if (current_ec) return Status::Error("CURRENT publish failed");
+    if (!SyncDirectory(impl_->root)) {
+        return Status::Error("CURRENT directory sync failed");
+    }
+    return Status::Ok();
+}
+
 Status Engine::FlushLocked(bool incremental) {
+    (void)incremental;
     if (impl_->closed) return Status::Error("engine is closed");
     std::vector<std::filesystem::path> new_files;
     std::vector<std::shared_ptr<SstableMetadata>> published_metadata;
-    std::vector<std::filesystem::path> manifest_files =
-        incremental ? impl_->current_files : std::vector<std::filesystem::path>{};
     for (size_t shard_id = 0; shard_id < impl_->shards.size(); ++shard_id) {
         std::string filename = "shard-";
         filename += shard_id < 10 ? "0" : "";
@@ -1462,23 +1524,13 @@ Status Engine::FlushLocked(bool incremental) {
         const auto temp = file.string() + ".tmp";
         SstableWriter writer;
         if (!writer.Open(temp)) return Status::Error("cannot create SSTable");
-        if (incremental) {
-            const auto& data = *impl_->shards[shard_id];
-            for (const auto& [_, points] : data.series) {
-                for (const auto& [__, value] : points) {
-                    if (value.version <= impl_->last_flushed_version) continue;
-                    writer.Append(value.point.series_id,
-                                  value.point.timestamp_ms,
-                                  value.point.value, value.version);
-                }
-            }
-        } else {
-            auto status = impl_->WriteMergedShard(shard_id, &writer);
-            if (!status.ok) {
-                writer.Discard();
-                std::error_code discard_ec;
-                std::filesystem::remove(temp, discard_ec);
-                return status;
+        const auto& data = *impl_->shards[shard_id];
+        for (const auto& [_, points] : data.series) {
+            for (const auto& [__, value] : points) {
+                if (value.version <= impl_->last_flushed_version) continue;
+                writer.Append(value.point.series_id,
+                              value.point.timestamp_ms, value.point.value,
+                              value.version);
             }
         }
         if (writer.count == 0) {
@@ -1503,83 +1555,125 @@ Status Engine::FlushLocked(bool incremental) {
             std::make_shared<SstableMetadata>(std::move(writer.metadata));
         metadata->path = file;
         metadata->shard_id = shard_id;
+        metadata->level = 0;
         published_metadata.push_back(metadata);
         new_files.push_back(file);
-        manifest_files.push_back(file);
         ++impl_->next_file_number;
     }
     for (auto& covered : impl_->covered_commit_versions) {
         covered = impl_->next_version - 1;
     }
     impl_->metadata_covered_commit_version = impl_->next_version - 1;
-    const auto manifest_tmp = impl_->manifest_path.string() + ".tmp";
-    {
-        std::ofstream manifest(manifest_tmp, std::ios::trunc);
-        if (!manifest) return Status::Error("cannot create Manifest");
-        std::string manifest_text;
-        manifest_text += std::to_string(impl_->cutoff) + " " +
-                         std::to_string(impl_->next_version) + " " +
-                         std::to_string(impl_->next_file_number) + "\n";
-        for (size_t shard_id = 0;
-             shard_id < impl_->covered_commit_versions.size(); ++shard_id) {
-            manifest_text += "COVERED " + std::to_string(shard_id) + " " +
-                             std::to_string(
-                                 impl_->covered_commit_versions[shard_id]) +
-                             "\n";
-        }
-        for (size_t i = 0; i < manifest_files.size(); ++i) {
-            manifest_text += std::to_string(i) + " " +
-                             std::filesystem::relative(manifest_files[i], impl_->root).string() +
-                             "\n";
-        }
-        manifest << manifest_text;
-        manifest << "CHECKSUM " << Checksum(manifest_text) << '\n';
-    }
-    if (!SyncFile(manifest_tmp)) return Status::Error("Manifest sync failed");
-    std::error_code ec;
-    std::filesystem::rename(manifest_tmp, impl_->manifest_path, ec);
-    if (ec) return Status::Error("Manifest publish failed");
-    if (!SyncDirectory(impl_->root)) return Status::Error("Manifest directory sync failed");
-    {
-        const auto current_tmp = impl_->root / "CURRENT.tmp";
-        std::ofstream current(current_tmp, std::ios::trunc);
-        if (!current) return Status::Error("cannot create CURRENT");
-        current << "MANIFEST\n";
-        current.close();
-        if (!SyncFile(current_tmp)) return Status::Error("CURRENT sync failed");
-        std::error_code current_ec;
-        std::filesystem::rename(current_tmp, impl_->root / "CURRENT", current_ec);
-        if (current_ec) return Status::Error("CURRENT publish failed");
-        if (!SyncDirectory(impl_->root)) return Status::Error("CURRENT directory sync failed");
-    }
-    if (!incremental) {
-        for (const auto& obsolete : impl_->sstable_metadata) {
-            impl_->obsolete_sstables.push_back(obsolete);
-        }
-    }
-    if (!incremental && !impl_->current_files.empty() &&
-        !SyncDirectory(impl_->root / "sst")) {
-        return Status::Error("obsolete SSTable directory sync failed");
-    }
+    impl_->current_files.insert(impl_->current_files.end(),
+                                new_files.begin(), new_files.end());
+    auto status = PublishManifestLocked(impl_->current_files);
+    if (!status.ok) return status;
     if (::ftruncate(impl_->wal_fd, 0) != 0 ||
         ::fsync(impl_->wal_fd) != 0) {
         return Status::Error("WAL truncate sync failed");
     }
-    impl_->current_files =
-        incremental ? std::move(manifest_files) : std::move(new_files);
-    if (incremental) {
-        impl_->sstable_metadata.insert(
-            impl_->sstable_metadata.end(),
-            published_metadata.begin(),
-            published_metadata.end());
-    } else {
-        impl_->sstable_metadata = std::move(published_metadata);
-    }
+    impl_->sstable_metadata.insert(impl_->sstable_metadata.end(),
+                                   published_metadata.begin(),
+                                   published_metadata.end());
     impl_->last_flushed_version = impl_->next_version - 1;
     impl_->points_since_flush = 0;
     impl_->hot_series_points.clear();
     impl_->ClearMemtableLocked();
     ++impl_->flush_count;
+    return Status::Ok();
+}
+
+Status Engine::CompactLocked(size_t threshold) {
+    if (impl_->closed) return Status::Error("engine is closed");
+    const size_t kNoLevel = std::numeric_limits<size_t>::max();
+    std::vector<size_t> compact_level(impl_->shards.size(), kNoLevel);
+    for (size_t shard_id = 0; shard_id < impl_->shards.size(); ++shard_id) {
+        std::map<size_t, size_t> counts;
+        for (const auto& sstable : impl_->sstable_metadata) {
+            if (sstable->shard_id == shard_id) ++counts[sstable->level];
+        }
+        for (const auto& [level, count] : counts) {
+            if (count >= threshold) {
+                compact_level[shard_id] = level;
+                break;
+            }
+        }
+    }
+
+    std::vector<std::filesystem::path> new_files;
+    std::vector<std::shared_ptr<SstableMetadata>> published_metadata;
+    for (size_t shard_id = 0; shard_id < impl_->shards.size(); ++shard_id) {
+        if (compact_level[shard_id] == kNoLevel) continue;
+        std::string filename = "shard-";
+        filename += shard_id < 10 ? "0" : "";
+        filename += std::to_string(shard_id);
+        filename += "-" + std::to_string(impl_->next_file_number) + ".sst";
+        const auto file = impl_->root / "sst" / filename;
+        const auto temp = file.string() + ".tmp";
+        SstableWriter writer;
+        if (!writer.Open(temp)) return Status::Error("cannot create SSTable");
+        auto status =
+            impl_->WriteMergedShard(shard_id, compact_level[shard_id], &writer);
+        if (!status.ok) {
+            writer.Discard();
+            std::error_code discard_ec;
+            std::filesystem::remove(temp, discard_ec);
+            return status;
+        }
+        if (writer.count == 0) {
+            writer.Discard();
+            std::error_code discard_ec;
+            std::filesystem::remove(temp, discard_ec);
+            continue;
+        }
+        if (!writer.Finish()) {
+            std::error_code discard_ec;
+            std::filesystem::remove(temp, discard_ec);
+            return Status::Error("SSTable write failed");
+        }
+        if (!SyncFile(temp)) return Status::Error("SSTable sync failed");
+        std::error_code ec;
+        std::filesystem::rename(temp, file, ec);
+        if (ec) return Status::Error("SSTable publish failed");
+        if (!SyncDirectory(file.parent_path())) {
+            return Status::Error("SSTable directory sync failed");
+        }
+        auto metadata =
+            std::make_shared<SstableMetadata>(std::move(writer.metadata));
+        metadata->path = file;
+        metadata->shard_id = shard_id;
+        metadata->level = compact_level[shard_id] + 1;
+        published_metadata.push_back(metadata);
+        new_files.push_back(file);
+        ++impl_->next_file_number;
+    }
+
+    if (published_metadata.empty()) return Status::Ok();
+
+    std::vector<std::shared_ptr<SstableMetadata>> retained;
+    retained.reserve(impl_->sstable_metadata.size());
+    for (const auto& sstable : impl_->sstable_metadata) {
+        const size_t shard_id = sstable->shard_id;
+        if (shard_id < compact_level.size() &&
+            sstable->level == compact_level[shard_id]) {
+            impl_->obsolete_sstables.push_back(sstable);
+        } else {
+            retained.push_back(sstable);
+        }
+    }
+    impl_->sstable_metadata = std::move(retained);
+    impl_->sstable_metadata.insert(impl_->sstable_metadata.end(),
+                                   published_metadata.begin(),
+                                   published_metadata.end());
+
+    impl_->current_files.clear();
+    impl_->current_files.reserve(impl_->sstable_metadata.size());
+    for (const auto& sstable : impl_->sstable_metadata) {
+        impl_->current_files.push_back(sstable->path);
+    }
+    auto status = PublishManifestLocked(impl_->current_files);
+    if (!status.ok) return status;
+    ++impl_->compaction_count;
     return Status::Ok();
 }
 
@@ -1591,9 +1685,13 @@ Status Engine::Flush() {
 Status Engine::Compact() {
     std::lock_guard lock(impl_->mutex);
     if (impl_->closed) return Status::Error("engine is closed");
-    ++impl_->compaction_count;
-    return FlushLocked(false);
+    while (impl_->ShouldCompactLocked(2)) {
+        auto status = CompactLocked(2);
+        if (!status.ok) return status;
+    }
+    return Status::Ok();
 }
+
 
 Status Engine::GarbageCollect() {
     std::lock_guard lock(impl_->mutex);
