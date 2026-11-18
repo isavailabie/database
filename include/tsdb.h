@@ -48,6 +48,7 @@ public:
     std::optional<DataPoint> NextPoint();
     std::optional<AggregateResult> NextAggregate();
     void Close();
+    ~Cursor();
     bool closed() const { return closed_; }
 
 private:
@@ -66,6 +67,10 @@ struct Options {
     size_t memtable_max_points{100000};
     size_t max_pending_batches{64};
     bool enable_background_compaction{true};
+    size_t max_memtable_bytes{160 * 1024 * 1024};
+    size_t cpu_budget{4};
+    size_t memtable_block_bytes{16 * 1024};
+    uint64_t hot_series_point_limit{10000000};
 };
 
 struct EngineStats {
@@ -82,6 +87,10 @@ struct EngineStats {
     uint64_t sstable_bytes{};
     size_t active_read_views{};
     uint64_t obsolete_sstable_count{};
+    uint64_t rss_bytes{};
+    uint64_t peak_rss_bytes{};
+    size_t engine_threads{};
+    size_t memtable_bytes{};
 };
 
 class Engine {

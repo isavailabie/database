@@ -37,20 +37,25 @@ ctest --test-dir build --output-on-failure
 
 ## 当前状态
 
-当前实现包含：
+已实现：
 
 - `Put`、`WriteBatch`
 - Series 分片和 Shard MemTable
-- WAL 校验、持久 fd 和 Group Commit
-- SSTable、Manifest 和尾部 WAL 重放
+- WAL 校验、持久 fd 和小批量 Group Commit
+- 增量 Flush、SSTable、Manifest 和尾部 WAL 重放
+- SSTable SeriesIndex 和按需磁盘分页读取
 - 流式 `Scan`
 - 窗口聚合
 - ReadView 和过期视图
-- 后台 Flush 请求、基础 Compaction 和状态统计
+- 后台 Flush、基础 Compaction 和安全 GC
+- 50 次文件级故障注入
+- 完全过期 SSTable 会移出新视图并等待 GC
+- 导入和混合基准会报告峰值 RSS
 
-以下内容仍是下一阶段：
+尚未完成课程满负载验收：
 
-- 磁盘外 SSTable 分页读取
-- Page 编码和压缩
-- 自动持续 Compaction 和过期 GC
+- timestamp/value 压缩编码
+- 完整多 SSTable merge Compaction
+- 物理过期 SSTable/Page 清理
+- 512 MiB RSS 和 4 CPU 配额验证
 - 完整的 1 亿点、60 分钟读写和恢复基准

@@ -80,5 +80,6 @@ int main(int argc, char** argv) {
               << " sstable_bytes=" << stats.sstable_bytes
               << " recovery_seconds=" << recovery_seconds
               << " wal_bytes_replayed=" << stats.wal_bytes_replayed
-              << " recovered_series_1000_points=" << recovered << '\n';
+              << " recovered_series_1000_points=" << recovered
+              << " peak_rss_bytes=" << stats.peak_rss_bytes << '\n';
 }

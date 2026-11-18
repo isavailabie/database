@@ -95,5 +95,7 @@ int main(int argc, char** argv) {
               << " flush_count=" << stats.flush_count
               << " compaction_count=" << stats.compaction_count
               << " active_read_views=" << stats.active_read_views
-              << " obsolete_sstables=" << stats.obsolete_sstable_count << '\n';
+              << " obsolete_sstables=" << stats.obsolete_sstable_count
+              << " peak_rss_bytes=" << stats.peak_rss_bytes
+              << " engine_threads=" << stats.engine_threads << '\n';
 }

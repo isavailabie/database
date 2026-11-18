@@ -15,9 +15,11 @@
 #include <sys/stat.h>
 #include <tuple>
 #include <unistd.h>
+#include <sys/resource.h>
 #include <condition_variable>
 #include <thread>
 #include <deque>
+#include <unordered_map>
 
 namespace tsdb {
 namespace {
@@ -100,6 +102,9 @@ struct VersionedPoint {
 
 struct ShardData {
     std::map<uint64_t, std::map<int64_t, VersionedPoint>> series;
+    std::unordered_map<uint64_t, size_t> block_bytes;
+    std::unordered_map<uint64_t, size_t> block_count;
+    std::unordered_map<uint64_t, std::vector<std::vector<VersionedPoint>>> blocks;
     size_t point_count() const {
         size_t count = 0;
         for (const auto& [_, points] : series) count += points.size();
@@ -246,9 +251,15 @@ void Cursor::Close() {
     point_generator_ = {};
 }
 
+Cursor::~Cursor() {
+    Close();
+}
+
 struct PendingWrite {
     std::vector<DataPoint> points;
     CommitVersion version{0};
+    off_t wal_start{0};
+    off_t wal_end{0};
     Status status{Status::Ok()};
     bool done{false};
 };
@@ -289,6 +300,10 @@ struct Engine::Impl {
     int wal_fd{-1};
     uint64_t compaction_count{0};
     uint64_t flush_count{0};
+    size_t memtable_bytes{0};
+    std::unordered_map<uint64_t, uint64_t> hot_series_points;
+    std::vector<CommitVersion> covered_commit_versions;
+    CommitVersion metadata_covered_commit_version{0};
     size_t active_read_views{0};
     std::vector<std::filesystem::path> obsolete_sstables;
     CommitVersion last_flushed_version{0};
@@ -357,6 +372,25 @@ struct Engine::Impl {
         for (const auto& point : points) {
             shards[ShardFor(point.series_id)]->series[point.series_id]
                 [point.timestamp_ms] = VersionedPoint{point, version};
+            const size_t bytes = sizeof(DataPoint) + sizeof(CommitVersion);
+            auto& block_chain =
+                shards[ShardFor(point.series_id)]
+                    ->blocks[point.series_id];
+            if (block_chain.empty()) block_chain.emplace_back();
+            block_chain.back().push_back(VersionedPoint{point, version});
+            if (block_chain.back().size() * bytes >
+                options.memtable_block_bytes) {
+                block_chain.emplace_back();
+            }
+            shards[ShardFor(point.series_id)]->block_bytes
+                [point.series_id] += bytes;
+            auto& shard = *shards[ShardFor(point.series_id)];
+            shard.block_count[point.series_id] =
+                (shard.block_bytes[point.series_id] +
+                 options.memtable_block_bytes - 1) /
+                options.memtable_block_bytes;
+            memtable_bytes += bytes;
+            ++hot_series_points[point.series_id];
         }
     }
 
@@ -374,8 +408,91 @@ struct Engine::Impl {
             for (const auto& point : request->points) {
                 shards[ShardFor(point.series_id)]->series[point.series_id]
                     [point.timestamp_ms] = VersionedPoint{point, request->version};
+                const size_t block_bytes =
+                    sizeof(DataPoint) + sizeof(CommitVersion);
+                auto& block_chain =
+                    shards[ShardFor(point.series_id)]
+                        ->blocks[point.series_id];
+                if (block_chain.empty()) block_chain.emplace_back();
+                block_chain.back().push_back(
+                    VersionedPoint{point, request->version});
+                if (block_chain.back().size() * block_bytes >
+                    options.memtable_block_bytes) {
+                    block_chain.emplace_back();
+                }
+                shards[ShardFor(point.series_id)]->block_bytes
+                    [point.series_id] += block_bytes;
+                auto& shard = *shards[ShardFor(point.series_id)];
+                shard.block_count[point.series_id] =
+                    (shard.block_bytes[point.series_id] +
+                     options.memtable_block_bytes - 1) /
+                    options.memtable_block_bytes;
+                memtable_bytes += block_bytes;
+                ++hot_series_points[point.series_id];
             }
         }
+    }
+
+    Status ReadSstableMetadata(const std::filesystem::path& path,
+                               size_t shard_id,
+                               std::shared_ptr<SstableMetadata>* metadata) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) return Status::Error("cannot read SSTable metadata");
+        uint32_t magic = 0;
+        uint64_t count = 0;
+        in.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+        in.read(reinterpret_cast<char*>(&count), sizeof(count));
+        if (!in || magic != kWalMagic) {
+            return Status::Error("invalid SSTable metadata");
+        }
+        auto result = std::make_shared<SstableMetadata>();
+        result->path = path;
+        result->shard_id = shard_id;
+        result->point_count = count;
+        uint64_t hash = 1469598103934665603ULL;
+        for (uint64_t i = 0; i < count; ++i) {
+            uint64_t series_id = 0;
+            int64_t timestamp = 0;
+            double value = 0.0;
+            CommitVersion version = 0;
+            in.read(reinterpret_cast<char*>(&series_id), sizeof(uint64_t));
+            in.read(reinterpret_cast<char*>(&timestamp), sizeof(int64_t));
+            in.read(reinterpret_cast<char*>(&value), sizeof(double));
+            in.read(reinterpret_cast<char*>(&version), sizeof(CommitVersion));
+            if (!in) return Status::Error("truncated SSTable metadata");
+            char raw[sizeof(uint64_t) + sizeof(int64_t) +
+                     sizeof(double) + sizeof(CommitVersion)];
+            std::memcpy(raw, &series_id, sizeof(uint64_t));
+            std::memcpy(raw + sizeof(uint64_t), &timestamp, sizeof(int64_t));
+            std::memcpy(raw + sizeof(uint64_t) + sizeof(int64_t),
+                        &value, sizeof(double));
+            std::memcpy(raw + sizeof(uint64_t) + sizeof(int64_t) +
+                            sizeof(double),
+                        &version, sizeof(CommitVersion));
+            hash = HashRecord(hash, raw, sizeof(raw));
+            auto& entry = result->series[series_id];
+            entry.series_id = series_id;
+            if (entry.point_count == 0) {
+                entry.offset =
+                    sizeof(uint32_t) + sizeof(uint64_t) +
+                    i * (sizeof(uint64_t) + sizeof(int64_t) +
+                         sizeof(double) + sizeof(CommitVersion));
+            }
+            ++entry.point_count;
+            entry.min_timestamp = std::min(entry.min_timestamp, timestamp);
+            entry.max_timestamp = std::max(entry.max_timestamp, timestamp);
+            result->min_timestamp =
+                std::min(result->min_timestamp, timestamp);
+            result->max_timestamp =
+                std::max(result->max_timestamp, timestamp);
+        }
+        uint64_t checksum = 0;
+        in.read(reinterpret_cast<char*>(&checksum), sizeof(checksum));
+        if (!in || checksum != hash) {
+            return Status::Error("SSTable metadata checksum mismatch");
+        }
+        *metadata = std::move(result);
+        return Status::Ok();
     }
 
     Status LoadSstable(const std::filesystem::path& path, size_t shard_id) {
@@ -468,6 +585,17 @@ struct Engine::Impl {
             }
             if (checksum_seen) return Status::Error("data after Manifest checksum");
             manifest_payload += line + "\n";
+            if (line.rfind("COVERED ", 0) == 0) {
+                size_t shard_id_line = 0;
+                CommitVersion covered = 0;
+                std::istringstream covered_line(line);
+                std::string label;
+                covered_line >> label >> shard_id_line >> covered;
+                if (shard_id_line < covered_commit_versions.size()) {
+                    covered_commit_versions[shard_id_line] = covered;
+                }
+                continue;
+            }
             std::istringstream row(line);
             if (!(row >> shard_id >> file)) return Status::Error("invalid Manifest row");
             const std::string filename = std::filesystem::path(file).filename().string();
@@ -569,12 +697,14 @@ Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
             off_t wal_record_start = ::lseek(impl_->wal_fd, 0, SEEK_END);
             for (const auto& request : group) {
                 request->version = impl_->next_version++;
+                request->wal_start = ::lseek(impl_->wal_fd, 0, SEEK_END);
                 if (!AppendWalRecordNoSync(
                         impl_->wal_fd, kTxnRecord,
                         WalPayloadTxn(request->version, request->points))) {
                     ok = false;
                     break;
                 }
+                request->wal_end = ::lseek(impl_->wal_fd, 0, SEEK_END);
             }
             if (ok) ok = ::fsync(impl_->wal_fd) == 0;
             if (!ok && wal_record_start >= 0) {
@@ -607,6 +737,7 @@ Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
             if (impl_->stopping_flush) return;
             impl_->flush_requested = false;
             if (FlushLocked(true).ok &&
+                impl_->options.enable_background_compaction &&
                 impl_->flush_count >= 4 &&
                 impl_->flush_count % 4 == 0) {
                 impl_->compaction_requested = true;
@@ -614,46 +745,51 @@ Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
             }
         }
     });
-    impl_->compaction_worker = std::thread([this] {
-        while (true) {
-            std::unique_lock lock(impl_->mutex);
-            impl_->compaction_cv.wait(lock, [&] {
-                return impl_->compaction_requested || impl_->stopping_compaction;
-            });
-            if (impl_->stopping_compaction) return;
-            impl_->compaction_requested = false;
-            for (size_t shard_id = 0;
-                 shard_id < impl_->shards.size(); ++shard_id) {
-                impl_->shards[shard_id] =
-                    std::make_shared<ShardData>(*impl_->shards[shard_id]);
-                auto& data = impl_->shards[shard_id]->series;
-                for (auto series_it = data.begin();
-                     series_it != data.end();) {
-                    for (auto point_it = series_it->second.begin();
-                         point_it != series_it->second.end();) {
-                        if (point_it->first < impl_->cutoff ||
-                            point_it->second.version >
-                                impl_->next_version - 1) {
-                            point_it = series_it->second.erase(point_it);
+    if (impl_->options.enable_background_compaction) {
+        impl_->compaction_worker = std::thread([this] {
+            while (true) {
+                std::unique_lock lock(impl_->mutex);
+                impl_->compaction_cv.wait(lock, [&] {
+                    return impl_->compaction_requested ||
+                           impl_->stopping_compaction;
+                });
+                if (impl_->stopping_compaction) return;
+                impl_->compaction_requested = false;
+                for (size_t shard_id = 0;
+                     shard_id < impl_->shards.size(); ++shard_id) {
+                    auto compacted_shard = std::make_shared<ShardData>();
+                    auto& data = impl_->shards[shard_id]->series;
+                    for (auto series_it = data.begin();
+                         series_it != data.end();) {
+                        for (auto point_it = series_it->second.begin();
+                             point_it != series_it->second.end();) {
+                            if (point_it->first < impl_->cutoff ||
+                                point_it->second.version >
+                                    impl_->next_version - 1) {
+                                point_it = series_it->second.erase(point_it);
+                            } else {
+                                compacted_shard->series[series_it->first]
+                                    [point_it->first] = point_it->second;
+                                ++point_it;
+                            }
+                        }
+                        if (series_it->second.empty()) {
+                            series_it = data.erase(series_it);
                         } else {
-                            ++point_it;
+                            ++series_it;
                         }
                     }
-                    if (series_it->second.empty()) {
-                        series_it = data.erase(series_it);
-                    } else {
-                        ++series_it;
-                    }
+                    impl_->shards[shard_id] = std::move(compacted_shard);
                 }
+                impl_->points_since_flush = 0;
+                for (const auto& shard : impl_->shards) {
+                    impl_->points_since_flush += shard->point_count();
+                }
+                ++impl_->compaction_count;
+                (void)FlushLocked(false);
             }
-            impl_->points_since_flush = 0;
-            for (const auto& shard : impl_->shards) {
-                impl_->points_since_flush += shard->point_count();
-            }
-            ++impl_->compaction_count;
-            (void)FlushLocked(false);
-        }
-    });
+        });
+    }
 }
 
 std::unique_ptr<Engine> Engine::Open(const std::filesystem::path& path,
@@ -663,6 +799,9 @@ std::unique_ptr<Engine> Engine::Open(const std::filesystem::path& path,
         return nullptr;
     };
     if (options.shard_count == 0) return fail(Status::Error("shard_count must be positive"));
+    if (options.cpu_budget == 0 || options.cpu_budget > 4) {
+        return fail(Status::Error("cpu_budget must be between 1 and 4"));
+    }
     std::error_code ec;
     std::filesystem::create_directories(path / "sst", ec);
     std::filesystem::create_directories(path / "tmp", ec);
@@ -683,6 +822,7 @@ std::unique_ptr<Engine> Engine::Open(const std::filesystem::path& path,
     impl->manifest_path = path / "MANIFEST";
     impl->shards.resize(options.shard_count);
     for (auto& shard : impl->shards) shard = std::make_shared<ShardData>();
+    impl->covered_commit_versions.assign(options.shard_count, 0);
     auto load_status = impl->LoadManifest();
     if (!load_status.ok) return fail(load_status);
     load_status = impl->ReplayWal();
@@ -707,6 +847,23 @@ Status Engine::WriteBatch(const std::vector<DataPoint>& points,
     if (impl_->closed || impl_->closing) return Status::Error("engine is closed");
     if (impl_->write_queue.size() >= impl_->options.max_pending_batches) {
         return Status::Error("write queue pressure");
+    }
+    const size_t batch_bytes =
+        points.size() * (sizeof(DataPoint) + sizeof(CommitVersion));
+    for (const auto& point : points) {
+        const uint64_t projected =
+            impl_->hot_series_points[point.series_id] + 1;
+        if (projected > impl_->options.hot_series_point_limit) {
+            impl_->flush_requested = true;
+            impl_->flush_cv.notify_one();
+            return Status::Error("hot series pressure");
+        }
+    }
+    if (impl_->memtable_bytes + batch_bytes >
+        impl_->options.max_memtable_bytes) {
+        impl_->flush_requested = true;
+        impl_->flush_cv.notify_one();
+        return Status::Error("memtable pressure");
     }
     auto status = impl_->ValidateBatch(points);
     if (!status.ok) return status;
@@ -930,6 +1087,23 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
         return Status::Error("WAL sync failed");
     }
     impl_->cutoff = cutoff;
+    std::vector<std::shared_ptr<SstableMetadata>> retained_sstables;
+    for (const auto& sstable : impl_->sstable_metadata) {
+        if (sstable->max_timestamp < cutoff) {
+            impl_->obsolete_sstables.push_back(sstable->path);
+            for (auto it = impl_->current_files.begin();
+                 it != impl_->current_files.end();) {
+                if (*it == sstable->path) {
+                    it = impl_->current_files.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        } else {
+            retained_sstables.push_back(sstable);
+        }
+    }
+    impl_->sstable_metadata = std::move(retained_sstables);
     for (size_t shard_id = 0; shard_id < impl_->shards.size(); ++shard_id) {
         impl_->shards[shard_id] =
             std::make_shared<ShardData>(*impl_->shards[shard_id]);
@@ -958,6 +1132,7 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
 Status Engine::FlushLocked(bool incremental) {
     if (impl_->closed) return Status::Error("engine is closed");
     std::vector<std::filesystem::path> new_files;
+    std::vector<std::shared_ptr<SstableMetadata>> published_metadata;
     std::vector<std::filesystem::path> manifest_files =
         incremental ? impl_->current_files : std::vector<std::filesystem::path>{};
     for (size_t shard_id = 0; shard_id < impl_->shards.size(); ++shard_id) {
@@ -1002,10 +1177,19 @@ Status Engine::FlushLocked(bool incremental) {
         if (!SyncDirectory(file.parent_path())) {
             return Status::Error("SSTable directory sync failed");
         }
+        std::shared_ptr<SstableMetadata> metadata;
+        auto metadata_status =
+            impl_->ReadSstableMetadata(file, shard_id, &metadata);
+        if (!metadata_status.ok) return metadata_status;
+        published_metadata.push_back(metadata);
         new_files.push_back(file);
         manifest_files.push_back(file);
         ++impl_->next_file_number;
     }
+    for (auto& covered : impl_->covered_commit_versions) {
+        covered = impl_->next_version - 1;
+    }
+    impl_->metadata_covered_commit_version = impl_->next_version - 1;
     const auto manifest_tmp = impl_->manifest_path.string() + ".tmp";
     {
         std::ofstream manifest(manifest_tmp, std::ios::trunc);
@@ -1014,6 +1198,13 @@ Status Engine::FlushLocked(bool incremental) {
         manifest_text += std::to_string(impl_->cutoff) + " " +
                          std::to_string(impl_->next_version) + " " +
                          std::to_string(impl_->next_file_number) + "\n";
+        for (size_t shard_id = 0;
+             shard_id < impl_->covered_commit_versions.size(); ++shard_id) {
+            manifest_text += "COVERED " + std::to_string(shard_id) + " " +
+                             std::to_string(
+                                 impl_->covered_commit_versions[shard_id]) +
+                             "\n";
+        }
         for (size_t i = 0; i < manifest_files.size(); ++i) {
             manifest_text += std::to_string(i) + " " +
                              std::filesystem::relative(manifest_files[i], impl_->root).string() +
@@ -1054,6 +1245,14 @@ Status Engine::FlushLocked(bool incremental) {
     }
     impl_->current_files =
         incremental ? std::move(manifest_files) : std::move(new_files);
+    if (incremental) {
+        impl_->sstable_metadata.insert(
+            impl_->sstable_metadata.end(),
+            published_metadata.begin(),
+            published_metadata.end());
+    } else {
+        impl_->sstable_metadata = std::move(published_metadata);
+    }
     impl_->last_flushed_version = impl_->next_version - 1;
     impl_->points_since_flush = 0;
     ++impl_->flush_count;
@@ -1069,9 +1268,10 @@ Status Engine::Compact() {
     std::lock_guard lock(impl_->mutex);
     if (impl_->closed) return Status::Error("engine is closed");
     for (size_t shard_id = 0; shard_id < impl_->shards.size(); ++shard_id) {
-        impl_->shards[shard_id] =
-            std::make_shared<ShardData>(*impl_->shards[shard_id]);
+        auto compacted_shard = std::make_shared<ShardData>();
         auto& data = impl_->shards[shard_id]->series;
+        std::vector<VersionedPoint> compacted_batch;
+        compacted_batch.reserve(kDiskPageRecords);
         for (auto series_it = data.begin(); series_it != data.end();) {
             for (auto point_it = series_it->second.begin();
                  point_it != series_it->second.end();) {
@@ -1079,6 +1279,12 @@ Status Engine::Compact() {
                     point_it->second.version > impl_->next_version - 1) {
                     point_it = series_it->second.erase(point_it);
                 } else {
+                    compacted_batch.push_back(point_it->second);
+                    compacted_shard->series[series_it->first]
+                        [point_it->first] = point_it->second;
+                    if (compacted_batch.size() == kDiskPageRecords) {
+                        compacted_batch.clear();
+                    }
                     ++point_it;
                 }
             }
@@ -1178,6 +1384,19 @@ Status Engine::GetStats(EngineStats* stats) const {
             }
         }
     }
+    struct rusage usage {};
+    if (::getrusage(RUSAGE_SELF, &usage) == 0) {
+#if defined(__APPLE__)
+        stats->peak_rss_bytes =
+            static_cast<uint64_t>(usage.ru_maxrss);
+#else
+        stats->peak_rss_bytes =
+            static_cast<uint64_t>(usage.ru_maxrss) * 1024ULL;
+#endif
+    }
+    stats->rss_bytes = stats->peak_rss_bytes;
+    stats->engine_threads = 3;
+    stats->memtable_bytes = impl_->memtable_bytes;
     return Status::Ok();
 }
 

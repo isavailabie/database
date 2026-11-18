@@ -143,6 +143,25 @@ void TestQueueBackpressure(const std::filesystem::path& path) {
     AssertOk(engine->Close());
 }
 
+void TestPhysicalExpirationAndGC(const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(path, Options{4, 100000}, &status);
+    AssertOk(status);
+    AssertOk(engine->WriteBatch({{600, 100, 1.0}, {600, 200, 2.0}}));
+    AssertOk(engine->Flush());
+    std::unique_ptr<Cursor> old_view;
+    AssertOk(engine->Scan({600}, 0, 300, &old_view));
+    AssertOk(engine->ExpireBefore(300));
+    AssertOk(engine->GarbageCollect());
+    assert(old_view->NextPoint().has_value());
+    old_view->Close();
+    AssertOk(engine->GarbageCollect());
+    std::unique_ptr<Cursor> new_view;
+    AssertOk(engine->Scan({600}, 0, 300, &new_view));
+    assert(Read(new_view.get()).empty());
+    AssertOk(engine->Close());
+}
+
 void TestMultipleIncrementalFlushes(const std::filesystem::path& path) {
     {
         Status status;
@@ -243,6 +262,7 @@ int main() {
     TestQueueBackpressure(root / "queue");
     TestNegativeWindowsAndDuplicateSeries(root / "negative");
     TestMultipleIncrementalFlushes(root / "incremental");
+    TestPhysicalExpirationAndGC(root / "physical_expiration");
     TestSstableChecksum(root / "checksum");
     std::cout << "all tests passed\n";
 }
