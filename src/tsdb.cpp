@@ -45,6 +45,7 @@ constexpr uint32_t kWalMagic = 0x54534442;
 constexpr uint8_t kTxnRecord = 1;
 constexpr uint8_t kExpireRecord = 2;
 constexpr uint64_t kDiskPageRecords = 128;
+constexpr uint32_t kEncodedWalPayloadMagic = 0x57564c45;
 
 uint64_t Checksum(const std::string& payload) {
     uint64_t hash = 1469598103934665603ULL;
@@ -86,6 +87,39 @@ bool Read(const std::string& data, size_t& offset, T* value) {
     return true;
 }
 
+void AppendUvarint(std::string& output, uint64_t value) {
+    while (value >= 0x80) {
+        output.push_back(static_cast<char>((value & 0x7f) | 0x80));
+        value >>= 7;
+    }
+    output.push_back(static_cast<char>(value));
+}
+
+bool ReadUvarint(const std::string& input, size_t& offset, uint64_t* value) {
+    uint64_t result = 0;
+    unsigned shift = 0;
+    while (offset < input.size() && shift < 64) {
+        const uint8_t byte =
+            static_cast<uint8_t>(static_cast<unsigned char>(input[offset++]));
+        result |= static_cast<uint64_t>(byte & 0x7f) << shift;
+        if ((byte & 0x80) == 0) {
+            *value = result;
+            return true;
+        }
+        shift += 7;
+    }
+    return false;
+}
+
+uint64_t ZigzagEncode(int64_t value) {
+    return static_cast<uint64_t>((value << 1) ^ (value >> 63));
+}
+
+int64_t ZigzagDecode(uint64_t value) {
+    return static_cast<int64_t>((value >> 1) ^
+                                -static_cast<int64_t>(value & 1));
+}
+
 
 bool SyncFile(const std::filesystem::path& path) {
     const int fd = ::open(path.c_str(), O_RDONLY);
@@ -122,12 +156,13 @@ struct ReadView {
 std::string WalPayloadTxn(CommitVersion version,
                           const std::vector<DataPoint>& points) {
     std::string payload;
+    Append(payload, kEncodedWalPayloadMagic);
     Append(payload, version);
     const uint32_t count = static_cast<uint32_t>(points.size());
     Append(payload, count);
     for (const auto& point : points) {
-        Append(payload, point.series_id);
-        Append(payload, point.timestamp_ms);
+        AppendUvarint(payload, point.series_id);
+        AppendUvarint(payload, ZigzagEncode(point.timestamp_ms));
         Append(payload, point.value);
     }
     return payload;
@@ -680,19 +715,47 @@ struct Engine::Impl {
             wal_bytes_replayed += offset - record_start;
             size_t payload_offset = 0;
             CommitVersion version = 0;
-            if (!Read(payload, payload_offset, &version)) return Status::Error("invalid WAL");
             if (type == kTxnRecord) {
-                uint32_t count = 0;
-                if (!Read(payload, payload_offset, &count)) return Status::Error("invalid WAL");
-                std::vector<DataPoint> points(count);
-                for (auto& point : points) {
-                    if (!Read(payload, payload_offset, &point.series_id) ||
-                        !Read(payload, payload_offset, &point.timestamp_ms) ||
-                        !Read(payload, payload_offset, &point.value)) {
-                        return Status::Error("invalid WAL");
+                uint32_t encoded_magic = 0;
+                if (payload.size() >= sizeof(uint32_t) &&
+                    Read(payload, payload_offset, &encoded_magic) &&
+                    encoded_magic == kEncodedWalPayloadMagic) {
+                    if (!Read(payload, payload_offset, &version)) {
+                        return Status::Error("invalid encoded WAL");
                     }
+                    uint32_t count = 0;
+                    if (!Read(payload, payload_offset, &count)) {
+                        return Status::Error("invalid encoded WAL");
+                    }
+                    std::vector<DataPoint> points(count);
+                    for (auto& point : points) {
+                        uint64_t series_id = 0;
+                        uint64_t zigzag_timestamp = 0;
+                        if (!ReadUvarint(payload, payload_offset, &series_id) ||
+                            !ReadUvarint(payload, payload_offset,
+                                         &zigzag_timestamp) ||
+                            !Read(payload, payload_offset, &point.value)) {
+                            return Status::Error("invalid encoded WAL");
+                        }
+                        point.series_id = series_id;
+                        point.timestamp_ms = ZigzagDecode(zigzag_timestamp);
+                    }
+                    ApplyPoints(points, version);
+                } else {
+                    payload_offset = 0;
+                    if (!Read(payload, payload_offset, &version)) return Status::Error("invalid WAL");
+                    uint32_t count = 0;
+                    if (!Read(payload, payload_offset, &count)) return Status::Error("invalid WAL");
+                    std::vector<DataPoint> points(count);
+                    for (auto& point : points) {
+                        if (!Read(payload, payload_offset, &point.series_id) ||
+                            !Read(payload, payload_offset, &point.timestamp_ms) ||
+                            !Read(payload, payload_offset, &point.value)) {
+                            return Status::Error("invalid WAL");
+                        }
+                    }
+                    ApplyPoints(points, version);
                 }
-                ApplyPoints(points, version);
             } else if (type == kExpireRecord) {
                 if (!Read(payload, payload_offset, &cutoff)) return Status::Error("invalid WAL");
             } else {
