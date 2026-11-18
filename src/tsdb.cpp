@@ -404,6 +404,45 @@ bool ReadSeriesPoints(const SstableMetadata& sstable, uint64_t series_id,
     return ok;
 }
 
+struct StreamingReader {
+    std::ifstream in;
+    uint64_t hash{1469598103934665603ULL};
+    uint64_t bytes{0};
+
+    explicit StreamingReader(const std::filesystem::path& path)
+        : in(path, std::ios::binary) {}
+
+    bool ReadUvarint(uint64_t* value) {
+        uint64_t result = 0;
+        unsigned shift = 0;
+        while (shift < 64) {
+            char raw = 0;
+            in.get(raw);
+            if (!in) return false;
+            hash = HashRecord(hash, &raw, 1);
+            ++bytes;
+            const uint8_t byte = static_cast<uint8_t>(raw);
+            result |= static_cast<uint64_t>(byte & 0x7f) << shift;
+            if ((byte & 0x80) == 0) {
+                *value = result;
+                return true;
+            }
+            shift += 7;
+        }
+        return false;
+    }
+
+    bool ReadDouble(double* value) {
+        char raw[sizeof(double)];
+        in.read(raw, sizeof(raw));
+        if (!in) return false;
+        std::memcpy(value, raw, sizeof(raw));
+        hash = HashRecord(hash, raw, sizeof(raw));
+        bytes += sizeof(raw);
+        return true;
+    }
+};
+
 }  // namespace
 
 Cursor::Cursor(std::vector<DataPoint> points) : points_(std::move(points)) {}
@@ -703,33 +742,21 @@ struct Engine::Impl {
         result->point_count = count;
         result->encoding = magic;
         if (magic == kEncodedSstableMagic) {
-            std::string data;
-            if (!ReadFile(path, &data)) return Status::Error("cannot read SSTable");
-            if (data.size() < sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint64_t)) {
-                return Status::Error("truncated encoded SSTable");
-            }
-            const uint64_t checksum_offset = data.size() - sizeof(uint64_t);
-            uint64_t recorded_checksum = 0;
-            std::memcpy(&recorded_checksum, data.data() + checksum_offset,
-                        sizeof(uint64_t));
-            const size_t payload_offset =
-                sizeof(uint32_t) + sizeof(uint64_t);
-            const std::string payload =
-                data.substr(payload_offset, checksum_offset - payload_offset);
-            if (Checksum(payload) != recorded_checksum) {
-                return Status::Error("SSTable checksum mismatch");
-            }
-            size_t encoded_offset = 0;
+            StreamingReader reader(path);
+            reader.in.seekg(sizeof(uint32_t) + sizeof(uint64_t),
+                            std::ios::beg);
+            if (!reader.in) return Status::Error("cannot read SSTable");
             for (uint64_t i = 0; i < count; ++i) {
-                const size_t record_offset = payload_offset + encoded_offset;
+                const uint64_t record_offset =
+                    sizeof(uint32_t) + sizeof(uint64_t) + reader.bytes;
                 uint64_t series_id = 0;
                 uint64_t zigzag_timestamp = 0;
                 double value = 0.0;
                 uint64_t version = 0;
-                if (!ReadUvarint(payload, encoded_offset, &series_id) ||
-                    !ReadUvarint(payload, encoded_offset, &zigzag_timestamp) ||
-                    !Read(payload, encoded_offset, &value) ||
-                    !ReadUvarint(payload, encoded_offset, &version)) {
+                if (!reader.ReadUvarint(&series_id) ||
+                    !reader.ReadUvarint(&zigzag_timestamp) ||
+                    !reader.ReadDouble(&value) ||
+                    !reader.ReadUvarint(&version)) {
                     return Status::Error("truncated encoded SSTable");
                 }
                 const int64_t timestamp = ZigzagDecode(zigzag_timestamp);
@@ -737,14 +764,20 @@ struct Engine::Impl {
                 entry.series_id = series_id;
                 if (entry.point_count == 0) entry.offset = record_offset;
                 ++entry.point_count;
-                entry.byte_length = payload_offset + encoded_offset -
-                                    entry.offset;
+                entry.byte_length = sizeof(uint32_t) + sizeof(uint64_t) +
+                                    reader.bytes - entry.offset;
                 entry.min_timestamp = std::min(entry.min_timestamp, timestamp);
                 entry.max_timestamp = std::max(entry.max_timestamp, timestamp);
                 result->min_timestamp =
                     std::min(result->min_timestamp, timestamp);
                 result->max_timestamp =
                     std::max(result->max_timestamp, timestamp);
+            }
+            uint64_t recorded_checksum = 0;
+            reader.in.read(reinterpret_cast<char*>(&recorded_checksum),
+                           sizeof(recorded_checksum));
+            if (!reader.in || reader.hash != recorded_checksum) {
+                return Status::Error("SSTable checksum mismatch");
             }
             *metadata = std::move(result);
             return Status::Ok();
