@@ -21,6 +21,11 @@
 #include <deque>
 #include <unordered_map>
 
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
+
 namespace tsdb {
 namespace {
 
@@ -130,6 +135,18 @@ bool SyncFile(const std::filesystem::path& path) {
     const bool ok = ::fsync(fd) == 0;
     ::close(fd);
     return ok;
+}
+
+void PinCurrentThread(size_t cpu_budget, size_t index) {
+    (void)cpu_budget;
+    (void)index;
+#if defined(__linux__)
+    if (cpu_budget == 0) return;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(index % cpu_budget, &set);
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#endif
 }
 
 struct VersionedPoint {
@@ -947,6 +964,7 @@ struct Engine::Impl {
 Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
     impl_->owner = this;
     impl_->write_worker = std::thread([this] {
+        PinCurrentThread(impl_->options.cpu_budget, 0);
         while (true) {
             std::unique_lock lock(impl_->mutex);
             impl_->write_cv.wait_for(lock, std::chrono::microseconds(200), [&] {
@@ -1002,6 +1020,7 @@ Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
         }
     });
     impl_->flush_worker = std::thread([this] {
+        PinCurrentThread(impl_->options.cpu_budget, 1);
         while (true) {
             std::unique_lock lock(impl_->mutex);
             impl_->flush_cv.wait(lock, [&] {
@@ -1020,6 +1039,7 @@ Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
     });
     if (impl_->options.enable_background_compaction) {
         impl_->compaction_worker = std::thread([this] {
+            PinCurrentThread(impl_->options.cpu_budget, 2);
             while (true) {
                 std::unique_lock lock(impl_->mutex);
                 impl_->compaction_cv.wait(lock, [&] {
