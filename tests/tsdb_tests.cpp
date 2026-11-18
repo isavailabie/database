@@ -324,6 +324,27 @@ void TestNegativeTimestampRecovery(const std::filesystem::path& path) {
     AssertOk(engine->Close());
 }
 
+void TestGcReclaimsWhileViewActive(const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(path, Options{4, 100000}, &status);
+    AssertOk(status);
+    AssertOk(engine->WriteBatch({{960, 100, 1.0}}));
+    AssertOk(engine->Flush());
+    std::unique_ptr<Cursor> held;
+    AssertOk(engine->Scan({960}, 0, 200, &held));
+    AssertOk(engine->WriteBatch({{960, 200, 2.0}}));
+    AssertOk(engine->Flush());
+    AssertOk(engine->Compact());
+    AssertOk(engine->GarbageCollect());
+    assert(held->NextPoint().has_value());
+    held->Close();
+    AssertOk(engine->GarbageCollect());
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({960}, 0, 300, &cursor));
+    assert(Read(cursor.get()).size() == 2);
+    AssertOk(engine->Close());
+}
+
 void TestSstableChecksum(const std::filesystem::path& path) {
     {
         Status status;
@@ -369,6 +390,7 @@ int main() {
     TestCompactionMergesSstables(root / "compaction_merges");
     TestCompactionDropsExpired(root / "compaction_drops_expired");
     TestNegativeTimestampRecovery(root / "negative_ts_recovery");
+    TestGcReclaimsWhileViewActive(root / "gc_refcount");
     TestSstableChecksum(root / "checksum");
     std::cout << "all tests passed\n";
 }

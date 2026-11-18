@@ -46,6 +46,7 @@ struct SstableMetadata {
     int64_t min_timestamp{std::numeric_limits<int64_t>::max()};
     int64_t max_timestamp{std::numeric_limits<int64_t>::min()};
     std::map<uint64_t, SstableIndexEntry> series;
+    mutable size_t refs{0};
 };
 
 constexpr uint32_t kWalMagic = 0x54534442;
@@ -501,7 +502,7 @@ struct Engine::Impl {
     std::vector<CommitVersion> covered_commit_versions;
     CommitVersion metadata_covered_commit_version{0};
     size_t active_read_views{0};
-    std::vector<std::filesystem::path> obsolete_sstables;
+    std::vector<std::shared_ptr<SstableMetadata>> obsolete_sstables;
     CommitVersion last_flushed_version{0};
     std::unordered_map<uint64_t, int64_t> last_timestamps;
 
@@ -521,7 +522,10 @@ struct Engine::Impl {
         view.cutoff = cutoff;
         view.shards.reserve(shards.size());
         for (const auto& shard : shards) view.shards.push_back(shard);
-        for (const auto& sstable : sstable_metadata) view.sstables.push_back(sstable);
+        for (const auto& sstable : sstable_metadata) {
+            view.sstables.push_back(sstable);
+            ++sstable->refs;
+        }
         return view;
     }
 
@@ -641,12 +645,17 @@ struct Engine::Impl {
     }
 
     Status GarbageCollectLocked() {
-        if (active_read_views != 0) return Status::Ok();
+        std::vector<std::shared_ptr<SstableMetadata>> retained;
+        retained.reserve(obsolete_sstables.size());
         for (const auto& obsolete : obsolete_sstables) {
-            std::error_code ec;
-            std::filesystem::remove(obsolete, ec);
+            if (obsolete->refs == 0) {
+                std::error_code ec;
+                std::filesystem::remove(obsolete->path, ec);
+            } else {
+                retained.push_back(obsolete);
+            }
         }
-        obsolete_sstables.clear();
+        obsolete_sstables = std::move(retained);
         if (!SyncDirectory(root / "sst")) {
             return Status::Error("GC directory sync failed");
         }
@@ -1305,9 +1314,12 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
             advance(item.source);
             return item.point;
         },
-        [this] {
+        [this, state] {
             std::lock_guard lock(impl_->mutex);
             if (impl_->active_read_views > 0) --impl_->active_read_views;
+            for (const auto& sstable : state->view.sstables) {
+                if (sstable->refs > 0) --sstable->refs;
+            }
         });
     return Status::Ok();
 }
@@ -1381,7 +1393,7 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
     std::vector<std::shared_ptr<SstableMetadata>> retained_sstables;
     for (const auto& sstable : impl_->sstable_metadata) {
         if (sstable->max_timestamp < cutoff) {
-            impl_->obsolete_sstables.push_back(sstable->path);
+            impl_->obsolete_sstables.push_back(sstable);
             for (auto it = impl_->current_files.begin();
                  it != impl_->current_files.end();) {
                 if (*it == sstable->path) {
@@ -1536,7 +1548,7 @@ Status Engine::FlushLocked(bool incremental) {
         if (!SyncDirectory(impl_->root)) return Status::Error("CURRENT directory sync failed");
     }
     if (!incremental) {
-        for (const auto& obsolete : impl_->current_files) {
+        for (const auto& obsolete : impl_->sstable_metadata) {
             impl_->obsolete_sstables.push_back(obsolete);
         }
     }
