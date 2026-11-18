@@ -46,7 +46,9 @@ ctest --test-dir build --output-on-failure
 - 无损 timestamp/value 编码（zigzag varint + 原始 float64 位）
 - SSTable SeriesIndex（含字节长度）和按需磁盘分页读取
 - 有界流式 Compaction：磁盘多 SSTable 归并 + 过期过滤
+- Size-tiered Compaction：按层级归并，避免 O(N²) 写放大
 - 后台 Flush、阈值触发 Compaction 和后台 GC
+- 引用计数 GC：读取并发下也能回收过期 SSTable 文件
 - ReadView、过期视图和物理过期清理
 - 热点 Series 每 Flush 窗口限流
 - 工作线程绑定到 `cpu_budget` CPU 配额
@@ -56,11 +58,12 @@ ctest --test-dir build --output-on-failure
 
 验证结果：
 
-- 1000 万点导入 smoke：约 44.7k 点/秒，峰值 RSS 约 178 MiB，
-  恢复约 4.5 秒，WAL 重放 0 字节。
+- 1000 万点导入 smoke：约 109k 点/秒，峰值 RSS 约 32 MiB，
+  恢复约 1.9 秒。
+- 1 亿点完整导入：约 103.6k 点/秒（16.1 分钟），峰值 RSS 约 42 MiB，
+  恢复约 19.9 秒，WAL 重放 0 字节。
 
 尚未完成课程满负载验收：
 
-- 完整的 1 亿点、60 分钟读写和 60 秒恢复基准
-- 512 MiB RSS 在 1 亿点满负载下的最终确认
+- 1 亿点数据上的 60 分钟混合读写测试（持续并发 + 后台维护）
 
