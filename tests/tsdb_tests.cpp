@@ -185,10 +185,11 @@ void TestMultipleIncrementalFlushes(const std::filesystem::path& path) {
 }
 
 void TestTimestampEncodingRoundTrip() {
+    const auto path =
+        std::filesystem::temp_directory_path() / "tsdb-encoding-test";
+    std::filesystem::remove_all(path);
     Status status;
-    auto engine = Engine::Open(
-        std::filesystem::temp_directory_path() / "tsdb-encoding-test",
-        Options{4, 100000}, &status);
+    auto engine = Engine::Open(path, Options{4, 100000}, &status);
     AssertOk(status);
     AssertOk(engine->WriteBatch({
         {700, -1600, 1.0},

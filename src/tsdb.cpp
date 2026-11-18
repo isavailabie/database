@@ -1340,19 +1340,33 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
         }
     }
     impl_->sstable_metadata = std::move(retained_sstables);
+    if (impl_->options.enable_background_compaction) {
+        impl_->compaction_requested = true;
+        impl_->compaction_cv.notify_one();
+    }
+    constexpr size_t kRecordBytes = sizeof(DataPoint) + sizeof(CommitVersion);
     for (size_t shard_id = 0; shard_id < impl_->shards.size(); ++shard_id) {
         impl_->shards[shard_id] =
             std::make_shared<ShardData>(*impl_->shards[shard_id]);
         auto& points_by_series = impl_->shards[shard_id]->series;
+        auto& blocks_by_series = impl_->shards[shard_id]->blocks;
         for (auto series_it = points_by_series.begin();
              series_it != points_by_series.end();) {
+            size_t removed = 0;
             for (auto point_it = series_it->second.begin();
                  point_it != series_it->second.end();) {
                 if (point_it->first < cutoff) {
                     point_it = series_it->second.erase(point_it);
+                    ++removed;
                 } else {
                     ++point_it;
                 }
+            }
+            if (removed > 0) {
+                impl_->memtable_bytes -= removed * kRecordBytes;
+                blocks_by_series.erase(series_it->first);
+                impl_->shards[shard_id]->block_bytes.erase(series_it->first);
+                impl_->shards[shard_id]->block_count.erase(series_it->first);
             }
             if (series_it->second.empty()) {
                 series_it = points_by_series.erase(series_it);
@@ -1490,6 +1504,7 @@ Status Engine::FlushLocked(bool incremental) {
     }
     impl_->last_flushed_version = impl_->next_version - 1;
     impl_->points_since_flush = 0;
+    impl_->hot_series_points.clear();
     ++impl_->flush_count;
     return Status::Ok();
 }
