@@ -39,23 +39,28 @@ ctest --test-dir build --output-on-failure
 
 已实现：
 
-- `Put`、`WriteBatch`
-- Series 分片和 Shard MemTable
+- `Put`、`WriteBatch`、`Scan`、窗口 `Aggregate`、`ExpireBefore`
+- Series 分片和 Shard MemTable（有界内存，Flush 后清空）
 - WAL 校验、持久 fd 和小批量 Group Commit
 - 增量 Flush、SSTable、Manifest 和尾部 WAL 重放
-- SSTable SeriesIndex 和按需磁盘分页读取
-- 流式 `Scan`
-- 窗口聚合
-- ReadView 和过期视图
-- 后台 Flush、基础 Compaction 和安全 GC
+- 无损 timestamp/value 编码（zigzag varint + 原始 float64 位）
+- SSTable SeriesIndex（含字节长度）和按需磁盘分页读取
+- 有界流式 Compaction：磁盘多 SSTable 归并 + 过期过滤
+- 后台 Flush、阈值触发 Compaction 和后台 GC
+- ReadView、过期视图和物理过期清理
+- 热点 Series 每 Flush 窗口限流
+- 工作线程绑定到 `cpu_budget` CPU 配额
+- Covered Commit Version 写入 Manifest
 - 50 次文件级故障注入
-- 完全过期 SSTable 会移出新视图并等待 GC
-- 导入和混合基准会报告峰值 RSS
+- 导入和混合基准会报告吞吐、峰值 RSS、恢复耗时
+
+验证结果：
+
+- 1000 万点导入 smoke：约 44.7k 点/秒，峰值 RSS 约 178 MiB，
+  恢复约 4.5 秒，WAL 重放 0 字节。
 
 尚未完成课程满负载验收：
 
-- timestamp/value 压缩编码
-- 完整多 SSTable merge Compaction
-- 物理过期 SSTable/Page 清理
-- 512 MiB RSS 和 4 CPU 配额验证
-- 完整的 1 亿点、60 分钟读写和恢复基准
+- 完整的 1 亿点、60 分钟读写和 60 秒恢复基准
+- 512 MiB RSS 在 1 亿点满负载下的最终确认
+

@@ -1659,7 +1659,8 @@ Status Engine::GetStats(EngineStats* stats) const {
 #endif
     }
     stats->rss_bytes = stats->peak_rss_bytes;
-    stats->engine_threads = 3;
+    stats->engine_threads =
+        2 + (impl_->options.enable_background_compaction ? 1 : 0);
     stats->memtable_bytes = impl_->memtable_bytes;
     return Status::Ok();
 }
