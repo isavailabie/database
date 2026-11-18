@@ -123,25 +123,6 @@ int64_t ZigzagDecode(uint64_t value) {
                                 -static_cast<int64_t>(value & 1));
 }
 
-bool ReadUvarintStream(std::istream& input, uint64_t* value) {
-    uint64_t result = 0;
-    unsigned shift = 0;
-    while (shift < 64) {
-        char raw = 0;
-        input.get(raw);
-        if (!input) return false;
-        const uint8_t byte =
-            static_cast<uint8_t>(static_cast<unsigned char>(raw));
-        result |= static_cast<uint64_t>(byte & 0x7f) << shift;
-        if ((byte & 0x80) == 0) {
-            *value = result;
-            return true;
-        }
-        shift += 7;
-    }
-    return false;
-}
-
 
 bool SyncFile(const std::filesystem::path& path) {
     const int fd = ::open(path.c_str(), O_RDONLY);
@@ -263,6 +244,150 @@ bool ReadFile(const std::filesystem::path& path, std::string* data) {
     return true;
 }
 
+struct SstableWriter {
+    std::ofstream out;
+    uint64_t hash{1469598103934665603ULL};
+    uint64_t count{0};
+    uint64_t payload_bytes{0};
+    SstableMetadata metadata;
+    uint32_t magic{kEncodedSstableMagic};
+
+    bool Open(const std::filesystem::path& temp) {
+        out.open(temp, std::ios::binary | std::ios::trunc);
+        if (!out) return false;
+        out.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+        const uint64_t zero = 0;
+        out.write(reinterpret_cast<const char*>(&zero), sizeof(zero));
+        return true;
+    }
+
+    void Append(uint64_t series_id, int64_t timestamp, double value,
+                CommitVersion version) {
+        auto& entry = metadata.series[series_id];
+        entry.series_id = series_id;
+        if (entry.point_count == 0) {
+            entry.offset = sizeof(uint32_t) + sizeof(uint64_t) + payload_bytes;
+        }
+        char buf[10];
+        size_t n = 0;
+        uint64_t v = series_id;
+        while (v >= 0x80) {
+            buf[n++] = static_cast<char>((v & 0x7f) | 0x80);
+            v >>= 7;
+        }
+        buf[n++] = static_cast<char>(v);
+        WriteAndHash(buf, n);
+        v = ZigzagEncode(timestamp);
+        n = 0;
+        while (v >= 0x80) {
+            buf[n++] = static_cast<char>((v & 0x7f) | 0x80);
+            v >>= 7;
+        }
+        buf[n++] = static_cast<char>(v);
+        WriteAndHash(buf, n);
+        WriteAndHash(reinterpret_cast<const char*>(&value), sizeof(value));
+        v = version;
+        n = 0;
+        while (v >= 0x80) {
+            buf[n++] = static_cast<char>((v & 0x7f) | 0x80);
+            v >>= 7;
+        }
+        buf[n++] = static_cast<char>(v);
+        WriteAndHash(buf, n);
+        ++entry.point_count;
+        entry.byte_length = sizeof(uint32_t) + sizeof(uint64_t) + payload_bytes -
+                            entry.offset;
+        entry.min_timestamp = std::min(entry.min_timestamp, timestamp);
+        entry.max_timestamp = std::max(entry.max_timestamp, timestamp);
+        metadata.min_timestamp = std::min(metadata.min_timestamp, timestamp);
+        metadata.max_timestamp = std::max(metadata.max_timestamp, timestamp);
+        ++count;
+    }
+
+    void WriteAndHash(const char* bytes, size_t length) {
+        out.write(bytes, static_cast<std::streamsize>(length));
+        hash = HashRecord(hash, bytes, length);
+        payload_bytes += length;
+    }
+
+    bool Finish() {
+        out.write(reinterpret_cast<const char*>(&hash), sizeof(hash));
+        out.flush();
+        out.seekp(sizeof(uint32_t), std::ios::beg);
+        out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        out.flush();
+        out.close();
+        metadata.point_count = count;
+        metadata.encoding = magic;
+        return !out.fail();
+    }
+
+    void Discard() {
+        out.close();
+    }
+};
+
+bool ReadSeriesPoints(const SstableMetadata& sstable, uint64_t series_id,
+                      std::vector<VersionedPoint>* out) {
+    const auto it = sstable.series.find(series_id);
+    if (it == sstable.series.end()) return true;
+    const auto& entry = it->second;
+    const int fd = ::open(sstable.path.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    bool ok = true;
+    if (sstable.encoding == kEncodedSstableMagic) {
+        std::vector<char> buffer(entry.byte_length);
+        const ssize_t bytes =
+            ::pread(fd, buffer.data(), buffer.size(), entry.offset);
+        if (bytes > 0) {
+            std::string payload(buffer.data(), static_cast<size_t>(bytes));
+            size_t offset = 0;
+            for (uint64_t i = 0; i < entry.point_count; ++i) {
+                uint64_t sid = 0;
+                uint64_t zigzag_timestamp = 0;
+                double value = 0.0;
+                uint64_t version = 0;
+                if (!ReadUvarint(payload, offset, &sid) ||
+                    !ReadUvarint(payload, offset, &zigzag_timestamp) ||
+                    !Read(payload, offset, &value) ||
+                    !ReadUvarint(payload, offset, &version)) {
+                    ok = false;
+                    break;
+                }
+                out->push_back({{sid, ZigzagDecode(zigzag_timestamp), value},
+                                static_cast<CommitVersion>(version)});
+            }
+        }
+    } else {
+        const size_t record_size = sizeof(uint64_t) + sizeof(int64_t) +
+                                   sizeof(double) + sizeof(CommitVersion);
+        std::vector<char> buffer(entry.point_count * record_size);
+        const ssize_t bytes =
+            ::pread(fd, buffer.data(), buffer.size(), entry.offset);
+        const size_t complete = static_cast<size_t>(bytes) / record_size;
+        for (size_t j = 0; j < complete; ++j) {
+            const char* record = buffer.data() + j * record_size;
+            uint64_t sid = 0;
+            int64_t timestamp = 0;
+            double value = 0.0;
+            CommitVersion version = 0;
+            std::memcpy(&sid, record, sizeof(uint64_t));
+            std::memcpy(&timestamp, record + sizeof(uint64_t), sizeof(int64_t));
+            std::memcpy(&value,
+                        record + sizeof(uint64_t) + sizeof(int64_t),
+                        sizeof(double));
+            std::memcpy(&version,
+                        record + sizeof(uint64_t) + sizeof(int64_t) +
+                            sizeof(double),
+                        sizeof(CommitVersion));
+            out->push_back({{sid, timestamp, value}, version});
+        }
+        ok = complete == entry.point_count;
+    }
+    ::close(fd);
+    return ok;
+}
+
 }  // namespace
 
 Cursor::Cursor(std::vector<DataPoint> points) : points_(std::move(points)) {}
@@ -364,6 +489,7 @@ struct Engine::Impl {
     size_t active_read_views{0};
     std::vector<std::filesystem::path> obsolete_sstables;
     CommitVersion last_flushed_version{0};
+    std::unordered_map<uint64_t, int64_t> last_timestamps;
 
     size_t ShardFor(uint64_t series_id) const {
         uint64_t value = series_id;
@@ -409,12 +535,10 @@ struct Engine::Impl {
                 }
                 it->second = point.timestamp_ms;
             }
-            const auto& series = shards[ShardFor(point.series_id)]->series;
-            const auto series_it = series.find(point.series_id);
-            if (series_it != series.end() && !series_it->second.empty()) {
-                if (point.timestamp_ms <= series_it->second.rbegin()->first) {
-                    return Status::Error("timestamp is not greater than last committed timestamp");
-                }
+            const auto committed = last_timestamps.find(point.series_id);
+            if (committed != last_timestamps.end() &&
+                point.timestamp_ms <= committed->second) {
+                return Status::Error("timestamp is not greater than last committed timestamp");
             }
         }
         return Status::Ok();
@@ -429,6 +553,7 @@ struct Engine::Impl {
         for (const auto& point : points) {
             shards[ShardFor(point.series_id)]->series[point.series_id]
                 [point.timestamp_ms] = VersionedPoint{point, version};
+            last_timestamps[point.series_id] = point.timestamp_ms;
             const size_t bytes = sizeof(DataPoint) + sizeof(CommitVersion);
             auto& block_chain =
                 shards[ShardFor(point.series_id)]
@@ -451,37 +576,61 @@ struct Engine::Impl {
         }
     }
 
-    void CompactShardLocked(size_t shard_id) {
-        auto compacted = std::make_shared<ShardData>();
-        const auto& old = *shards[shard_id];
-        size_t batch_count = 0;
-        for (const auto& [series_id, points] : old.series) {
-            std::vector<VersionedPoint> batch;
-            batch.reserve(kDiskPageRecords);
-            for (const auto& [timestamp, value] : points) {
-                if (timestamp < cutoff ||
-                    value.version > next_version - 1) {
+    void ClearMemtableLocked() {
+        for (auto& shard : shards) shard = std::make_shared<ShardData>();
+        memtable_bytes = 0;
+    }
+
+    Status WriteMergedShard(size_t shard_id, SstableWriter* writer) {
+        std::vector<std::shared_ptr<SstableMetadata>> sources;
+        for (const auto& sstable : sstable_metadata) {
+            if (sstable->shard_id == shard_id) sources.push_back(sstable);
+        }
+        std::set<uint64_t> series_ids;
+        for (const auto& [series_id, _] : shards[shard_id]->series) {
+            series_ids.insert(series_id);
+        }
+        for (const auto& sstable : sources) {
+            for (const auto& [series_id, _] : sstable->series) {
+                series_ids.insert(series_id);
+            }
+        }
+        for (const uint64_t series_id : series_ids) {
+            std::map<int64_t, VersionedPoint> merged;
+            const auto insert = [&](int64_t timestamp,
+                                    const VersionedPoint& point) {
+                if (timestamp < cutoff) return;
+                auto [it, ok] = merged.emplace(timestamp, point);
+                if (!ok && point.version > it->second.version) {
+                    it->second = point;
+                }
+            };
+            const auto mem_it = shards[shard_id]->series.find(series_id);
+            if (mem_it != shards[shard_id]->series.end()) {
+                for (const auto& [timestamp, point] : mem_it->second) {
+                    insert(timestamp, point);
+                }
+            }
+            for (const auto& sstable : sources) {
+                if (sstable->series.find(series_id) ==
+                    sstable->series.end()) {
                     continue;
                 }
-                compacted->series[series_id][timestamp] = value;
-                batch.push_back(value);
-                ++batch_count;
-                if (batch.size() == kDiskPageRecords) {
-                    compacted->blocks[series_id].push_back(batch);
-                    batch.clear();
+                std::vector<VersionedPoint> points;
+                if (!ReadSeriesPoints(*sstable, series_id, &points)) {
+                    return Status::Error("compaction read failed");
+                }
+                for (const auto& point : points) {
+                    insert(point.point.timestamp_ms, point);
                 }
             }
-            if (!batch.empty()) {
-                compacted->blocks[series_id].push_back(batch);
+            for (const auto& [timestamp, point] : merged) {
+                if (point.version > next_version - 1) continue;
+                writer->Append(series_id, timestamp, point.point.value,
+                               point.version);
             }
-            compacted->block_bytes[series_id] =
-                compacted->series[series_id].size() *
-                (sizeof(DataPoint) + sizeof(CommitVersion));
-            compacted->block_count[series_id] =
-                compacted->blocks[series_id].size();
         }
-        (void)batch_count;
-        shards[shard_id] = std::move(compacted);
+        return Status::Ok();
     }
 
     void ApplyGroup(const std::vector<std::shared_ptr<PendingWrite>>& group) {
@@ -498,6 +647,7 @@ struct Engine::Impl {
             for (const auto& point : request->points) {
                 shards[ShardFor(point.series_id)]->series[point.series_id]
                     [point.timestamp_ms] = VersionedPoint{point, request->version};
+                last_timestamps[point.series_id] = point.timestamp_ms;
                 const size_t block_bytes =
                     sizeof(DataPoint) + sizeof(CommitVersion);
                 auto& block_chain =
@@ -636,115 +786,6 @@ struct Engine::Impl {
         return Status::Ok();
     }
 
-    Status LoadSstable(const std::filesystem::path& path, size_t shard_id) {
-        std::ifstream in(path, std::ios::binary);
-        if (!in) return Status::Error("cannot read SSTable: " + path.string());
-        uint32_t magic = 0;
-        uint64_t count = 0;
-        in.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-        in.read(reinterpret_cast<char*>(&count), sizeof(count));
-        if (!in ||
-            (magic != kWalMagic && magic != kEncodedSstableMagic)) {
-            return Status::Error("invalid SSTable");
-        }
-        auto metadata = std::make_shared<SstableMetadata>();
-        metadata->path = path;
-        metadata->shard_id = shard_id;
-        metadata->point_count = count;
-        metadata->encoding = magic;
-        if (magic == kEncodedSstableMagic) {
-            std::string data;
-            if (!ReadFile(path, &data)) return Status::Error("cannot read SSTable");
-            if (data.size() < sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint64_t)) {
-                return Status::Error("truncated encoded SSTable");
-            }
-            const uint64_t checksum_offset = data.size() - sizeof(uint64_t);
-            uint64_t recorded_checksum = 0;
-            std::memcpy(&recorded_checksum, data.data() + checksum_offset,
-                        sizeof(uint64_t));
-            const size_t payload_offset =
-                sizeof(uint32_t) + sizeof(uint64_t);
-            const std::string payload =
-                data.substr(payload_offset, checksum_offset - payload_offset);
-            if (Checksum(payload) != recorded_checksum) {
-                return Status::Error("SSTable checksum mismatch");
-            }
-            size_t encoded_offset = 0;
-            for (uint64_t i = 0; i < count; ++i) {
-                const size_t record_offset = payload_offset + encoded_offset;
-                uint64_t series_id = 0;
-                uint64_t zigzag_timestamp = 0;
-                double value = 0.0;
-                uint64_t version = 0;
-                if (!ReadUvarint(payload, encoded_offset, &series_id) ||
-                    !ReadUvarint(payload, encoded_offset, &zigzag_timestamp) ||
-                    !Read(payload, encoded_offset, &value) ||
-                    !ReadUvarint(payload, encoded_offset, &version)) {
-                    return Status::Error("truncated encoded SSTable");
-                }
-                const int64_t timestamp = ZigzagDecode(zigzag_timestamp);
-                const VersionedPoint point{
-                    {series_id, timestamp, value},
-                    static_cast<CommitVersion>(version)};
-                shards[shard_id]->series[series_id][timestamp] = point;
-                auto& entry = metadata->series[series_id];
-                entry.series_id = series_id;
-                if (entry.point_count == 0) entry.offset = record_offset;
-                ++entry.point_count;
-                entry.min_timestamp = std::min(entry.min_timestamp, timestamp);
-                entry.max_timestamp = std::max(entry.max_timestamp, timestamp);
-                metadata->min_timestamp =
-                    std::min(metadata->min_timestamp, timestamp);
-                metadata->max_timestamp =
-                    std::max(metadata->max_timestamp, timestamp);
-                next_version = std::max(next_version, version + 1);
-            }
-            sstable_metadata.push_back(metadata);
-            return Status::Ok();
-        }
-        uint64_t hash = 1469598103934665603ULL;
-        for (uint64_t i = 0; i < count; ++i) {
-            uint64_t series_id = 0;
-            int64_t timestamp = 0;
-            double value = 0.0;
-            CommitVersion version = 0;
-            in.read(reinterpret_cast<char*>(&series_id), sizeof(uint64_t));
-            in.read(reinterpret_cast<char*>(&timestamp), sizeof(int64_t));
-            in.read(reinterpret_cast<char*>(&value), sizeof(double));
-            in.read(reinterpret_cast<char*>(&version), sizeof(CommitVersion));
-            if (!in) return Status::Error("truncated SSTable");
-            char raw[sizeof(uint64_t) + sizeof(int64_t) +
-                     sizeof(double) + sizeof(CommitVersion)];
-            std::memcpy(raw, &series_id, sizeof(uint64_t));
-            std::memcpy(raw + sizeof(uint64_t), &timestamp, sizeof(int64_t));
-            std::memcpy(raw + sizeof(uint64_t) + sizeof(int64_t),
-                        &value, sizeof(double));
-            std::memcpy(raw + sizeof(uint64_t) + sizeof(int64_t) + sizeof(double),
-                        &version, sizeof(CommitVersion));
-            hash = HashRecord(hash, raw, sizeof(raw));
-            auto& entry = metadata->series[series_id];
-            entry.series_id = series_id;
-            if (entry.point_count == 0) {
-                entry.offset = sizeof(uint32_t) + sizeof(uint64_t) +
-                               i * (sizeof(uint64_t) + sizeof(int64_t) +
-                                    sizeof(double) + sizeof(CommitVersion));
-            }
-            ++entry.point_count;
-            entry.min_timestamp = std::min(entry.min_timestamp, timestamp);
-            entry.max_timestamp = std::max(entry.max_timestamp, timestamp);
-            metadata->min_timestamp = std::min(metadata->min_timestamp, timestamp);
-            metadata->max_timestamp = std::max(metadata->max_timestamp, timestamp);
-            next_version = std::max(next_version, version + 1);
-        }
-        uint64_t checksum = 0;
-        in.read(reinterpret_cast<char*>(&checksum), sizeof(checksum));
-        if (!in || checksum != hash) {
-            return Status::Error("SSTable checksum mismatch");
-        }
-        sstable_metadata.push_back(metadata);
-        return Status::Ok();
-    }
-
     Status LoadManifest() {
         std::filesystem::path active_manifest = manifest_path;
         const auto current_path = root / "CURRENT";
@@ -804,8 +845,17 @@ struct Engine::Impl {
                 }
             }
             if (parsed_shard >= shards.size()) return Status::Error("invalid shard in Manifest");
-            auto status = LoadSstable(root / file, parsed_shard);
+            std::shared_ptr<SstableMetadata> metadata;
+            auto status = ReadSstableMetadata(root / file, parsed_shard, &metadata);
             if (!status.ok) return status;
+            sstable_metadata.push_back(metadata);
+            for (const auto& [series_id, entry] : metadata->series) {
+                auto it = last_timestamps.find(series_id);
+                if (it == last_timestamps.end() ||
+                    entry.max_timestamp > it->second) {
+                    last_timestamps[series_id] = entry.max_timestamp;
+                }
+            }
             current_files.push_back(root / file);
         }
         if (!checksum_seen ||
@@ -978,14 +1028,6 @@ Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
                 });
                 if (impl_->stopping_compaction) return;
                 impl_->compaction_requested = false;
-                for (size_t shard_id = 0;
-                     shard_id < impl_->shards.size(); ++shard_id) {
-                    impl_->CompactShardLocked(shard_id);
-                }
-                impl_->points_since_flush = 0;
-                for (const auto& shard : impl_->shards) {
-                    impl_->points_since_flush += shard->point_count();
-                }
                 ++impl_->compaction_count;
                 (void)FlushLocked(false);
             }
@@ -1398,33 +1440,38 @@ Status Engine::FlushLocked(bool incremental) {
         filename += "-" + std::to_string(impl_->next_file_number) + ".sst";
         const auto file = impl_->root / "sst" / filename;
         const auto temp = file.string() + ".tmp";
-        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-        if (!out) return Status::Error("cannot create SSTable");
-        const auto& data = *impl_->shards[shard_id];
-        const uint32_t magic = kEncodedSstableMagic;
-        std::string payload;
-        uint64_t count = 0;
-        for (const auto& [_, points] : data.series) {
-            for (const auto& [__, value] : points) {
-                if (incremental &&
-                    value.version <= impl_->last_flushed_version) {
-                    continue;
+        SstableWriter writer;
+        if (!writer.Open(temp)) return Status::Error("cannot create SSTable");
+        if (incremental) {
+            const auto& data = *impl_->shards[shard_id];
+            for (const auto& [_, points] : data.series) {
+                for (const auto& [__, value] : points) {
+                    if (value.version <= impl_->last_flushed_version) continue;
+                    writer.Append(value.point.series_id,
+                                  value.point.timestamp_ms,
+                                  value.point.value, value.version);
                 }
-                AppendUvarint(payload, value.point.series_id);
-                AppendUvarint(payload, ZigzagEncode(value.point.timestamp_ms));
-                Append(payload, value.point.value);
-                AppendUvarint(payload, value.version);
-                ++count;
+            }
+        } else {
+            auto status = impl_->WriteMergedShard(shard_id, &writer);
+            if (!status.ok) {
+                writer.Discard();
+                std::error_code discard_ec;
+                std::filesystem::remove(temp, discard_ec);
+                return status;
             }
         }
-        if (incremental && count == 0) continue;
-        out.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
-        out.write(reinterpret_cast<const char*>(&count), sizeof(count));
-        const uint64_t checksum = Checksum(payload);
-        out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
-        out.write(reinterpret_cast<const char*>(&checksum), sizeof(checksum));
-        out.flush();
-        out.close();
+        if (writer.count == 0) {
+            writer.Discard();
+            std::error_code discard_ec;
+            std::filesystem::remove(temp, discard_ec);
+            continue;
+        }
+        if (!writer.Finish()) {
+            std::error_code discard_ec;
+            std::filesystem::remove(temp, discard_ec);
+            return Status::Error("SSTable write failed");
+        }
         if (!SyncFile(temp)) return Status::Error("SSTable sync failed");
         std::error_code ec;
         std::filesystem::rename(temp, file, ec);
@@ -1432,10 +1479,10 @@ Status Engine::FlushLocked(bool incremental) {
         if (!SyncDirectory(file.parent_path())) {
             return Status::Error("SSTable directory sync failed");
         }
-        std::shared_ptr<SstableMetadata> metadata;
-        auto metadata_status =
-            impl_->ReadSstableMetadata(file, shard_id, &metadata);
-        if (!metadata_status.ok) return metadata_status;
+        auto metadata =
+            std::make_shared<SstableMetadata>(std::move(writer.metadata));
+        metadata->path = file;
+        metadata->shard_id = shard_id;
         published_metadata.push_back(metadata);
         new_files.push_back(file);
         manifest_files.push_back(file);
@@ -1511,6 +1558,7 @@ Status Engine::FlushLocked(bool incremental) {
     impl_->last_flushed_version = impl_->next_version - 1;
     impl_->points_since_flush = 0;
     impl_->hot_series_points.clear();
+    impl_->ClearMemtableLocked();
     ++impl_->flush_count;
     return Status::Ok();
 }
@@ -1523,13 +1571,6 @@ Status Engine::Flush() {
 Status Engine::Compact() {
     std::lock_guard lock(impl_->mutex);
     if (impl_->closed) return Status::Error("engine is closed");
-    for (size_t shard_id = 0; shard_id < impl_->shards.size(); ++shard_id) {
-        impl_->CompactShardLocked(shard_id);
-    }
-    impl_->points_since_flush = 0;
-    for (const auto& shard : impl_->shards) {
-        impl_->points_since_flush += shard->point_count();
-    }
     ++impl_->compaction_count;
     return FlushLocked(false);
 }

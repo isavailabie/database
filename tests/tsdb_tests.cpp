@@ -242,6 +242,68 @@ void TestLargeSeriesPaging(const std::filesystem::path& path) {
     AssertOk(engine->Close());
 }
 
+void TestFlushClearsMemtable(const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(path, Options{4, 100000}, &status);
+    AssertOk(status);
+    AssertOk(engine->WriteBatch({{800, 100, 1.0}, {801, 100, 2.0}}));
+    EngineStats before;
+    AssertOk(engine->GetStats(&before));
+    assert(before.mutable_points == 2);
+    AssertOk(engine->Flush());
+    EngineStats after;
+    AssertOk(engine->GetStats(&after));
+    assert(after.mutable_points == 0);
+    assert(after.memtable_bytes == 0);
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({800, 801}, 0, 200, &cursor));
+    assert(Read(cursor.get()).size() == 2);
+    AssertOk(engine->Close());
+}
+
+void TestCompactionMergesSstables(const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(path, Options{4, 100000}, &status);
+    AssertOk(status);
+    for (int flush = 0; flush < 3; ++flush) {
+        std::vector<DataPoint> batch;
+        for (int i = 0; i < 100; ++i) {
+            batch.push_back({static_cast<uint64_t>(700 + (i % 4)),
+                             static_cast<int64_t>(flush * 1000 + i),
+                             static_cast<double>(i)});
+        }
+        AssertOk(engine->WriteBatch(batch));
+        AssertOk(engine->Flush());
+    }
+    AssertOk(engine->Compact());
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({700, 701, 702, 703}, 0, 10000, &cursor));
+    assert(Read(cursor.get()).size() == 300);
+    AssertOk(engine->Close());
+
+    auto reopened = Engine::Open(path, Options{4, 100000}, &status);
+    AssertOk(status);
+    AssertOk(reopened->Scan({700, 701, 702, 703}, 0, 10000, &cursor));
+    assert(Read(cursor.get()).size() == 300);
+    AssertOk(reopened->Close());
+}
+
+void TestCompactionDropsExpired(const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(path, Options{4, 100000}, &status);
+    AssertOk(status);
+    AssertOk(engine->WriteBatch(
+        {{900, 100, 1.0}, {900, 200, 2.0}, {900, 300, 3.0}}));
+    AssertOk(engine->Flush());
+    AssertOk(engine->ExpireBefore(250));
+    AssertOk(engine->Compact());
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({900}, 0, 1000, &cursor));
+    const auto points = Read(cursor.get());
+    assert(points.size() == 1 && points[0].timestamp_ms == 300);
+    AssertOk(engine->Close());
+}
+
 void TestSstableChecksum(const std::filesystem::path& path) {
     {
         Status status;
@@ -283,6 +345,9 @@ int main() {
     TestMultipleIncrementalFlushes(root / "incremental");
     TestPhysicalExpirationAndGC(root / "physical_expiration");
     TestLargeSeriesPaging(root / "large_series_paging");
+    TestFlushClearsMemtable(root / "flush_clears_memtable");
+    TestCompactionMergesSstables(root / "compaction_merges");
+    TestCompactionDropsExpired(root / "compaction_drops_expired");
     TestSstableChecksum(root / "checksum");
     std::cout << "all tests passed\n";
 }
