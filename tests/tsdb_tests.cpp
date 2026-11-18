@@ -304,6 +304,26 @@ void TestCompactionDropsExpired(const std::filesystem::path& path) {
     AssertOk(engine->Close());
 }
 
+void TestNegativeTimestampRecovery(const std::filesystem::path& path) {
+    {
+        Status status;
+        auto engine = Engine::Open(path, Options{4, 100000}, &status);
+        AssertOk(status);
+        AssertOk(engine->WriteBatch({{950, -1000, 1.0}, {950, -500, 2.0}}));
+        AssertOk(engine->Flush());
+        AssertOk(engine->Close());
+    }
+    Status status;
+    auto engine = Engine::Open(path, Options{4, 100000}, &status);
+    AssertOk(status);
+    AssertOk(engine->Put({950, 0, 3.0}));
+    assert(!engine->Put({950, -500, 4.0}).ok);
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({950}, -2000, 2000, &cursor));
+    assert(Read(cursor.get()).size() == 3);
+    AssertOk(engine->Close());
+}
+
 void TestSstableChecksum(const std::filesystem::path& path) {
     {
         Status status;
@@ -348,6 +368,7 @@ int main() {
     TestFlushClearsMemtable(root / "flush_clears_memtable");
     TestCompactionMergesSstables(root / "compaction_merges");
     TestCompactionDropsExpired(root / "compaction_drops_expired");
+    TestNegativeTimestampRecovery(root / "negative_ts_recovery");
     TestSstableChecksum(root / "checksum");
     std::cout << "all tests passed\n";
 }
