@@ -645,18 +645,20 @@ struct Engine::Impl {
     }
 
     Status GarbageCollectLocked() {
+        bool deleted = false;
         std::vector<std::shared_ptr<SstableMetadata>> retained;
         retained.reserve(obsolete_sstables.size());
         for (const auto& obsolete : obsolete_sstables) {
             if (obsolete->refs == 0) {
                 std::error_code ec;
                 std::filesystem::remove(obsolete->path, ec);
+                deleted = true;
             } else {
                 retained.push_back(obsolete);
             }
         }
         obsolete_sstables = std::move(retained);
-        if (!SyncDirectory(root / "sst")) {
+        if (deleted && !SyncDirectory(root / "sst")) {
             return Status::Error("GC directory sync failed");
         }
         return Status::Ok();
@@ -1021,8 +1023,11 @@ Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
             });
             if (impl_->stopping_flush) return;
             impl_->flush_requested = false;
-            if (FlushLocked(true).ok &&
-                impl_->options.enable_background_compaction &&
+            const bool flushed = FlushLocked(true).ok;
+            if (flushed && impl_->options.enable_background_gc) {
+                (void)impl_->GarbageCollectLocked();
+            }
+            if (flushed && impl_->options.enable_background_compaction &&
                 impl_->MaxSstablesPerShardLocked() >=
                     impl_->options.compaction_sstable_threshold) {
                 impl_->compaction_requested = true;
