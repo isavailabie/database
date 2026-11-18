@@ -394,6 +394,39 @@ struct Engine::Impl {
         }
     }
 
+    void CompactShardLocked(size_t shard_id) {
+        auto compacted = std::make_shared<ShardData>();
+        const auto& old = *shards[shard_id];
+        size_t batch_count = 0;
+        for (const auto& [series_id, points] : old.series) {
+            std::vector<VersionedPoint> batch;
+            batch.reserve(kDiskPageRecords);
+            for (const auto& [timestamp, value] : points) {
+                if (timestamp < cutoff ||
+                    value.version > next_version - 1) {
+                    continue;
+                }
+                compacted->series[series_id][timestamp] = value;
+                batch.push_back(value);
+                ++batch_count;
+                if (batch.size() == kDiskPageRecords) {
+                    compacted->blocks[series_id].push_back(batch);
+                    batch.clear();
+                }
+            }
+            if (!batch.empty()) {
+                compacted->blocks[series_id].push_back(batch);
+            }
+            compacted->block_bytes[series_id] =
+                compacted->series[series_id].size() *
+                (sizeof(DataPoint) + sizeof(CommitVersion));
+            compacted->block_count[series_id] =
+                compacted->blocks[series_id].size();
+        }
+        (void)batch_count;
+        shards[shard_id] = std::move(compacted);
+    }
+
     void ApplyGroup(const std::vector<std::shared_ptr<PendingWrite>>& group) {
         std::set<size_t> touched;
         for (const auto& request : group) {
@@ -757,29 +790,7 @@ Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
                 impl_->compaction_requested = false;
                 for (size_t shard_id = 0;
                      shard_id < impl_->shards.size(); ++shard_id) {
-                    auto compacted_shard = std::make_shared<ShardData>();
-                    auto& data = impl_->shards[shard_id]->series;
-                    for (auto series_it = data.begin();
-                         series_it != data.end();) {
-                        for (auto point_it = series_it->second.begin();
-                             point_it != series_it->second.end();) {
-                            if (point_it->first < impl_->cutoff ||
-                                point_it->second.version >
-                                    impl_->next_version - 1) {
-                                point_it = series_it->second.erase(point_it);
-                            } else {
-                                compacted_shard->series[series_it->first]
-                                    [point_it->first] = point_it->second;
-                                ++point_it;
-                            }
-                        }
-                        if (series_it->second.empty()) {
-                            series_it = data.erase(series_it);
-                        } else {
-                            ++series_it;
-                        }
-                    }
-                    impl_->shards[shard_id] = std::move(compacted_shard);
+                    impl_->CompactShardLocked(shard_id);
                 }
                 impl_->points_since_flush = 0;
                 for (const auto& shard : impl_->shards) {
@@ -1268,32 +1279,7 @@ Status Engine::Compact() {
     std::lock_guard lock(impl_->mutex);
     if (impl_->closed) return Status::Error("engine is closed");
     for (size_t shard_id = 0; shard_id < impl_->shards.size(); ++shard_id) {
-        auto compacted_shard = std::make_shared<ShardData>();
-        auto& data = impl_->shards[shard_id]->series;
-        std::vector<VersionedPoint> compacted_batch;
-        compacted_batch.reserve(kDiskPageRecords);
-        for (auto series_it = data.begin(); series_it != data.end();) {
-            for (auto point_it = series_it->second.begin();
-                 point_it != series_it->second.end();) {
-                if (point_it->first < impl_->cutoff ||
-                    point_it->second.version > impl_->next_version - 1) {
-                    point_it = series_it->second.erase(point_it);
-                } else {
-                    compacted_batch.push_back(point_it->second);
-                    compacted_shard->series[series_it->first]
-                        [point_it->first] = point_it->second;
-                    if (compacted_batch.size() == kDiskPageRecords) {
-                        compacted_batch.clear();
-                    }
-                    ++point_it;
-                }
-            }
-            if (series_it->second.empty()) {
-                series_it = data.erase(series_it);
-            } else {
-                ++series_it;
-            }
-        }
+        impl_->CompactShardLocked(shard_id);
     }
     impl_->points_since_flush = 0;
     for (const auto& shard : impl_->shards) {
