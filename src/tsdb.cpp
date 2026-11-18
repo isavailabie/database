@@ -36,6 +36,7 @@ struct SstableMetadata {
     std::filesystem::path path;
     size_t shard_id{};
     uint64_t point_count{};
+    uint32_t encoding{0};
     int64_t min_timestamp{std::numeric_limits<int64_t>::max()};
     int64_t max_timestamp{std::numeric_limits<int64_t>::min()};
     std::map<uint64_t, SstableIndexEntry> series;
@@ -45,6 +46,7 @@ constexpr uint32_t kWalMagic = 0x54534442;
 constexpr uint8_t kTxnRecord = 1;
 constexpr uint8_t kExpireRecord = 2;
 constexpr uint64_t kDiskPageRecords = 128;
+constexpr uint32_t kEncodedSstableMagic = 0x53535445;
 constexpr uint32_t kEncodedWalPayloadMagic = 0x57564c45;
 
 uint64_t Checksum(const std::string& payload) {
@@ -118,6 +120,25 @@ uint64_t ZigzagEncode(int64_t value) {
 int64_t ZigzagDecode(uint64_t value) {
     return static_cast<int64_t>((value >> 1) ^
                                 -static_cast<int64_t>(value & 1));
+}
+
+bool ReadUvarintStream(std::istream& input, uint64_t* value) {
+    uint64_t result = 0;
+    unsigned shift = 0;
+    while (shift < 64) {
+        char raw = 0;
+        input.get(raw);
+        if (!input) return false;
+        const uint8_t byte =
+            static_cast<uint8_t>(static_cast<unsigned char>(raw));
+        result |= static_cast<uint64_t>(byte & 0x7f) << shift;
+        if ((byte & 0x80) == 0) {
+            *value = result;
+            return true;
+        }
+        shift += 7;
+    }
+    return false;
 }
 
 
@@ -510,13 +531,59 @@ struct Engine::Impl {
         uint64_t count = 0;
         in.read(reinterpret_cast<char*>(&magic), sizeof(magic));
         in.read(reinterpret_cast<char*>(&count), sizeof(count));
-        if (!in || magic != kWalMagic) {
+        if (!in || (magic != kWalMagic && magic != kEncodedSstableMagic)) {
             return Status::Error("invalid SSTable metadata");
         }
         auto result = std::make_shared<SstableMetadata>();
         result->path = path;
         result->shard_id = shard_id;
         result->point_count = count;
+        result->encoding = magic;
+        if (magic == kEncodedSstableMagic) {
+            std::string data;
+            if (!ReadFile(path, &data)) return Status::Error("cannot read SSTable");
+            if (data.size() < sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint64_t)) {
+                return Status::Error("truncated encoded SSTable");
+            }
+            const uint64_t checksum_offset = data.size() - sizeof(uint64_t);
+            uint64_t recorded_checksum = 0;
+            std::memcpy(&recorded_checksum, data.data() + checksum_offset,
+                        sizeof(uint64_t));
+            const size_t payload_offset =
+                sizeof(uint32_t) + sizeof(uint64_t);
+            const std::string payload =
+                data.substr(payload_offset, checksum_offset - payload_offset);
+            if (Checksum(payload) != recorded_checksum) {
+                return Status::Error("SSTable checksum mismatch");
+            }
+            size_t encoded_offset = 0;
+            for (uint64_t i = 0; i < count; ++i) {
+                const size_t record_offset = payload_offset + encoded_offset;
+                uint64_t series_id = 0;
+                uint64_t zigzag_timestamp = 0;
+                double value = 0.0;
+                uint64_t version = 0;
+                if (!ReadUvarint(payload, encoded_offset, &series_id) ||
+                    !ReadUvarint(payload, encoded_offset, &zigzag_timestamp) ||
+                    !Read(payload, encoded_offset, &value) ||
+                    !ReadUvarint(payload, encoded_offset, &version)) {
+                    return Status::Error("truncated encoded SSTable");
+                }
+                const int64_t timestamp = ZigzagDecode(zigzag_timestamp);
+                auto& entry = result->series[series_id];
+                entry.series_id = series_id;
+                if (entry.point_count == 0) entry.offset = record_offset;
+                ++entry.point_count;
+                entry.min_timestamp = std::min(entry.min_timestamp, timestamp);
+                entry.max_timestamp = std::max(entry.max_timestamp, timestamp);
+                result->min_timestamp =
+                    std::min(result->min_timestamp, timestamp);
+                result->max_timestamp =
+                    std::max(result->max_timestamp, timestamp);
+            }
+            *metadata = std::move(result);
+            return Status::Ok();
+        }
         uint64_t hash = 1469598103934665603ULL;
         for (uint64_t i = 0; i < count; ++i) {
             uint64_t series_id = 0;
@@ -570,11 +637,65 @@ struct Engine::Impl {
         uint64_t count = 0;
         in.read(reinterpret_cast<char*>(&magic), sizeof(magic));
         in.read(reinterpret_cast<char*>(&count), sizeof(count));
-        if (!in || magic != kWalMagic) return Status::Error("invalid SSTable");
+        if (!in ||
+            (magic != kWalMagic && magic != kEncodedSstableMagic)) {
+            return Status::Error("invalid SSTable");
+        }
         auto metadata = std::make_shared<SstableMetadata>();
         metadata->path = path;
         metadata->shard_id = shard_id;
         metadata->point_count = count;
+        metadata->encoding = magic;
+        if (magic == kEncodedSstableMagic) {
+            std::string data;
+            if (!ReadFile(path, &data)) return Status::Error("cannot read SSTable");
+            if (data.size() < sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint64_t)) {
+                return Status::Error("truncated encoded SSTable");
+            }
+            const uint64_t checksum_offset = data.size() - sizeof(uint64_t);
+            uint64_t recorded_checksum = 0;
+            std::memcpy(&recorded_checksum, data.data() + checksum_offset,
+                        sizeof(uint64_t));
+            const size_t payload_offset =
+                sizeof(uint32_t) + sizeof(uint64_t);
+            const std::string payload =
+                data.substr(payload_offset, checksum_offset - payload_offset);
+            if (Checksum(payload) != recorded_checksum) {
+                return Status::Error("SSTable checksum mismatch");
+            }
+            size_t encoded_offset = 0;
+            for (uint64_t i = 0; i < count; ++i) {
+                const size_t record_offset = payload_offset + encoded_offset;
+                uint64_t series_id = 0;
+                uint64_t zigzag_timestamp = 0;
+                double value = 0.0;
+                uint64_t version = 0;
+                if (!ReadUvarint(payload, encoded_offset, &series_id) ||
+                    !ReadUvarint(payload, encoded_offset, &zigzag_timestamp) ||
+                    !Read(payload, encoded_offset, &value) ||
+                    !ReadUvarint(payload, encoded_offset, &version)) {
+                    return Status::Error("truncated encoded SSTable");
+                }
+                const int64_t timestamp = ZigzagDecode(zigzag_timestamp);
+                const VersionedPoint point{
+                    {series_id, timestamp, value},
+                    static_cast<CommitVersion>(version)};
+                shards[shard_id]->series[series_id][timestamp] = point;
+                auto& entry = metadata->series[series_id];
+                entry.series_id = series_id;
+                if (entry.point_count == 0) entry.offset = record_offset;
+                ++entry.point_count;
+                entry.min_timestamp = std::min(entry.min_timestamp, timestamp);
+                entry.max_timestamp = std::max(entry.max_timestamp, timestamp);
+                metadata->min_timestamp =
+                    std::min(metadata->min_timestamp, timestamp);
+                metadata->max_timestamp =
+                    std::max(metadata->max_timestamp, timestamp);
+                next_version = std::max(next_version, version + 1);
+            }
+            sstable_metadata.push_back(metadata);
+            return Status::Ok();
+        }
         uint64_t hash = 1469598103934665603ULL;
         for (uint64_t i = 0; i < count; ++i) {
             uint64_t series_id = 0;
@@ -1012,6 +1133,47 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
             if (entry.max_timestamp < start || entry.min_timestamp >= end) continue;
             const int fd = ::open(sstable->path.c_str(), O_RDONLY);
             if (fd < 0) continue;
+            if (sstable->encoding == kEncodedSstableMagic) {
+                std::vector<char> encoded_page(64 * 1024);
+                const ssize_t bytes =
+                    ::pread(fd, encoded_page.data(), encoded_page.size(),
+                            entry.offset);
+                if (bytes > 0) {
+                    std::string payload(encoded_page.data(),
+                                        static_cast<size_t>(bytes));
+                    size_t encoded_offset = 0;
+                    for (uint64_t i = 0; i < entry.point_count; ++i) {
+                        uint64_t disk_series = 0;
+                        uint64_t zigzag_timestamp = 0;
+                        double disk_value = 0.0;
+                        uint64_t disk_version = 0;
+                        if (!ReadUvarint(payload, encoded_offset, &disk_series) ||
+                            !ReadUvarint(payload, encoded_offset,
+                                         &zigzag_timestamp) ||
+                            !Read(payload, encoded_offset, &disk_value) ||
+                            !ReadUvarint(payload, encoded_offset,
+                                         &disk_version)) {
+                            break;
+                        }
+                        const int64_t disk_timestamp =
+                            ZigzagDecode(zigzag_timestamp);
+                        if (disk_timestamp >= start && disk_timestamp < end &&
+                            disk_timestamp >= view.cutoff &&
+                            disk_version <= view.version) {
+                            const auto existing = merged.find(disk_timestamp);
+                            if (existing == merged.end() ||
+                                disk_version >= existing->second.version) {
+                                merged[disk_timestamp] =
+                                    VersionedPoint{
+                                        {disk_series, disk_timestamp, disk_value},
+                                        static_cast<CommitVersion>(disk_version)};
+                            }
+                        }
+                    }
+                }
+                ::close(fd);
+                continue;
+            }
             const size_t record_size =
                 sizeof(uint64_t) + sizeof(int64_t) +
                 sizeof(double) + sizeof(CommitVersion);
@@ -1219,23 +1381,22 @@ Status Engine::FlushLocked(bool incremental) {
         std::ofstream out(temp, std::ios::binary | std::ios::trunc);
         if (!out) return Status::Error("cannot create SSTable");
         const auto& data = *impl_->shards[shard_id];
-        const uint32_t magic = kWalMagic;
+        const uint32_t magic = kEncodedSstableMagic;
         std::string payload;
+        uint64_t count = 0;
         for (const auto& [_, points] : data.series) {
             for (const auto& [__, value] : points) {
                 if (incremental &&
                     value.version <= impl_->last_flushed_version) {
                     continue;
                 }
-                Append(payload, value.point.series_id);
-                Append(payload, value.point.timestamp_ms);
+                AppendUvarint(payload, value.point.series_id);
+                AppendUvarint(payload, ZigzagEncode(value.point.timestamp_ms));
                 Append(payload, value.point.value);
-                Append(payload, value.version);
+                AppendUvarint(payload, value.version);
+                ++count;
             }
         }
-        const uint64_t count =
-            payload.size() / (sizeof(uint64_t) + sizeof(int64_t) +
-                              sizeof(double) + sizeof(CommitVersion));
         if (incremental && count == 0) continue;
         out.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
         out.write(reinterpret_cast<const char*>(&count), sizeof(count));
