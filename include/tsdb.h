@@ -71,6 +71,8 @@ struct Options {
     size_t cpu_budget{4};
     size_t memtable_block_bytes{16 * 1024};
     uint64_t hot_series_point_limit{10000000};
+    size_t compaction_sstable_threshold{8};
+    bool enable_background_gc{true};
 };
 
 struct EngineStats {

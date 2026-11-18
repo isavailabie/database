@@ -650,6 +650,29 @@ struct Engine::Impl {
         return Status::Ok();
     }
 
+    size_t MaxSstablesPerShardLocked() const {
+        std::vector<size_t> counts(shards.size(), 0);
+        for (const auto& sstable : sstable_metadata) {
+            if (sstable->shard_id < counts.size()) ++counts[sstable->shard_id];
+        }
+        size_t max_count = 0;
+        for (const size_t count : counts) max_count = std::max(max_count, count);
+        return max_count;
+    }
+
+    Status GarbageCollectLocked() {
+        if (active_read_views != 0) return Status::Ok();
+        for (const auto& obsolete : obsolete_sstables) {
+            std::error_code ec;
+            std::filesystem::remove(obsolete, ec);
+        }
+        obsolete_sstables.clear();
+        if (!SyncDirectory(root / "sst")) {
+            return Status::Error("GC directory sync failed");
+        }
+        return Status::Ok();
+    }
+
     void ApplyGroup(const std::vector<std::shared_ptr<PendingWrite>>& group) {
         std::set<size_t> touched;
         for (const auto& request : group) {
@@ -1030,8 +1053,8 @@ Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
             impl_->flush_requested = false;
             if (FlushLocked(true).ok &&
                 impl_->options.enable_background_compaction &&
-                impl_->flush_count >= 4 &&
-                impl_->flush_count % 4 == 0) {
+                impl_->MaxSstablesPerShardLocked() >=
+                    impl_->options.compaction_sstable_threshold) {
                 impl_->compaction_requested = true;
                 impl_->compaction_cv.notify_one();
             }
@@ -1050,6 +1073,9 @@ Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
                 impl_->compaction_requested = false;
                 ++impl_->compaction_count;
                 (void)FlushLocked(false);
+                if (impl_->options.enable_background_gc) {
+                    (void)impl_->GarbageCollectLocked();
+                }
             }
         });
     }
@@ -1597,18 +1623,7 @@ Status Engine::Compact() {
 
 Status Engine::GarbageCollect() {
     std::lock_guard lock(impl_->mutex);
-    if (impl_->active_read_views != 0) {
-        return Status::Ok();
-    }
-    for (const auto& obsolete : impl_->obsolete_sstables) {
-        std::error_code ec;
-        std::filesystem::remove(obsolete, ec);
-    }
-    impl_->obsolete_sstables.clear();
-    if (!SyncDirectory(impl_->root / "sst")) {
-        return Status::Error("GC directory sync failed");
-    }
-    return Status::Ok();
+    return impl_->GarbageCollectLocked();
 }
 
 Status Engine::Close() {
