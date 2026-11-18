@@ -224,6 +224,24 @@ void TestNegativeWindowsAndDuplicateSeries(const std::filesystem::path& path) {
     AssertOk(engine->Close());
 }
 
+void TestLargeSeriesPaging(const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(path, Options{4, 100000}, &status);
+    AssertOk(status);
+    std::vector<DataPoint> batch;
+    batch.reserve(10000);
+    for (int i = 0; i < 10000; ++i) {
+        batch.push_back({900, static_cast<int64_t>(i * 10),
+                         static_cast<double>(i)});
+    }
+    AssertOk(engine->WriteBatch(batch));
+    AssertOk(engine->Flush());
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({900}, 0, 1000000, &cursor));
+    assert(Read(cursor.get()).size() == 10000);
+    AssertOk(engine->Close());
+}
+
 void TestSstableChecksum(const std::filesystem::path& path) {
     {
         Status status;
@@ -264,6 +282,7 @@ int main() {
     TestNegativeWindowsAndDuplicateSeries(root / "negative");
     TestMultipleIncrementalFlushes(root / "incremental");
     TestPhysicalExpirationAndGC(root / "physical_expiration");
+    TestLargeSeriesPaging(root / "large_series_paging");
     TestSstableChecksum(root / "checksum");
     std::cout << "all tests passed\n";
 }

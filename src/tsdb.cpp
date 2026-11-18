@@ -27,6 +27,7 @@ namespace {
 struct SstableIndexEntry {
     uint64_t series_id{};
     uint64_t offset{};
+    uint64_t byte_length{};
     uint64_t point_count{};
     int64_t min_timestamp{std::numeric_limits<int64_t>::max()};
     int64_t max_timestamp{std::numeric_limits<int64_t>::min()};
@@ -574,6 +575,8 @@ struct Engine::Impl {
                 entry.series_id = series_id;
                 if (entry.point_count == 0) entry.offset = record_offset;
                 ++entry.point_count;
+                entry.byte_length = payload_offset + encoded_offset -
+                                    entry.offset;
                 entry.min_timestamp = std::min(entry.min_timestamp, timestamp);
                 entry.max_timestamp = std::max(entry.max_timestamp, timestamp);
                 result->min_timestamp =
@@ -614,6 +617,9 @@ struct Engine::Impl {
                          sizeof(double) + sizeof(CommitVersion));
             }
             ++entry.point_count;
+            entry.byte_length = entry.point_count *
+                                (sizeof(uint64_t) + sizeof(int64_t) +
+                                 sizeof(double) + sizeof(CommitVersion));
             entry.min_timestamp = std::min(entry.min_timestamp, timestamp);
             entry.max_timestamp = std::max(entry.max_timestamp, timestamp);
             result->min_timestamp =
@@ -1134,13 +1140,13 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
             const int fd = ::open(sstable->path.c_str(), O_RDONLY);
             if (fd < 0) continue;
             if (sstable->encoding == kEncodedSstableMagic) {
-                std::vector<char> encoded_page(64 * 1024);
+                std::vector<char> encoded_page(entry.byte_length);
                 const ssize_t bytes =
                     ::pread(fd, encoded_page.data(), encoded_page.size(),
                             entry.offset);
                 if (bytes > 0) {
-                    std::string payload(encoded_page.data(),
-                                        static_cast<size_t>(bytes));
+                    std::string payload(
+                        encoded_page.data(), static_cast<size_t>(bytes));
                     size_t encoded_offset = 0;
                     for (uint64_t i = 0; i < entry.point_count; ++i) {
                         uint64_t disk_series = 0;
