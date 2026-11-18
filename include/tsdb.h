@@ -69,7 +69,6 @@ struct Options {
     bool enable_background_compaction{true};
     size_t max_memtable_bytes{160 * 1024 * 1024};
     size_t cpu_budget{4};
-    size_t memtable_block_bytes{16 * 1024};
     uint64_t hot_series_point_limit{10000000};
     size_t compaction_sstable_threshold{8};
     bool enable_background_gc{true};

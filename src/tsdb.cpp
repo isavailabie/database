@@ -156,9 +156,6 @@ struct VersionedPoint {
 
 struct ShardData {
     std::map<uint64_t, std::map<int64_t, VersionedPoint>> series;
-    std::unordered_map<uint64_t, size_t> block_bytes;
-    std::unordered_map<uint64_t, size_t> block_count;
-    std::unordered_map<uint64_t, std::vector<std::vector<VersionedPoint>>> blocks;
     size_t point_count() const {
         size_t count = 0;
         for (const auto& [_, points] : series) count += points.size();
@@ -571,24 +568,7 @@ struct Engine::Impl {
             shards[ShardFor(point.series_id)]->series[point.series_id]
                 [point.timestamp_ms] = VersionedPoint{point, version};
             last_timestamps[point.series_id] = point.timestamp_ms;
-            const size_t bytes = sizeof(DataPoint) + sizeof(CommitVersion);
-            auto& block_chain =
-                shards[ShardFor(point.series_id)]
-                    ->blocks[point.series_id];
-            if (block_chain.empty()) block_chain.emplace_back();
-            block_chain.back().push_back(VersionedPoint{point, version});
-            if (block_chain.back().size() * bytes >
-                options.memtable_block_bytes) {
-                block_chain.emplace_back();
-            }
-            shards[ShardFor(point.series_id)]->block_bytes
-                [point.series_id] += bytes;
-            auto& shard = *shards[ShardFor(point.series_id)];
-            shard.block_count[point.series_id] =
-                (shard.block_bytes[point.series_id] +
-                 options.memtable_block_bytes - 1) /
-                options.memtable_block_bytes;
-            memtable_bytes += bytes;
+            memtable_bytes += sizeof(DataPoint) + sizeof(CommitVersion);
             ++hot_series_points[point.series_id];
         }
     }
@@ -688,26 +668,7 @@ struct Engine::Impl {
                 shards[ShardFor(point.series_id)]->series[point.series_id]
                     [point.timestamp_ms] = VersionedPoint{point, request->version};
                 last_timestamps[point.series_id] = point.timestamp_ms;
-                const size_t block_bytes =
-                    sizeof(DataPoint) + sizeof(CommitVersion);
-                auto& block_chain =
-                    shards[ShardFor(point.series_id)]
-                        ->blocks[point.series_id];
-                if (block_chain.empty()) block_chain.emplace_back();
-                block_chain.back().push_back(
-                    VersionedPoint{point, request->version});
-                if (block_chain.back().size() * block_bytes >
-                    options.memtable_block_bytes) {
-                    block_chain.emplace_back();
-                }
-                shards[ShardFor(point.series_id)]->block_bytes
-                    [point.series_id] += block_bytes;
-                auto& shard = *shards[ShardFor(point.series_id)];
-                shard.block_count[point.series_id] =
-                    (shard.block_bytes[point.series_id] +
-                     options.memtable_block_bytes - 1) /
-                    options.memtable_block_bytes;
-                memtable_bytes += block_bytes;
+                memtable_bytes += sizeof(DataPoint) + sizeof(CommitVersion);
                 ++hot_series_points[point.series_id];
             }
         }
@@ -1443,7 +1404,6 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
         impl_->shards[shard_id] =
             std::make_shared<ShardData>(*impl_->shards[shard_id]);
         auto& points_by_series = impl_->shards[shard_id]->series;
-        auto& blocks_by_series = impl_->shards[shard_id]->blocks;
         for (auto series_it = points_by_series.begin();
              series_it != points_by_series.end();) {
             size_t removed = 0;
@@ -1458,9 +1418,6 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
             }
             if (removed > 0) {
                 impl_->memtable_bytes -= removed * kRecordBytes;
-                blocks_by_series.erase(series_it->first);
-                impl_->shards[shard_id]->block_bytes.erase(series_it->first);
-                impl_->shards[shard_id]->block_count.erase(series_it->first);
             }
             if (series_it->second.empty()) {
                 series_it = points_by_series.erase(series_it);
