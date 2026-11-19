@@ -2336,56 +2336,97 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
 Status Engine::FlushLocked(bool incremental) {
     (void)incremental;
     if (impl_->closed) return Status::Error("engine is closed");
-    std::vector<std::filesystem::path> new_files;
-    std::vector<std::shared_ptr<SstableMetadata>> published_metadata;
+
+    struct Job {
+        size_t shard_id{};
+        std::shared_ptr<ShardData> data;
+        std::filesystem::path file;
+        std::filesystem::path temp;
+        bool written{false};
+        Status status{Status::Ok()};
+        std::shared_ptr<SstableMetadata> metadata;
+    };
+
+    std::vector<std::shared_ptr<Job>> jobs;
     for (size_t shard_id = 0; shard_id < impl_->shards.size(); ++shard_id) {
+        auto job = std::make_shared<Job>();
+        job->shard_id = shard_id;
+        {
+            std::lock_guard shard_lock(*impl_->shard_mutex[shard_id]);
+            job->data = impl_->shards[shard_id];
+        }
         std::string filename = "shard-";
         filename += shard_id < 10 ? "0" : "";
         filename += std::to_string(shard_id);
         filename += "-" + std::to_string(impl_->next_file_number) + ".sst";
-        const auto file = impl_->root / "sst" / filename;
-        const auto temp = file.string() + ".tmp";
-        SstableWriter writer;
-        if (!writer.Open(temp)) return Status::Error("cannot create SSTable");
-        std::shared_ptr<ShardData> data;
-        {
-            std::lock_guard shard_lock(*impl_->shard_mutex[shard_id]);
-            data = impl_->shards[shard_id];
-        }
-        for (const auto& [_, points] : data->series) {
-            for (const auto& [__, value] : *points) {
-                if (value.version <= impl_->last_flushed_version) continue;
-                writer.Append(value.point.series_id,
-                              value.point.timestamp_ms, value.point.value,
-                              value.version);
-            }
-        }
-        if (writer.count == 0) {
-            writer.Discard();
-            std::error_code discard_ec;
-            std::filesystem::remove(temp, discard_ec);
-            continue;
-        }
-        if (!writer.Finish()) {
-            std::error_code discard_ec;
-            std::filesystem::remove(temp, discard_ec);
-            return Status::Error("SSTable write failed");
-        }
-        if (!SyncFile(temp)) return Status::Error("SSTable sync failed");
-        std::error_code ec;
-        std::filesystem::rename(temp, file, ec);
-        if (ec) return Status::Error("SSTable publish failed");
-        if (!SyncDirectory(file.parent_path())) {
-            return Status::Error("SSTable directory sync failed");
-        }
-        auto metadata =
-            std::make_shared<SstableMetadata>(std::move(writer.metadata));
-        metadata->path = file;
-        metadata->shard_id = shard_id;
-        metadata->level = 0;
-        published_metadata.push_back(metadata);
-        new_files.push_back(file);
         ++impl_->next_file_number;
+        job->file = impl_->root / "sst" / filename;
+        job->temp = job->file.string() + ".tmp";
+        jobs.push_back(std::move(job));
+    }
+
+    // The per-shard SSTables are independent, so the four writes run
+    // concurrently instead of rotating through one shard at a time.
+    std::vector<std::thread> writers;
+    for (const auto& job : jobs) {
+        writers.emplace_back([this, job] {
+            SstableWriter writer;
+            if (!writer.Open(job->temp)) {
+                job->status = Status::Error("cannot create SSTable");
+                return;
+            }
+            for (const auto& [_, points] : job->data->series) {
+                for (const auto& [__, value] : *points) {
+                    if (value.version <= impl_->last_flushed_version) continue;
+                    writer.Append(value.point.series_id,
+                                  value.point.timestamp_ms, value.point.value,
+                                  value.version);
+                }
+            }
+            if (writer.count == 0) {
+                writer.Discard();
+                std::error_code discard_ec;
+                std::filesystem::remove(job->temp, discard_ec);
+                return;
+            }
+            if (!writer.Finish()) {
+                std::error_code discard_ec;
+                std::filesystem::remove(job->temp, discard_ec);
+                job->status = Status::Error("SSTable write failed");
+                return;
+            }
+            if (!SyncFile(job->temp)) {
+                job->status = Status::Error("SSTable sync failed");
+                return;
+            }
+            std::error_code ec;
+            std::filesystem::rename(job->temp, job->file, ec);
+            if (ec) {
+                job->status = Status::Error("SSTable publish failed");
+                return;
+            }
+            if (!SyncDirectory(job->file.parent_path())) {
+                job->status = Status::Error("SSTable directory sync failed");
+                return;
+            }
+            auto metadata =
+                std::make_shared<SstableMetadata>(std::move(writer.metadata));
+            metadata->path = job->file;
+            metadata->shard_id = job->shard_id;
+            metadata->level = 0;
+            job->metadata = std::move(metadata);
+            job->written = true;
+        });
+    }
+    for (auto& writer : writers) writer.join();
+
+    std::vector<std::filesystem::path> new_files;
+    std::vector<std::shared_ptr<SstableMetadata>> published_metadata;
+    for (const auto& job : jobs) {
+        if (!job->status.ok) return job->status;
+        if (!job->written) continue;
+        new_files.push_back(job->file);
+        published_metadata.push_back(job->metadata);
     }
     for (auto& covered : impl_->covered_commit_versions) {
         covered = impl_->next_version - 1;
@@ -2413,7 +2454,6 @@ Status Engine::FlushLocked(bool incremental) {
     }
     return Status::Ok();
 }
-
 Status Engine::CompactRoundLocked(std::unique_lock<std::mutex>& lock,
                                   size_t threshold) {
     auto jobs = impl_->PlanCompactionLocked(threshold);
