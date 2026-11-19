@@ -845,6 +845,18 @@ struct Engine::Impl {
 
     void ApplyFragment(size_t shard_id, const ShardFragment& fragment) {
         std::lock_guard lock(*shard_mutex[shard_id]);
+        // No read view or flush holds this shard: mutate in place. This is the
+        // steady state for write-only paths (bulk import), where copying the
+        // series maps on every commit is pure overhead.
+        if (shards[shard_id].use_count() == 1) {
+            auto& shard = *shards[shard_id];
+            for (const auto& point : fragment.points) {
+                auto& slot = shard.series[point.point.series_id];
+                if (!slot) slot = std::make_shared<SeriesPoints>();
+                (*slot)[point.point.timestamp_ms] = point;
+            }
+            return;
+        }
         auto next = std::make_shared<ShardData>(*shards[shard_id]);
         for (const auto& point : fragment.points) {
             auto& slot = next->series[point.point.series_id];
