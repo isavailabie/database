@@ -54,22 +54,15 @@ db/wal/
 ### 3.2 Commit WAL
 
 ```
-[magic u32][type u8][segment_id u64][batch_txn_count u32]
-[ (txn u64, version u64, fragment_count u16,
-   [ (shard u8, segment_id u64, start_offset u64, end_offset u64) × fragment_count ]
-  ) × batch_txn_count ]
-[ (cutoff u64) 仅 kExpireBatch 使用 ]
-[crc u64]
+kCommitRange 记录:  [magic u32][type u8][segment_id u64][first_version u64][last_version u64][crc u64]
+kExpireRecord 记录: [magic u32][type u8][segment_id u64][version u64][cutoff u64][crc u64]
 ```
 
-| type | 含义 |
-| --- | --- |
-| `kCommitBatch` | 一组事务的提交决策，**一次 fsync 覆盖多个 txn**（组提交） |
-| `kExpireBatch` | 全局过期边界推进，带 version |
-
-> 关键修订（意见 1）：提交决策里保存的是**每个 fragment 的精确位置**
-> `(shard, segment, start_offset, end_offset)`，恢复时按 `txn_id` 精确匹配，
-> **不再用偏移大小推断是否提交**。
+> 实现说明（v1）：提交决策记录的是**版本区间**而不是逐 fragment 的 `(segment,start,end)`。
+> 因为 §1.1 保证同一时刻只有一个事务组在途、组内版本连续，所以"记录 version 落在某个
+> 已提交区间内"与"按 txn 精确匹配"等价，恢复不做任何偏移推断。
+> 逐 fragment 的精确坐标留到需要**子段截断/精确回收**时再引入（当前回收以整段为单位，
+> 见 §8），届时 Commit 记录升版本号，旧库按 §9 的格式标记拒绝混用。
 
 ## 4. 事务状态机与版本
 

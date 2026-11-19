@@ -1,6 +1,8 @@
-*.a
-*.o
-*.tmp
-/build-*/n/bench-results/n/doc/*.bakn
 /build/
+/build-*/
 /cmake-build-*/
+/bench-results/
+*.o
+*.a
+*.tmp
+/doc/*.bak

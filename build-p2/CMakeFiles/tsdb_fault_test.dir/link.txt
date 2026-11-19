@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/tsdb_fault_test.dir/tests/fault_injection.cpp.o -o tsdb_fault_test  libtsdb.a 

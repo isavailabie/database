@@ -432,8 +432,51 @@ void TestSstableChecksum(const std::filesystem::path& path) {
     assert(engine == nullptr);
 }
 
-// A cursor keeps its own read view, so it must remain valid (and closeable)
-// after the Engine that produced it has been destroyed.
+// Exercises the optional per-shard WAL path: a cross-shard batch, an expire
+// record, a clean reopen and a crash-recovery reopen.
+void TestShardedWal(const std::filesystem::path& path) {
+    const auto options = Options{.shard_count = 4,
+                                 .memtable_max_points = 1000,
+                                 .sharded_wal = true};
+    {
+        Status status;
+        auto engine = Engine::Open(path, options, &status);
+        AssertOk(status);
+        AssertOk(engine->WriteBatch({{1, 100, 1.0}, {2, 200, 2.0}, {3, 300, 3.0}}));
+        AssertOk(engine->ExpireBefore(150));
+        AssertOk(engine->Close());
+    }
+    {
+        Status status;
+        auto engine = Engine::Open(path, options, &status);
+        AssertOk(status);
+        std::unique_ptr<Cursor> cursor;
+        AssertOk(engine->Scan({1, 2, 3}, 0, 1000, &cursor));
+        assert(Read(cursor.get()).size() == 2);
+        AssertOk(engine->Close());
+    }
+
+    const pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        Status status;
+        auto engine = Engine::Open(path, options, &status);
+        if (!status.ok) _exit(2);
+        if (!engine->Put({7, 400, 4.0}).ok) _exit(3);
+        _exit(0);
+    }
+    int child_status = 0;
+    waitpid(pid, &child_status, 0);
+    assert(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
+
+    Status status;
+    auto engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({7}, 0, 1000, &cursor));
+    assert(Read(cursor.get()).size() == 1);
+    AssertOk(engine->Close());
+}
 void TestCursorOutlivesEngine(const std::filesystem::path& path) {
     std::unique_ptr<Cursor> cursor;
     {
@@ -627,6 +670,7 @@ int main(int argc, char** argv) {
         {"concurrent_compaction_stress", [&] { TestConcurrentCompactionStress(root / "concurrent_compaction_stress"); }},
         {"sstable_checksum", [&] { TestSstableChecksum(root / "checksum"); }},
         {"cursor_outlives_engine", [&] { TestCursorOutlivesEngine(root / "cursor_lifetime"); }},
+        {"sharded_wal", [&] { TestShardedWal(root / "sharded_wal"); }},
     };
     const std::string filter = argc > 1 ? argv[1] : std::string();
     size_t ran = 0;

@@ -56,6 +56,7 @@ struct SstableMetadata {
 constexpr uint32_t kWalMagic = 0x54534442;
 constexpr uint8_t kTxnRecord = 1;
 constexpr uint8_t kExpireRecord = 2;
+constexpr uint8_t kCommitRangeRecord = 3;
 constexpr uint64_t kDiskPageRecords = 128;
 constexpr uint32_t kEncodedSstableMagic = 0x53535445;
 constexpr uint32_t kEncodedWalPayloadMagic = 0x57564c45;
@@ -153,6 +154,33 @@ std::filesystem::path WalSegmentPath(const std::filesystem::path& dir,
     std::snprintf(name, sizeof(name), "%06llu.log",
                   static_cast<unsigned long long>(number));
     return dir / name;
+}
+
+std::vector<uint64_t> ListSegmentNumbers(const std::filesystem::path& dir) {
+    std::vector<uint64_t> segments;
+    std::error_code ec;
+    if (!std::filesystem::exists(dir, ec)) return segments;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().extension() != ".log") continue;
+        const std::string stem = entry.path().stem().string();
+        if (stem.empty()) continue;
+        bool digits = true;
+        for (const char c : stem) {
+            if (std::isdigit(static_cast<unsigned char>(c)) == 0) {
+                digits = false;
+                break;
+            }
+        }
+        if (!digits) continue;
+        try {
+            segments.push_back(std::stoull(stem));
+        } catch (...) {
+            continue;
+        }
+    }
+    std::sort(segments.begin(), segments.end());
+    return segments;
 }
 
 // Best-effort rollback of a partially written WAL record. A failure here is not
@@ -563,6 +591,17 @@ struct Engine::Impl {
     Options options;
     std::filesystem::path wal_dir;
     uint64_t wal_segment{1};
+    // Sharded WAL state (Options::sharded_wal). Each shard appends to its own
+    // log; a separate commit log records which versions are durable.
+    bool sharded_wal{false};
+    std::filesystem::path shard_wal_dir;
+    std::filesystem::path commit_wal_dir;
+    std::vector<int> shard_wal_fd;
+    int commit_wal_fd{-1};
+    std::vector<uint64_t> shard_wal_segment;
+    uint64_t commit_wal_segment{1};
+    std::vector<std::pair<CommitVersion, CommitVersion>> committed_ranges;
+    uint32_t wal_format{1};
     std::filesystem::path manifest_path;
     mutable std::mutex mutex;
     std::condition_variable flush_cv;
@@ -985,6 +1024,8 @@ struct Engine::Impl {
             manifest_text += std::to_string(cutoff) + " " +
                              std::to_string(next_version) + " " +
                              std::to_string(next_file_number) + "\n";
+            manifest_text +=
+                std::string("WAL_FORMAT ") + (sharded_wal ? "2" : "1") + "\n";
             for (size_t shard_id = 0;
                  shard_id < covered_commit_versions.size(); ++shard_id) {
                 manifest_text += "COVERED " + std::to_string(shard_id) + " " +
@@ -1165,6 +1206,14 @@ struct Engine::Impl {
             }
             if (checksum_seen) return Status::Error("data after Manifest checksum");
             manifest_payload += line + "\n";
+            if (line.rfind("WAL_FORMAT ", 0) == 0) {
+                std::istringstream format_line(line);
+                std::string label;
+                uint32_t format = 1;
+                format_line >> label >> format;
+                wal_format = format;
+                continue;
+            }
             if (line.rfind("COVERED ", 0) == 0) {
                 size_t shard_id_line = 0;
                 CommitVersion covered = 0;
@@ -1262,31 +1311,7 @@ struct Engine::Impl {
     }
 
     std::vector<uint64_t> ListWalSegments() const {
-        std::vector<uint64_t> segments;
-        std::error_code ec;
-        if (!std::filesystem::exists(wal_dir, ec)) return segments;
-        for (const auto& entry :
-             std::filesystem::directory_iterator(wal_dir, ec)) {
-            if (!entry.is_regular_file()) continue;
-            if (entry.path().extension() != ".log") continue;
-            const std::string stem = entry.path().stem().string();
-            if (stem.empty()) continue;
-            bool digits = true;
-            for (const char c : stem) {
-                if (std::isdigit(static_cast<unsigned char>(c)) == 0) {
-                    digits = false;
-                    break;
-                }
-            }
-            if (!digits) continue;
-            try {
-                segments.push_back(std::stoull(stem));
-            } catch (...) {
-                continue;
-            }
-        }
-        std::sort(segments.begin(), segments.end());
-        return segments;
+        return ListSegmentNumbers(wal_dir);
     }
 
     // Replays complete records only. A torn tail (crash between the write and
@@ -1377,6 +1402,250 @@ struct Engine::Impl {
         }
         return synced;
     }
+
+    // ---- sharded WAL -------------------------------------------------------
+
+    std::filesystem::path ShardWalDir(size_t shard_id) const {
+        return shard_wal_dir / ("shard-" + std::to_string(shard_id));
+    }
+
+    bool ContainsCommitted(CommitVersion version) const {
+        for (const auto& range : committed_ranges) {
+            if (version >= range.first && version <= range.second) return true;
+        }
+        return false;
+    }
+
+    // Appends every request's points to the WAL of the shard they belong to,
+    // fsyncs each touched shard once, then records one commit range covering
+    // all versions of the group.
+    bool AppendGroupSharded(
+        const std::vector<std::shared_ptr<PendingWrite>>& group,
+        CommitVersion first_version) {
+        std::vector<std::vector<const PendingWrite*>> per_shard(shards.size());
+        for (const auto& request : group) {
+            std::set<size_t> touched;
+            for (const auto& point : request->points) {
+                touched.insert(ShardFor(point.series_id));
+            }
+            for (const size_t shard_id : touched) {
+                per_shard[shard_id].push_back(request.get());
+            }
+        }
+        bool ok = true;
+        for (size_t shard_id = 0; shard_id < per_shard.size() && ok; ++shard_id) {
+            if (per_shard[shard_id].empty()) continue;
+            for (const PendingWrite* request : per_shard[shard_id]) {
+                std::vector<DataPoint> points;
+                for (const auto& point : request->points) {
+                    if (ShardFor(point.series_id) == shard_id) points.push_back(point);
+                }
+                if (!AppendWalRecordNoSync(shard_wal_fd[shard_id], kTxnRecord,
+                                           WalPayloadTxn(request->version, points))) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) ok = ::fsync(shard_wal_fd[shard_id]) == 0;
+            if (ok) ++wal_syncs;
+        }
+        if (!ok) return false;
+        std::string payload;
+        Append(payload, first_version);
+        Append(payload, next_version - 1);
+        if (!AppendWalRecordNoSync(commit_wal_fd, kCommitRangeRecord, payload)) {
+            return false;
+        }
+        if (::fsync(commit_wal_fd) != 0) return false;
+        ++wal_syncs;
+        return true;
+    }
+
+    Status ReplayCommitWal() {
+        const auto segments = ListSegmentNumbers(commit_wal_dir);
+        if (segments.empty()) return Status::Ok();
+        for (size_t i = 0; i < segments.size(); ++i) {
+            const auto path = WalSegmentPath(commit_wal_dir, segments[i]);
+            std::string data;
+            if (!ReadFile(path, &data)) return Status::Error("cannot read commit WAL");
+            size_t offset = 0;
+            size_t valid = 0;
+            while (offset < data.size()) {
+                uint32_t magic = 0;
+                uint8_t type = 0;
+                uint64_t length = 0;
+                uint64_t checksum = 0;
+                if (!Read(data, offset, &magic) || !Read(data, offset, &type) ||
+                    !Read(data, offset, &length)) {
+                    break;
+                }
+                if (magic != kWalMagic) break;
+                if (length > data.size() - offset ||
+                    offset + sizeof(checksum) + length > data.size()) {
+                    break;
+                }
+                if (!Read(data, offset, &checksum)) break;
+                std::string payload = data.substr(offset, length);
+                offset += length;
+                if (checksum != Checksum(payload)) break;
+                size_t payload_offset = 0;
+                if (type == kCommitRangeRecord) {
+                    CommitVersion first = 0;
+                    CommitVersion last = 0;
+                    if (!Read(payload, payload_offset, &first) ||
+                        !Read(payload, payload_offset, &last)) {
+                        break;
+                    }
+                    committed_ranges.emplace_back(first, last);
+                } else if (type == kExpireRecord) {
+                    CommitVersion version = 0;
+                    if (!Read(payload, payload_offset, &version) ||
+                        !Read(payload, payload_offset, &cutoff)) {
+                        break;
+                    }
+                    next_version = std::max(next_version, version + 1);
+                } else {
+                    break;
+                }
+                valid = offset;
+            }
+            const bool last = (i + 1 == segments.size());
+            if (last) {
+                std::error_code ec;
+                const auto size = std::filesystem::file_size(path, ec);
+                if (!ec && size > valid) {
+                    (void)::truncate(path.c_str(), static_cast<off_t>(valid));
+                }
+                commit_wal_segment = segments[i];
+            } else if (valid != data.size()) {
+                return Status::Error("corrupt commit WAL segment");
+            }
+        }
+        return Status::Ok();
+    }
+
+    Status ReplayShardWal(size_t shard_id) {
+        const auto dir = ShardWalDir(shard_id);
+        const auto segments = ListSegmentNumbers(dir);
+        if (segments.empty()) {
+            shard_wal_segment[shard_id] = 1;
+            return Status::Ok();
+        }
+        for (size_t i = 0; i < segments.size(); ++i) {
+            const auto path = WalSegmentPath(dir, segments[i]);
+            std::string data;
+            if (!ReadFile(path, &data)) return Status::Error("cannot read shard WAL");
+            size_t offset = 0;
+            size_t valid = 0;
+            while (offset < data.size()) {
+                uint32_t magic = 0;
+                uint8_t type = 0;
+                uint64_t length = 0;
+                uint64_t checksum = 0;
+                if (!Read(data, offset, &magic) || !Read(data, offset, &type) ||
+                    !Read(data, offset, &length)) {
+                    break;
+                }
+                if (magic != kWalMagic) break;
+                if (length > data.size() - offset ||
+                    offset + sizeof(checksum) + length > data.size()) {
+                    break;
+                }
+                if (!Read(data, offset, &checksum)) break;
+                std::string payload = data.substr(offset, length);
+                offset += length;
+                if (checksum != Checksum(payload)) break;
+                size_t payload_offset = 0;
+                uint32_t payload_magic = 0;
+                CommitVersion version = 0;
+                if (type != kTxnRecord) break;
+                if (!Read(payload, payload_offset, &payload_magic) ||
+                    payload_magic != kEncodedWalPayloadMagic ||
+                    !Read(payload, payload_offset, &version)) {
+                    break;
+                }
+                next_version = std::max(next_version, version + 1);
+                // Only committed versions are replayed; uncommitted fragments
+                // stay in the log but are skipped.
+                if (ContainsCommitted(version)) {
+                    if (!ApplyWalTxn(payload, &version)) break;
+                }
+                valid = offset;
+            }
+            const bool last = (i + 1 == segments.size());
+            if (last) {
+                std::error_code ec;
+                const auto size = std::filesystem::file_size(path, ec);
+                if (!ec && size > valid) {
+                    (void)::truncate(path.c_str(), static_cast<off_t>(valid));
+                }
+            } else if (valid != data.size()) {
+                return Status::Error("corrupt shard WAL segment");
+            }
+            shard_wal_segment[shard_id] = segments[i];
+        }
+        return Status::Ok();
+    }
+
+    Status ReplayShardedWal() {
+        auto status = ReplayCommitWal();
+        if (!status.ok) return status;
+        for (size_t i = 0; i < shards.size(); ++i) {
+            status = ReplayShardWal(i);
+            if (!status.ok) return status;
+        }
+        return Status::Ok();
+    }
+
+    bool OpenShardedWalFds() {
+        for (size_t i = 0; i < shards.size(); ++i) {
+            const auto dir = ShardWalDir(i);
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            if (ec) return false;
+            const auto path = WalSegmentPath(dir, shard_wal_segment[i]);
+            shard_wal_fd[i] = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (shard_wal_fd[i] < 0) return false;
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(commit_wal_dir, ec);
+        if (ec) return false;
+        const auto path = WalSegmentPath(commit_wal_dir, commit_wal_segment);
+        commit_wal_fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+        return commit_wal_fd >= 0;
+    }
+
+    // Called by a flush while holding the lock and after the manifest covered
+    // every record written so far.
+    bool RotateShardedWalLocked() {
+        auto rotate = [](const std::filesystem::path& dir, uint64_t* segment,
+                         int* fd) {
+            const uint64_t next = *segment + 1;
+            const auto path = WalSegmentPath(dir, next);
+            const int new_fd =
+                ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
+            if (new_fd < 0) return false;
+            if (::fsync(new_fd) != 0) {
+                ::close(new_fd);
+                return false;
+            }
+            if (*fd >= 0) ::close(*fd);
+            *fd = new_fd;
+            *segment = next;
+            for (const uint64_t number : ListSegmentNumbers(dir)) {
+                if (number >= *segment) continue;
+                std::error_code ec;
+                std::filesystem::remove(WalSegmentPath(dir, number), ec);
+            }
+            return true;
+        };
+        for (size_t i = 0; i < shards.size(); ++i) {
+            if (!rotate(ShardWalDir(i), &shard_wal_segment[i], &shard_wal_fd[i])) {
+                return false;
+            }
+        }
+        return rotate(commit_wal_dir, &commit_wal_segment, &commit_wal_fd);
+    }
 };
 
 Engine::Engine(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {
@@ -1416,22 +1685,29 @@ Engine::Engine(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {
             }
 
             bool ok = true;
-            off_t wal_record_start = ::lseek(impl_->wal_fd, 0, SEEK_END);
             for (const auto& request : group) {
                 request->version = impl_->next_version++;
-                request->wal_start = ::lseek(impl_->wal_fd, 0, SEEK_END);
-                if (!AppendWalRecordNoSync(
-                        impl_->wal_fd, kTxnRecord,
-                        WalPayloadTxn(request->version, request->points))) {
-                    ok = false;
-                    break;
-                }
-                request->wal_end = ::lseek(impl_->wal_fd, 0, SEEK_END);
             }
-            if (ok) ok = ::fsync(impl_->wal_fd) == 0;
-            if (ok) ++impl_->wal_syncs;
-            if (!ok && wal_record_start >= 0) {
-                TruncateWalBestEffort(impl_->wal_fd, wal_record_start);
+            const CommitVersion first_version = group.front()->version;
+            if (impl_->sharded_wal) {
+                ok = impl_->AppendGroupSharded(group, first_version);
+            } else {
+                off_t wal_record_start = ::lseek(impl_->wal_fd, 0, SEEK_END);
+                for (const auto& request : group) {
+                    request->wal_start = ::lseek(impl_->wal_fd, 0, SEEK_END);
+                    if (!AppendWalRecordNoSync(
+                            impl_->wal_fd, kTxnRecord,
+                            WalPayloadTxn(request->version, request->points))) {
+                        ok = false;
+                        break;
+                    }
+                    request->wal_end = ::lseek(impl_->wal_fd, 0, SEEK_END);
+                }
+                if (ok) ok = ::fsync(impl_->wal_fd) == 0;
+                if (ok) ++impl_->wal_syncs;
+                if (!ok && wal_record_start >= 0) {
+                    TruncateWalBestEffort(impl_->wal_fd, wal_record_start);
+                }
             }
             if (ok) {
                 // Hand the batch to the shard workers and wait for every shard
@@ -1566,6 +1842,9 @@ std::unique_ptr<Engine> Engine::Open(const std::filesystem::path& path,
     impl->manifest_path = path / "MANIFEST";
     std::filesystem::create_directories(impl->wal_dir, ec);
     if (ec) return fail(Status::Error("cannot create WAL directory"));
+    impl->sharded_wal = options.sharded_wal;
+    impl->shard_wal_dir = impl->wal_dir;
+    impl->commit_wal_dir = impl->wal_dir / "commit";
     impl->shards.resize(options.shard_count);
     for (auto& shard : impl->shards) shard = std::make_shared<ShardData>();
     impl->shard_mutex.resize(options.shard_count);
@@ -1579,6 +1858,22 @@ std::unique_ptr<Engine> Engine::Open(const std::filesystem::path& path,
     impl->covered_commit_versions.assign(options.shard_count, 0);
     auto load_status = impl->LoadManifest();
     if (!load_status.ok) return fail(load_status);
+    if (std::filesystem::exists(impl->manifest_path) &&
+        impl->wal_format != (options.sharded_wal ? 2u : 1u)) {
+        return fail(Status::Error("WAL format mismatch"));
+    }
+    if (options.sharded_wal) {
+        impl->shard_wal_fd.assign(options.shard_count, -1);
+        impl->shard_wal_segment.assign(options.shard_count, 1);
+        load_status = impl->ReplayShardedWal();
+        if (!load_status.ok) return fail(load_status);
+        if (!impl->OpenShardedWalFds()) {
+            return fail(Status::Error("cannot open shard WAL"));
+        }
+        impl->visible_version = impl->next_version - 1;
+        if (status) *status = Status::Ok();
+        return std::unique_ptr<Engine>(new Engine(std::move(impl)));
+    }
     load_status = impl->ReplayWal();
     if (!load_status.ok) return fail(load_status);
     impl->visible_version = impl->next_version - 1;
@@ -1949,7 +2244,9 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
         return impl_->write_queue.empty();
     });
     const CommitVersion commit = impl_->next_version++;
-    if (!AppendWalRecord(impl_->wal_fd, kExpireRecord,
+    const int expire_fd =
+        impl_->sharded_wal ? impl_->commit_wal_fd : impl_->wal_fd;
+    if (!AppendWalRecord(expire_fd, kExpireRecord,
                          WalPayloadExpire(commit, cutoff))) {
         --impl_->next_version;
         return Status::Error("WAL sync failed");
@@ -2109,7 +2406,11 @@ Status Engine::FlushLocked(bool incremental) {
     // Best effort, and only after the in-memory state above is committed: the
     // manifest already covers every record written so far, so a failed rotation
     // just leaves a stale segment to be replayed (and dropped by the next one).
-    (void)impl_->RotateWalLocked();
+    if (impl_->sharded_wal) {
+        (void)impl_->RotateShardedWalLocked();
+    } else {
+        (void)impl_->RotateWalLocked();
+    }
     return Status::Ok();
 }
 
@@ -2209,6 +2510,16 @@ Status Engine::Close() {
         ::close(impl_->wal_fd);
         impl_->wal_fd = -1;
     }
+    for (int& fd : impl_->shard_wal_fd) {
+        if (fd >= 0) {
+            ::close(fd);
+            fd = -1;
+        }
+    }
+    if (impl_->commit_wal_fd >= 0) {
+        ::close(impl_->commit_wal_fd);
+        impl_->commit_wal_fd = -1;
+    }
     impl_->closing = false;
     impl_->close_cv.notify_all();
     return Status::Ok();
@@ -2226,11 +2537,21 @@ Status Engine::GetStats(EngineStats* stats) const {
     }
     stats->immutable_points = 0;
     uint64_t wal_bytes = 0;
-    for (const uint64_t number : impl_->ListWalSegments()) {
-        std::error_code ec;
-        const auto size = std::filesystem::file_size(
-            WalSegmentPath(impl_->wal_dir, number), ec);
-        if (!ec) wal_bytes += static_cast<uint64_t>(size);
+    auto add_dir_bytes = [&wal_bytes](const std::filesystem::path& dir) {
+        for (const uint64_t number : ListSegmentNumbers(dir)) {
+            std::error_code ec;
+            const auto size = std::filesystem::file_size(
+                WalSegmentPath(dir, number), ec);
+            if (!ec) wal_bytes += static_cast<uint64_t>(size);
+        }
+    };
+    if (impl_->sharded_wal) {
+        for (size_t i = 0; i < impl_->shards.size(); ++i) {
+            add_dir_bytes(impl_->ShardWalDir(i));
+        }
+        add_dir_bytes(impl_->commit_wal_dir);
+    } else {
+        add_dir_bytes(impl_->wal_dir);
     }
     stats->wal_bytes = wal_bytes;
     stats->wal_bytes_replayed = impl_->wal_bytes_replayed;

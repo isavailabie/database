@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/tsdb_bench.dir/benchmarks/ingest.cpp.o -o tsdb_bench  libtsdb.a 
