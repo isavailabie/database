@@ -2,7 +2,7 @@
 // left behind by `tsdb_bench N --crash`) and measures how long it takes to
 // become serviceable, reporting the WAL that had to be replayed.
 //
-//   tsdb_recover <db-path> [--csv FILE]
+//   tsdb_recover <db-path> [--wal-dir DIR] [--csv FILE] [--sharded-wal]
 //
 // The open is timed separately from the first probe scan so that the recovery
 // budget can be judged against the 60 s requirement.
@@ -23,11 +23,14 @@ int main(int argc, char** argv) {
     }
     const std::filesystem::path path = argv[1];
     std::string csv;
+    std::filesystem::path wal_dir;
     bool sharded_wal = false;
     for (int index = 2; index < argc; ++index) {
         const std::string flag = argv[index];
         if (flag == "--csv" && index + 1 < argc) {
             csv = argv[++index];
+        } else if (flag == "--wal-dir" && index + 1 < argc) {
+            wal_dir = argv[++index];
         } else if (flag == "--sharded-wal") {
             sharded_wal = true;
         } else {
@@ -35,12 +38,14 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    const std::filesystem::path effective_wal_dir =
+        wal_dir.empty() ? (path / "wal") : wal_dir;
 
     uint64_t wal_bytes = 0;
     {
         std::error_code ec;
         for (const auto& entry :
-             std::filesystem::directory_iterator(path / "wal", ec)) {
+             std::filesystem::directory_iterator(effective_wal_dir, ec)) {
             if (!entry.is_regular_file()) continue;
             std::error_code size_ec;
             const auto size =
@@ -52,7 +57,7 @@ int main(int argc, char** argv) {
     const auto started = bench::Clock::now();
     tsdb::Status status;
     auto engine = tsdb::Engine::Open(
-        path, tsdb::Options{.shard_count = 4, .memtable_max_points = 100000, .sharded_wal = sharded_wal},
+        path, tsdb::Options{.shard_count = 4, .memtable_max_points = 100000, .wal_dir = wal_dir, .sharded_wal = sharded_wal},
         &status);
     if (!status.ok || !engine) {
         std::cerr << "open failed: " << status.message << '\n';

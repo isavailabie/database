@@ -477,6 +477,63 @@ void TestShardedWal(const std::filesystem::path& path) {
     assert(Read(cursor.get()).size() == 1);
     AssertOk(engine->Close());
 }
+void TestWalOnSeparateDir(const std::filesystem::path& path) {
+    const auto wal_dir = path / "wal-separate";
+    const Options options{.shard_count = 4,
+                          .memtable_max_points = 1000000,
+                          .wal_dir = wal_dir};
+    // Crash (no Close) so the WAL on the separate directory must be replayed.
+    const pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        Status status;
+        auto engine = Engine::Open(path, options, &status);
+        if (!status.ok) _exit(2);
+        if (!engine->WriteBatch({{7, 100, 1.0}, {7, 200, 2.0}}).ok) _exit(3);
+        _exit(0);
+    }
+    int child_status = 0;
+    waitpid(pid, &child_status, 0);
+    assert(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
+    assert(std::filesystem::exists(wal_dir));
+
+    // Reopen with the same WAL directory: records are replayed from it.
+    Status status;
+    auto engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({7}, 0, 1000, &cursor));
+    assert(Read(cursor.get()).size() == 2);
+    // Flush records the WAL directory in the manifest.
+    AssertOk(engine->Close());
+
+    // A different WAL directory would orphan unflushed records: refuse to open.
+    auto wrong = Engine::Open(
+        path,
+        Options{.shard_count = 4, .memtable_max_points = 1000000,
+                .wal_dir = path / "wal-other"},
+        &status);
+    assert(wrong == nullptr);
+    assert(!status.ok);
+
+    // The sharded (concurrent) WAL honours the same override.
+    const auto sharded_dir = path / "wal-sharded";
+    const auto sharded_path = path / "sharded-db";
+    {
+        Status sharded_status;
+        auto sharded = Engine::Open(
+            sharded_path,
+            Options{.shard_count = 4, .memtable_max_points = 1000000,
+                    .wal_dir = sharded_dir, .sharded_wal = true},
+            &sharded_status);
+        AssertOk(sharded_status);
+        AssertOk(sharded->Put({9, 100, 1.0}));
+        AssertOk(sharded->Close());
+    }
+    assert(std::filesystem::exists(sharded_dir / "shard-0"));
+    assert(std::filesystem::exists(sharded_dir / "commit"));
+}
+
 void TestCursorOutlivesEngine(const std::filesystem::path& path) {
     std::unique_ptr<Cursor> cursor;
     {
@@ -709,6 +766,7 @@ int main(int argc, char** argv) {
         {"sstable_checksum", [&] { TestSstableChecksum(root / "checksum"); }},
         {"cursor_outlives_engine", [&] { TestCursorOutlivesEngine(root / "cursor_lifetime"); }},
         {"sharded_wal", [&] { TestShardedWal(root / "sharded_wal"); }},
+        {"wal_separate_dir", [&] { TestWalOnSeparateDir(root / "wal_separate"); }},
     };
     const std::string filter = argc > 1 ? argv[1] : std::string();
     size_t ran = 0;

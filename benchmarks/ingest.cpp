@@ -3,7 +3,8 @@
 // on-disk size, final flush cost and recovery time.
 //
 //   tsdb_bench [points] [--series N] [--hot-series N] [--hot-fraction F]
-//              [--path DIR] [--csv FILE] [--keep] [--crash] [--compact]
+//              [--path DIR] [--wal-dir DIR] [--csv FILE] [--keep] [--crash]
+//              [--compact] [--sharded-wal]
 //
 // --crash writes the points and exits without flushing, so the next
 // `tsdb_recover DIR` measures a real crash recovery including WAL replay.
@@ -29,6 +30,7 @@ struct Args {
     uint64_t hot_series{0};
     double hot_fraction{0.0};
     std::filesystem::path path;
+    std::filesystem::path wal_dir;
     std::string csv;
     bool keep{false};
     bool crash{false};
@@ -62,6 +64,8 @@ Args ParseArgs(int argc, char** argv) {
             args.hot_fraction = std::stod(value(&index));
         } else if (flag == "--path") {
             args.path = value(&index);
+        } else if (flag == "--wal-dir") {
+            args.wal_dir = value(&index);
         } else if (flag == "--csv") {
             args.csv = value(&index);
         } else if (flag == "--keep") {
@@ -99,7 +103,7 @@ int main(int argc, char** argv) {
 
     tsdb::Status status;
     auto engine = tsdb::Engine::Open(
-        args.path, tsdb::Options{.shard_count = 4, .memtable_max_points = 100000, .sharded_wal = args.sharded_wal},
+        args.path, tsdb::Options{.shard_count = 4, .memtable_max_points = 100000, .wal_dir = args.wal_dir, .sharded_wal = args.sharded_wal},
         &status);
     if (!status.ok || !engine) {
         std::cerr << status.message << '\n';
@@ -193,7 +197,7 @@ int main(int argc, char** argv) {
     const auto recovery_started = bench::Clock::now();
     status = tsdb::Status::Ok();
     auto reopened = tsdb::Engine::Open(
-        args.path, tsdb::Options{.shard_count = 4, .memtable_max_points = 100000, .sharded_wal = args.sharded_wal},
+        args.path, tsdb::Options{.shard_count = 4, .memtable_max_points = 100000, .wal_dir = args.wal_dir, .sharded_wal = args.sharded_wal},
         &status);
     if (!status.ok || !reopened) {
         std::cerr << "recovery failed: " << status.message << '\n';

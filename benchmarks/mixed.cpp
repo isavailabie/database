@@ -5,7 +5,7 @@
 //
 //   tsdb_mixed_bench [seconds] [--writers N] [--readers N]
 //                    [--series-per-writer N] [--hot] [--path DIR]
-//                    [--csv FILE] [--keep]
+//                    [--wal-dir DIR] [--csv FILE] [--keep] [--sharded-wal]
 //
 // --keep runs against an existing database produced by an earlier import (the
 // writers offset their timestamps past the imported range).
@@ -33,6 +33,7 @@ struct Args {
     size_t readers{16};
     uint64_t series_per_writer{100};
     std::filesystem::path path;
+    std::filesystem::path wal_dir;
     std::string csv;
     bool keep{false};
     bool sharded_wal{false};
@@ -66,6 +67,8 @@ Args ParseArgs(int argc, char** argv) {
             args.series_per_writer = 2;
         } else if (flag == "--path") {
             args.path = value(&index);
+        } else if (flag == "--wal-dir") {
+            args.wal_dir = value(&index);
         } else if (flag == "--csv") {
             args.csv = value(&index);
         } else if (flag == "--keep") {
@@ -95,7 +98,7 @@ int main(int argc, char** argv) {
 
     tsdb::Status status;
     auto engine = tsdb::Engine::Open(
-        args.path, tsdb::Options{.shard_count = 4, .memtable_max_points = 100000, .sharded_wal = args.sharded_wal},
+        args.path, tsdb::Options{.shard_count = 4, .memtable_max_points = 100000, .wal_dir = args.wal_dir, .sharded_wal = args.sharded_wal},
         &status);
     if (!status.ok || !engine) {
         std::cerr << status.message << '\n';

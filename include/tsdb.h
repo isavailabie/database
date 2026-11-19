@@ -73,6 +73,9 @@ struct Options {
     uint64_t hot_series_point_limit{10000000};
     size_t compaction_sstable_threshold{8};
     bool enable_background_gc{true};
+    // Directory for WAL segments; empty means <db>/wal. Pointing it at a
+    // separate disk keeps WAL fsyncs from contending with SSTable I/O.
+    std::filesystem::path wal_dir;
     // Per-shard WAL + global commit log. Off by default: the single global WAL
     // stays the production path until the sharded protocol has been soaked.
     bool sharded_wal{false};

@@ -156,6 +156,15 @@ bool SyncFile(const std::filesystem::path& path) {
     return ok;
 }
 
+// Absolute, lexically-normalized path used to detect a changed WAL directory
+// between runs (changing it would orphan unflushed WAL segments).
+std::filesystem::path NormalizePath(const std::filesystem::path& path) {
+    std::error_code ec;
+    const auto absolute = std::filesystem::absolute(path, ec);
+    if (ec) return path.lexically_normal();
+    return absolute.lexically_normal();
+}
+
 // WAL segments live in db/wal/000001.log, 000002.log, ... and are replayed in
 // numeric order. Rotation lets a flush retire the segments it has already
 // covered instead of truncating one shared file.
@@ -1061,6 +1070,7 @@ struct Engine::Impl {
                              std::to_string(next_file_number) + "\n";
             manifest_text +=
                 std::string("WAL_FORMAT ") + (sharded_wal ? "2" : "1") + "\n";
+            manifest_text += "WAL_DIR " + NormalizePath(wal_dir).string() + "\n";
             for (size_t shard_id = 0;
                  shard_id < covered_commit_versions.size(); ++shard_id) {
                 manifest_text += "COVERED " + std::to_string(shard_id) + " " +
@@ -1270,6 +1280,16 @@ struct Engine::Impl {
                 uint32_t format = 1;
                 format_line >> label >> format;
                 wal_format = format;
+                continue;
+            }
+            if (line.rfind("WAL_DIR ", 0) == 0) {
+                // A different WAL directory would orphan unflushed segments,
+                // silently losing data, so refuse to open.
+                const std::string recorded = line.substr(8);
+                if (NormalizePath(recorded) != NormalizePath(wal_dir)) {
+                    return Status::Error(
+                        "WAL directory changed since last open");
+                }
                 continue;
             }
             if (line.rfind("COVERED ", 0) == 0) {
@@ -1912,7 +1932,9 @@ std::unique_ptr<Engine> Engine::Open(const std::filesystem::path& path,
         }
     }
     auto impl = std::make_shared<Impl>(path, options);
-    impl->wal_dir = path / "wal";
+    // WAL segments may live on a separate disk: Options::wal_dir overrides the
+    // default <db>/wal location.
+    impl->wal_dir = options.wal_dir.empty() ? (path / "wal") : options.wal_dir;
     impl->manifest_path = path / "MANIFEST";
     std::filesystem::create_directories(impl->wal_dir, ec);
     if (ec) return fail(Status::Error("cannot create WAL directory"));
