@@ -20,6 +20,7 @@
 #include <thread>
 #include <deque>
 #include <unordered_map>
+#include <unordered_set>
 
 #if defined(__linux__)
 #include <pthread.h>
@@ -644,14 +645,9 @@ struct Engine::Impl {
         memtable_bytes = 0;
     }
 
-    Status WriteMergedShard(size_t shard_id, size_t level,
-                            SstableWriter* writer) {
-        std::vector<std::shared_ptr<SstableMetadata>> sources;
-        for (const auto& sstable : sstable_metadata) {
-            if (sstable->shard_id == shard_id && sstable->level == level) {
-                sources.push_back(sstable);
-            }
-        }
+    Status WriteMergedShard(
+        const std::vector<std::shared_ptr<SstableMetadata>>& sources,
+        SstableWriter* writer) {
         std::set<uint64_t> series_ids;
         for (const auto& sstable : sources) {
             for (const auto& [series_id, _] : sstable->series) {
@@ -705,6 +701,130 @@ struct Engine::Impl {
         return false;
     }
 
+    struct CompactionJob {
+        size_t shard_id{};
+        size_t level{};
+        std::vector<std::shared_ptr<SstableMetadata>> sources;
+        std::filesystem::path file;
+        std::filesystem::path temp;
+    };
+
+    std::vector<CompactionJob> PlanCompactionLocked(size_t threshold) {
+        std::vector<CompactionJob> jobs;
+        const size_t kNoLevel = std::numeric_limits<size_t>::max();
+        std::vector<size_t> compact_level(shards.size(), kNoLevel);
+        for (size_t shard_id = 0; shard_id < shards.size(); ++shard_id) {
+            std::map<size_t, size_t> counts;
+            for (const auto& sstable : sstable_metadata) {
+                if (sstable->shard_id == shard_id) ++counts[sstable->level];
+            }
+            for (const auto& [level, count] : counts) {
+                if (count >= threshold) {
+                    compact_level[shard_id] = level;
+                    break;
+                }
+            }
+        }
+        for (size_t shard_id = 0; shard_id < shards.size(); ++shard_id) {
+            if (compact_level[shard_id] == kNoLevel) continue;
+            CompactionJob job;
+            job.shard_id = shard_id;
+            job.level = compact_level[shard_id];
+            for (const auto& sstable : sstable_metadata) {
+                if (sstable->shard_id == shard_id &&
+                    sstable->level == job.level) {
+                    job.sources.push_back(sstable);
+                    ++sstable->refs;
+                }
+            }
+            std::string filename = "shard-";
+            filename += shard_id < 10 ? "0" : "";
+            filename += std::to_string(shard_id);
+            filename += "-" + std::to_string(next_file_number) + ".sst";
+            job.file = root / "sst" / filename;
+            job.temp = job.file.string() + ".tmp";
+            ++next_file_number;
+            jobs.push_back(std::move(job));
+        }
+        return jobs;
+    }
+
+    Status MergeCompactionJob(const CompactionJob& job,
+                              std::shared_ptr<SstableMetadata>* out) {
+        SstableWriter writer;
+        if (!writer.Open(job.temp)) return Status::Error("cannot create SSTable");
+        auto status = WriteMergedShard(job.sources, &writer);
+        if (!status.ok) {
+            writer.Discard();
+            std::error_code ec;
+            std::filesystem::remove(job.temp, ec);
+            return status;
+        }
+        if (writer.count == 0) {
+            writer.Discard();
+            std::error_code ec;
+            std::filesystem::remove(job.temp, ec);
+            *out = nullptr;
+            return Status::Ok();
+        }
+        if (!writer.Finish()) {
+            std::error_code ec;
+            std::filesystem::remove(job.temp, ec);
+            return Status::Error("SSTable write failed");
+        }
+        if (!SyncFile(job.temp)) return Status::Error("SSTable sync failed");
+        std::error_code ec;
+        std::filesystem::rename(job.temp, job.file, ec);
+        if (ec) return Status::Error("SSTable publish failed");
+        if (!SyncDirectory(job.file.parent_path())) {
+            return Status::Error("SSTable directory sync failed");
+        }
+        auto metadata =
+            std::make_shared<SstableMetadata>(std::move(writer.metadata));
+        metadata->path = job.file;
+        metadata->shard_id = job.shard_id;
+        metadata->level = job.level + 1;
+        *out = std::move(metadata);
+        return Status::Ok();
+    }
+
+    Status PublishCompactionLocked(
+        const std::vector<CompactionJob>& jobs,
+        const std::vector<std::shared_ptr<SstableMetadata>>& published) {
+        for (const auto& job : jobs) {
+            for (const auto& source : job.sources) {
+                if (source->refs > 0) --source->refs;
+            }
+        }
+        std::unordered_set<const SstableMetadata*> source_ptrs;
+        for (const auto& job : jobs) {
+            for (const auto& source : job.sources) {
+                source_ptrs.insert(source.get());
+            }
+        }
+        std::vector<std::shared_ptr<SstableMetadata>> retained;
+        retained.reserve(sstable_metadata.size());
+        for (const auto& sstable : sstable_metadata) {
+            if (source_ptrs.count(sstable.get()) != 0) {
+                obsolete_sstables.push_back(sstable);
+            } else {
+                retained.push_back(sstable);
+            }
+        }
+        sstable_metadata = std::move(retained);
+        sstable_metadata.insert(sstable_metadata.end(), published.begin(),
+                                published.end());
+        current_files.clear();
+        current_files.reserve(sstable_metadata.size());
+        for (const auto& sstable : sstable_metadata) {
+            current_files.push_back(sstable->path);
+        }
+        auto status = PublishManifestLocked(current_files);
+        if (!status.ok) return status;
+        ++compaction_count;
+        return Status::Ok();
+    }
+
     Status GarbageCollectLocked() {
         bool deleted = false;
         std::vector<std::shared_ptr<SstableMetadata>> retained;
@@ -721,6 +841,55 @@ struct Engine::Impl {
         obsolete_sstables = std::move(retained);
         if (deleted && !SyncDirectory(root / "sst")) {
             return Status::Error("GC directory sync failed");
+        }
+        return Status::Ok();
+    }
+
+    Status PublishManifestLocked(
+        const std::vector<std::filesystem::path>& files) {
+        const auto manifest_tmp = manifest_path.string() + ".tmp";
+        {
+            std::ofstream manifest(manifest_tmp, std::ios::trunc);
+            if (!manifest) return Status::Error("cannot create Manifest");
+            std::string manifest_text;
+            manifest_text += std::to_string(cutoff) + " " +
+                             std::to_string(next_version) + " " +
+                             std::to_string(next_file_number) + "\n";
+            for (size_t shard_id = 0;
+                 shard_id < covered_commit_versions.size(); ++shard_id) {
+                manifest_text += "COVERED " + std::to_string(shard_id) + " " +
+                                 std::to_string(
+                                     covered_commit_versions[shard_id]) +
+                                 "\n";
+            }
+            for (size_t i = 0; i < files.size(); ++i) {
+                manifest_text +=
+                    std::to_string(i) + " " +
+                    std::filesystem::relative(files[i], root).string() + "\n";
+            }
+            manifest << manifest_text;
+            manifest << "CHECKSUM " << Checksum(manifest_text) << '\n';
+        }
+        if (!SyncFile(manifest_tmp)) return Status::Error("Manifest sync failed");
+        std::error_code ec;
+        std::filesystem::rename(manifest_tmp, manifest_path, ec);
+        if (ec) return Status::Error("Manifest publish failed");
+        if (!SyncDirectory(root)) {
+            return Status::Error("Manifest directory sync failed");
+        }
+        const auto current_tmp = root / "CURRENT.tmp";
+        {
+            std::ofstream current(current_tmp, std::ios::trunc);
+            if (!current) return Status::Error("cannot create CURRENT");
+            current << "MANIFEST\n";
+            current.close();
+        }
+        if (!SyncFile(current_tmp)) return Status::Error("CURRENT sync failed");
+        std::error_code current_ec;
+        std::filesystem::rename(current_tmp, root / "CURRENT", current_ec);
+        if (current_ec) return Status::Error("CURRENT publish failed");
+        if (!SyncDirectory(root)) {
+            return Status::Error("CURRENT directory sync failed");
         }
         return Status::Ok();
     }
@@ -1115,7 +1284,8 @@ Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
                 impl_->compaction_requested = false;
                 while (impl_->ShouldCompactLocked(
                     impl_->options.compaction_sstable_threshold)) {
-                    if (!CompactLocked(
+                    if (!CompactRoundLocked(
+                             lock,
                              impl_->options.compaction_sstable_threshold)
                              .ok) {
                         break;
@@ -1548,56 +1718,6 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
     return Status::Ok();
 }
 
-Status Engine::PublishManifestLocked(
-    const std::vector<std::filesystem::path>& files) {
-    const auto manifest_tmp = impl_->manifest_path.string() + ".tmp";
-    {
-        std::ofstream manifest(manifest_tmp, std::ios::trunc);
-        if (!manifest) return Status::Error("cannot create Manifest");
-        std::string manifest_text;
-        manifest_text += std::to_string(impl_->cutoff) + " " +
-                         std::to_string(impl_->next_version) + " " +
-                         std::to_string(impl_->next_file_number) + "\n";
-        for (size_t shard_id = 0;
-             shard_id < impl_->covered_commit_versions.size(); ++shard_id) {
-            manifest_text += "COVERED " + std::to_string(shard_id) + " " +
-                             std::to_string(
-                                 impl_->covered_commit_versions[shard_id]) +
-                             "\n";
-        }
-        for (size_t i = 0; i < files.size(); ++i) {
-            manifest_text += std::to_string(i) + " " +
-                             std::filesystem::relative(files[i], impl_->root)
-                                 .string() +
-                             "\n";
-        }
-        manifest << manifest_text;
-        manifest << "CHECKSUM " << Checksum(manifest_text) << '\n';
-    }
-    if (!SyncFile(manifest_tmp)) return Status::Error("Manifest sync failed");
-    std::error_code ec;
-    std::filesystem::rename(manifest_tmp, impl_->manifest_path, ec);
-    if (ec) return Status::Error("Manifest publish failed");
-    if (!SyncDirectory(impl_->root)) {
-        return Status::Error("Manifest directory sync failed");
-    }
-    const auto current_tmp = impl_->root / "CURRENT.tmp";
-    {
-        std::ofstream current(current_tmp, std::ios::trunc);
-        if (!current) return Status::Error("cannot create CURRENT");
-        current << "MANIFEST\n";
-        current.close();
-    }
-    if (!SyncFile(current_tmp)) return Status::Error("CURRENT sync failed");
-    std::error_code current_ec;
-    std::filesystem::rename(current_tmp, impl_->root / "CURRENT", current_ec);
-    if (current_ec) return Status::Error("CURRENT publish failed");
-    if (!SyncDirectory(impl_->root)) {
-        return Status::Error("CURRENT directory sync failed");
-    }
-    return Status::Ok();
-}
-
 Status Engine::FlushLocked(bool incremental) {
     (void)incremental;
     if (impl_->closed) return Status::Error("engine is closed");
@@ -1654,7 +1774,7 @@ Status Engine::FlushLocked(bool incremental) {
     impl_->metadata_covered_commit_version = impl_->next_version - 1;
     impl_->current_files.insert(impl_->current_files.end(),
                                 new_files.begin(), new_files.end());
-    auto status = PublishManifestLocked(impl_->current_files);
+    auto status = impl_->PublishManifestLocked(impl_->current_files);
     if (!status.ok) return status;
     if (::ftruncate(impl_->wal_fd, 0) != 0 ||
         ::fsync(impl_->wal_fd) != 0) {
@@ -1671,98 +1791,40 @@ Status Engine::FlushLocked(bool incremental) {
     return Status::Ok();
 }
 
-Status Engine::CompactLocked(size_t threshold) {
-    if (impl_->closed) return Status::Error("engine is closed");
-    const size_t kNoLevel = std::numeric_limits<size_t>::max();
-    std::vector<size_t> compact_level(impl_->shards.size(), kNoLevel);
-    for (size_t shard_id = 0; shard_id < impl_->shards.size(); ++shard_id) {
-        std::map<size_t, size_t> counts;
-        for (const auto& sstable : impl_->sstable_metadata) {
-            if (sstable->shard_id == shard_id) ++counts[sstable->level];
+Status Engine::CompactRoundLocked(std::unique_lock<std::mutex>& lock,
+                                  size_t threshold) {
+    auto jobs = impl_->PlanCompactionLocked(threshold);
+    if (jobs.empty()) return Status::Ok();
+    lock.unlock();
+    std::vector<std::shared_ptr<SstableMetadata>> published;
+    std::vector<std::filesystem::path> written_files;
+    Status merge_status = Status::Ok();
+    for (const auto& job : jobs) {
+        std::shared_ptr<SstableMetadata> out;
+        auto status = impl_->MergeCompactionJob(job, &out);
+        if (!status.ok) {
+            merge_status = status;
+            break;
         }
-        for (const auto& [level, count] : counts) {
-            if (count >= threshold) {
-                compact_level[shard_id] = level;
-                break;
+        if (out) {
+            published.push_back(out);
+            written_files.push_back(out->path);
+        }
+    }
+    lock.lock();
+    if (!merge_status.ok) {
+        for (const auto& file : written_files) {
+            std::error_code ec;
+            std::filesystem::remove(file, ec);
+        }
+        for (const auto& job : jobs) {
+            for (const auto& source : job.sources) {
+                if (source->refs > 0) --source->refs;
             }
         }
+        return merge_status;
     }
-
-    std::vector<std::filesystem::path> new_files;
-    std::vector<std::shared_ptr<SstableMetadata>> published_metadata;
-    for (size_t shard_id = 0; shard_id < impl_->shards.size(); ++shard_id) {
-        if (compact_level[shard_id] == kNoLevel) continue;
-        std::string filename = "shard-";
-        filename += shard_id < 10 ? "0" : "";
-        filename += std::to_string(shard_id);
-        filename += "-" + std::to_string(impl_->next_file_number) + ".sst";
-        const auto file = impl_->root / "sst" / filename;
-        const auto temp = file.string() + ".tmp";
-        SstableWriter writer;
-        if (!writer.Open(temp)) return Status::Error("cannot create SSTable");
-        auto status =
-            impl_->WriteMergedShard(shard_id, compact_level[shard_id], &writer);
-        if (!status.ok) {
-            writer.Discard();
-            std::error_code discard_ec;
-            std::filesystem::remove(temp, discard_ec);
-            return status;
-        }
-        if (writer.count == 0) {
-            writer.Discard();
-            std::error_code discard_ec;
-            std::filesystem::remove(temp, discard_ec);
-            continue;
-        }
-        if (!writer.Finish()) {
-            std::error_code discard_ec;
-            std::filesystem::remove(temp, discard_ec);
-            return Status::Error("SSTable write failed");
-        }
-        if (!SyncFile(temp)) return Status::Error("SSTable sync failed");
-        std::error_code ec;
-        std::filesystem::rename(temp, file, ec);
-        if (ec) return Status::Error("SSTable publish failed");
-        if (!SyncDirectory(file.parent_path())) {
-            return Status::Error("SSTable directory sync failed");
-        }
-        auto metadata =
-            std::make_shared<SstableMetadata>(std::move(writer.metadata));
-        metadata->path = file;
-        metadata->shard_id = shard_id;
-        metadata->level = compact_level[shard_id] + 1;
-        published_metadata.push_back(metadata);
-        new_files.push_back(file);
-        ++impl_->next_file_number;
-    }
-
-    // published_metadata may be empty when every point in the merged level is
-    // already expired; the obsolete loop below still reclaims those files.
-    std::vector<std::shared_ptr<SstableMetadata>> retained;
-    retained.reserve(impl_->sstable_metadata.size());
-    for (const auto& sstable : impl_->sstable_metadata) {
-        const size_t shard_id = sstable->shard_id;
-        if (shard_id < compact_level.size() &&
-            sstable->level == compact_level[shard_id]) {
-            impl_->obsolete_sstables.push_back(sstable);
-        } else {
-            retained.push_back(sstable);
-        }
-    }
-    impl_->sstable_metadata = std::move(retained);
-    impl_->sstable_metadata.insert(impl_->sstable_metadata.end(),
-                                   published_metadata.begin(),
-                                   published_metadata.end());
-
-    impl_->current_files.clear();
-    impl_->current_files.reserve(impl_->sstable_metadata.size());
-    for (const auto& sstable : impl_->sstable_metadata) {
-        impl_->current_files.push_back(sstable->path);
-    }
-    auto status = PublishManifestLocked(impl_->current_files);
-    if (!status.ok) return status;
-    ++impl_->compaction_count;
-    return Status::Ok();
+    return impl_->PublishCompactionLocked(jobs, published);
 }
 
 Status Engine::Flush() {
@@ -1771,10 +1833,10 @@ Status Engine::Flush() {
 }
 
 Status Engine::Compact() {
-    std::lock_guard lock(impl_->mutex);
+    std::unique_lock lock(impl_->mutex);
     if (impl_->closed) return Status::Error("engine is closed");
     while (impl_->ShouldCompactLocked(2)) {
-        auto status = CompactLocked(2);
+        auto status = CompactRoundLocked(lock, 2);
         if (!status.ok) return status;
     }
     return Status::Ok();

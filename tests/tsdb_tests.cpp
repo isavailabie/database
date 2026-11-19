@@ -1,5 +1,6 @@
 #include "tsdb.h"
 
+#include <atomic>
 #include <cassert>
 #include <filesystem>
 #include <fstream>
@@ -477,6 +478,45 @@ void TestCrashRecoveryExpire(const std::filesystem::path& path) {
     AssertOk(engine->Close());
 }
 
+void TestConcurrentCompactionStress(const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(path, Options{4, 5000}, &status);
+    AssertOk(status);
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> threads;
+    for (int writer_id = 0; writer_id < 4; ++writer_id) {
+        threads.emplace_back([&, writer_id] {
+            uint64_t ts = writer_id * 1000000;
+            while (!stop.load(std::memory_order_relaxed)) {
+                std::vector<DataPoint> batch;
+                batch.reserve(100);
+                for (int i = 0; i < 100; ++i) {
+                    batch.push_back({static_cast<uint64_t>(4000 + writer_id),
+                                     static_cast<int64_t>(ts++),
+                                     static_cast<double>(i)});
+                }
+                (void)engine->WriteBatch(batch);
+            }
+        });
+    }
+    threads.emplace_back([&] {
+        int64_t cutoff = 1000;
+        while (!stop.load(std::memory_order_relaxed)) {
+            (void)engine->ExpireBefore(cutoff);
+            (void)engine->Compact();
+            cutoff += 5000;
+        }
+    });
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    stop.store(true);
+    for (auto& thread : threads) thread.join();
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({4000, 4001, 4002, 4003}, 0,
+                          std::numeric_limits<int64_t>::max(), &cursor));
+    while (cursor->NextPoint()) {}
+    AssertOk(engine->Close());
+}
+
 }  // namespace
 
 int main() {
@@ -500,6 +540,7 @@ int main() {
     TestGcReclaimsWhileViewActive(root / "gc_refcount");
     TestCrashRecovery(root / "crash_recovery");
     TestCrashRecoveryExpire(root / "crash_recovery_expire");
+    TestConcurrentCompactionStress(root / "concurrent_compaction_stress");
     TestSstableChecksum(root / "checksum");
     std::cout << "all tests passed\n";
 }

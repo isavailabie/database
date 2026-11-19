@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -122,8 +123,8 @@ private:
     struct Impl;
     explicit Engine(std::unique_ptr<Impl> impl);
     Status FlushLocked(bool incremental = true);
-    Status CompactLocked(size_t threshold);
-    Status PublishManifestLocked(const std::vector<std::filesystem::path>& files);
+    Status CompactRoundLocked(std::unique_lock<std::mutex>& lock,
+                              size_t threshold);
     std::unique_ptr<Impl> impl_;
 };
 
