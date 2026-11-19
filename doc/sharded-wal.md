@@ -1,164 +1,218 @@
-# 分片 WAL 与跨分片提交协议（设计稿）
+# 分片 WAL 与跨分片提交协议（设计稿 v2）
 
-> 目标：把唯一还没有分片的持久化组件——WAL——拆成每个 Shard 一份，
-> 同时保持 `WriteBatch` 的跨分片原子性与崩溃恢复的正确性。
+> v1 评审结论：架构方向通过，恢复与回收规则不通过。本版按评审逐条修订。
 
-## 1. 范围
+## 0. 评审意见闭合
 
-改造前（当前实现）：
+| # | 评审意见 | 本版处理 |
+| --- | --- | --- |
+| 1 | `end_offset` 不能代表"之前的事务都已提交"；提交序列允许空洞 | 改为 **FragmentRef 精确定位 + 按 txn 精确匹配**；恢复不再按偏移判断是否提交（§3、§7） |
+| 2 | 单分片 SelfCommit 与跨分片 Commit 的版本顺序、Abort 语义不完整 | 明确事务状态机、**连续版本闸门**与 **Abort 不得留洞**（§4） |
+| 3 | CommitWAL `fsync` 报错时状态不确定，不能直接判未提交 | 明确错误语义：进入**降级状态**，由恢复决定结果（§6.2） |
+| 4 | Expire 与普通提交的版本顺序、Apply 完成条件不完整 | Expire 作为**带版本的全局控制事务**，同样走状态机（§4.3、§5） |
+| 5 | 记录缺少 Segment ID | 记录头带 `segment_id`，FragmentRef 带 `(segment, start, end)`（§3） |
+| 6 | 回收条件不充分 | 回收以 **Manifest 覆盖 + 全部参与分片已发布** 为前提（§8） |
+| 7 | 开关默认应为 false，格式需由 Manifest 标记 | `sharded_wal` 默认 **false**；Manifest 记录 `wal_format`，禁止混用（§9） |
+| 8 | 性能不应写成结论 | 改为待测假设，并给出组提交优化方向（§10） |
 
-- 一个全局 `wal/000001.log`，一条记录承载整个批次；
-- 一次组提交一次 fsync，覆盖所有分片；
-- 恢复时按序重放，残缺尾部截断。
+## 1. 不变式
 
-改造后：
+1. **单事务在途**：协调器同一时刻只推进一组事务（组内可含多个 txn），组内全部 Prepare/Commit 完成前不分配新版本。
+   → 版本号**连续无空洞**；Abort 只需把 `next_version` 回退（现有实现已如此）。
+2. **可见性闸门**：`visible_version` 只推进到"已提交 **且** 全部参与分片已 Apply"的连续版本。
+3. **提交即持久**：只有 CommitWAL 中的决策落盘，事务才算提交；没有决策的 Fragment 一律不恢复。
+4. **不确定性不猜测**：无法确定提交结果时（fsync 报错/掉电），不得擅自判 Abort，交由恢复判定（§6.2）。
 
-- 每个 Shard 一个独立 WAL（`wal/shard-N/`），各自追加、各自 fsync；
-- 一个全局 Commit WAL（`wal/commit/`），只记录"这个事务到底提交了没有"和过期边界；
-- 全局协调器仍然存在，但它不再把数据写进同一个文件。
-
-不变的部分：分片路由、COW MemTable、Shard Worker、ReadView、`visible_version`、
-SSTable/Compaction/GC 全部保持现状。
-
-## 2. 目录结构
+## 2. 目录与段
 
 ```
-db/
-├── MANIFEST, CURRENT
-├── wal/
-│   ├── shard-0/000001.log     # 只有 shard 0 的点数据
-│   ├── shard-1/000001.log
-│   ├── shard-2/000001.log
-│   ├── shard-3/000001.log
-│   └── commit/000001.log      # 提交决定 + 过期边界（全局，量很小）
-└── sst/...
+db/wal/
+├── shard-0/000001.log
+├── shard-1/000001.log
+├── shard-2/000001.log
+├── shard-3/000001.log
+└── commit/000001.log
 ```
+
+每个 WAL 目录独立分段（`%06llu.log`），独立轮转。段号单调整增，记录头带 `segment_id`
+以便 Commit 记录跨段引用。
 
 ## 3. 记录格式
 
 ### 3.1 Shard WAL
 
 ```
-[magic u32][type u8][txn u64][version u64][shard u8][count u32]
-[ (series_id uvarint, ts zigzag-varint, value f64) × count ]
+[magic u32][type u8][segment_id u64][txn u64][version u64][shard u8][count u32]
+[ (series uvarint, ts zigzag-varint, value f64) × count ][crc u64]
+```
+
+| type | 含义 |
+| --- | --- |
+| `kFragment` | 跨分片事务的片段，**需 Commit 决策**才生效 |
+| `kSelfCommit` | 单分片事务，记录完整即提交 |
+
+### 3.2 Commit WAL
+
+```
+[magic u32][type u8][segment_id u64][batch_txn_count u32]
+[ (txn u64, version u64, fragment_count u16,
+   [ (shard u8, segment_id u64, start_offset u64, end_offset u64) × fragment_count ]
+  ) × batch_txn_count ]
+[ (cutoff u64) 仅 kExpireBatch 使用 ]
 [crc u64]
 ```
 
 | type | 含义 |
 | --- | --- |
-| 1 `kFragment` | 跨分片事务的一个片段，**需要 Commit 记录确认**才生效 |
-| 2 `kSelfCommit` | 单分片事务，记录完整即提交，不需要 Commit 记录 |
+| `kCommitBatch` | 一组事务的提交决策，**一次 fsync 覆盖多个 txn**（组提交） |
+| `kExpireBatch` | 全局过期边界推进，带 version |
 
-### 3.2 Commit WAL
+> 关键修订（意见 1）：提交决策里保存的是**每个 fragment 的精确位置**
+> `(shard, segment, start_offset, end_offset)`，恢复时按 `txn_id` 精确匹配，
+> **不再用偏移大小推断是否提交**。
 
-```
-[magic u32][type u8][version u64][txn u64][n u32]
-[ (shard u8, end_offset u64) × n ][crc u64]
-```
+## 4. 事务状态机与版本
 
-| type | 含义 |
-| --- | --- |
-| 1 `kCommit` | 事务 txn 提交；每个参与分片的片段结束于 `end_offset` |
-| 2 `kExpire` | 全局过期边界推进到 `version`，payload 为 `cutoff` |
-
-`end_offset` 是该分片 WAL 中该片段最后一个字节的位置，恢复时按它精确截断。
-
-## 4. 提交流程
-
-### 4.1 单分片批次（快路径）
+### 4.1 状态
 
 ```
-协调器: 分配 version V 与 txn T，拆出唯一 fragment
-Shard i: append kSelfCommit{T,V,points} → fsync      ← 唯一一次 fsync
+ALLOCATED → PREPARING → (COMMITTED | ABORTED) → APPLYING → APPLIED → VISIBLE
+```
+
+- `ALLOCATED`：协调器分配 version/txn；
+- `PREPARING`：各分片追加 Fragment 并 fsync；
+- `COMMITTED`：CommitWAL 决策落盘（单分片事务则由 `kSelfCommit` 记录自身代表）；
+- `APPLYING/APPLIED`：分片应用到 MemTable 并 ack；
+- `VISIBLE`：`visible_version` 越过该版本。
+
+### 4.2 版本闸门
+
+```
+visible_version = max{ V | V 连续、V 已 COMMITTED 且所有参与分片 APPLIED }
+```
+
+- 由于 §1.1 保证只有一个事务组在途，**不存在"未提交版本成为永久空洞"**；
+- `ABORTED`：协调器回退 `next_version`（组内 txn 数），下一组重新使用这些版本号；
+- 因此闸门实现为"组内全部 APPLIED → 推进到组内最大版本"。
+
+### 4.3 Expire
+
+`ExpireBefore(cutoff)` 是一次**全局控制事务**：分配 version，写 `kExpireBatch`，
+fsync 后更新 `cutoff`，再由各分片清理；`visible_version` 必须等它完成后才能越过该版本。
+
+## 5. 提交流程（含组提交）
+
+### 5.1 单分片快路径
+
+```
+协调器: 分配 V, T
+Shard i: append kSelfCommit{T,V} → 与同段其它记录一起 fsync（组提交）
 Shard i: apply → ack
 协调器: visible_version = V → 返回
 ```
 
-### 4.2 跨分片批次（两阶段）
+### 5.2 跨分片
 
 ```
-协调器: 分配 V, T，拆成 N 个 fragment
-  ┌─ Shard 0: append kFragment{T,V,...} → fsync ┐
-  ├─ Shard 2: append kFragment{T,V,...} → fsync ├─ 并行，各自记下 end_offset
-  └─ Shard 3: append kFragment{T,V,...} → fsync ┘
-协调器: 若全部成功 → append kCommit{V,T,[(shard,end_offset)...]} 到 Commit WAL → fsync
-        若有任一失败 → 不写 Commit，事务作废
+协调器: 分配 V, T，拆 N 个 fragment
+各分片: append kFragment{T,V}，记下 (segment, start, end)；与其它记录一起 fsync（组提交）
+协调器: 全部成功后 append kCommitBatch{[(T,V,[refs])]} → fsync（一次覆盖多个 txn）
 各分片: apply → ack
-协调器: visible_version = V → 返回
+协调器: visible_version = 组内最大 V → 返回
 ```
 
-单盘上一次跨分片提交是 **N 次并行 fsync + 1 次 commit fsync**；单分片只有 1 次。
+组提交是本设计的性能关键：**同一分片的多条 Fragment / SelfCommit 共用一次 fsync；
+CommitWAL 一次 fsync 记录多个 txn 的决策**。
 
-## 5. 崩溃点与恢复语义
+## 6. 崩溃与错误语义
 
-| 崩溃位置 | 磁盘状态 | 恢复行为 | 客户端 |
+### 6.1 崩溃点矩阵
+
+| 崩溃位置 | 磁盘状态 | 恢复 | 客户端 |
 | --- | --- | --- | --- |
-| 任一 fragment fsync 前 | 分片 WAL 尾部残缺 | 截断到最后一个完整记录；无 Commit → 丢弃 | 未收到成功 |
-| fragment 全部 fsync 后、Commit 前 | 有完整 fragment，无 Commit | 丢弃这些 fragment | 未收到成功 |
-| Commit fsync 前（写到一半） | Commit 记录残缺 | 视为未提交，丢弃全部 fragment | 未收到成功 |
-| Commit fsync 后、apply 前 | 完整 fragment + Commit | 重放全部 fragment，重新 apply | 已收到成功（重放保证不丢） |
-| apply 中途 | 同上 | 重放后重新 apply，幂等（同 ts 同 version 覆盖） | 已收到成功 |
+| Fragment fsync 前 | 段尾残缺 | 截断尾部，丢弃 | 未成功 |
+| Fragment 完成、Commit 前 | 完整 Fragment，无决策 | 丢弃 | 未成功 |
+| Commit 记录写到一半 | 决策残缺 | 视为未提交，丢弃全部 Fragment | 未成功 |
+| Commit 落盘后、Apply 前 | 完整决策 | 全部重放并 Apply | 已成功，不丢 |
+| Apply 中途 | 同上 | 重放后重新 Apply（幂等） | 已成功，不丢 |
 
-**关键不变式**：只有 Commit 记录落盘的事务才会被恢复；没有 Commit 的 fragment 一律丢弃。
+### 6.2 fsync 报错（意见 3）
 
-## 6. 恢复算法
+`fsync` 返回错误时，数据可能已持久化也可能没有，**不能判定为失败**。规则：
+
+1. 重试一次；
+2. 仍失败 → 引擎进入 **DEGRADED**：拒绝新的写入与过期操作（返回错误），查询仍可读；
+3. 只有重新 `Open`（走恢复）才能确定该事务的实际结果；
+4. 恢复时若读到完整 Commit 决策 → 该事务**已提交**，正常重放；否则未提交。
+
+**不允许**在 fsync 失败后直接把事务标记为 Aborted 并继续服务。
+
+### 6.3 恢复与截断（意见 1）
+
+- **只截断段尾不完整记录**；
+- 段中间"未提交的 Fragment"**不删除、不截断**——它在逻辑上被忽略，物理空间由 §8 的段级回收处理；
+- 因此恢复后段内可能同时存在"已提交/未提交"记录，这是正常状态，不是错误。
+
+## 7. 恢复算法
 
 ```
-读取 MANIFEST（校验和、cutoff、next_version、covered 版本、SSTable 列表）
-读取 Commit WAL:
-    committed[txn] = (version, [(shard, end_offset)], )
-    记录已提交的最大 version
-对每个 shard:
-    顺序读 WAL 记录：
-      kSelfCommit  → 应用
-      kFragment    → 若 txn ∈ committed 且当前偏移 <= committed[txn].end_offset → 应用
-                     否则跳过（未提交）
-    把 WAL 截断到"最后一个已应用的记录末尾"
-    （已提交但偏移超过 end_offset 的，说明是别的事务，正常继续）
-visible_version = 已提交的连续最大 version
-next_version    = max(MANIFEST.next_version, 已见最大 version + 1)
-重建各 SSTable 的 SeriesIndex，重建 last_timestamps
+1. 读 MANIFEST（校验和、cutoff、next_version、covered 版本、SSTable 列表、wal_format）
+   wal_format 不匹配 → 拒绝打开（§9）
+2. 读 Commit WAL（所有段，按段号顺序）：
+     committed[txn] = (version, [FragmentRef],)
+     committed_versions = 已提交版本集合
+     max_committed = max(committed_versions)
+3. 对每个 shard：
+     顺序读段内记录：
+       kSelfCommit            → 应用
+       kFragment(txn, ref)    → 仅当 txn ∈ committed **且** ref 与当前记录位置完全匹配 → 应用
+                                否则跳过（保留在段内，不截断）
+     段尾不完整记录 → 截断到最后一个完整记录末尾
+4. 重放 ExpireBatch：按版本顺序恢复 cutoff（只认已提交的）
+5. visible_version = 连续已提交且已应用的版本
+   next_version    = max(MANIFEST.next_version, 已见最大 version + 1)
+6. 重建 SeriesIndex 与 last_timestamps
 ```
 
-## 7. 日志回收
+> 匹配语义：`FragmentRef` 的 `(shard, segment_id, start_offset, end_offset)` 必须与
+> 实际记录位置一致，否则视为不一致状态（记录损坏），按损坏处理并拒绝打开。
 
-- 每个 Shard 独立轮转：自己的 MemTable 被 Flush 成 SSTable、Manifest 发布后，
-  才能删除该分片已覆盖的段；
-- Commit WAL 只保留"还有未覆盖事务"的部分，按 covered 版本轮转；
-- 单分片事务的段回收只看该分片自己的 covered 版本。
+## 8. WAL 回收（意见 6）
 
-## 8. 可见性与原子性
+一个段可以删除，当且仅当：
 
-- `visible_version` 仍是唯一可见性闸门，且只推进到**连续已提交完成 apply** 的版本；
-- 读路径不变：`ReadView.version = visible_version`，MemTable/ SSTable 均按版本过滤。
+1. 该段内所有记录对应的 txn **要么已提交并 Apply，要么已确认 Abort**；
+2. 该段涉及的所有分片数据已被 **Manifest 覆盖**（`covered_version >= 段内最大 version`）；
+3. 段的删除与 Manifest 发布顺序一致：**先发布 Manifest，再删除段**（崩溃只会留下可重放的旧段）。
 
-## 9. 开关与 A/B
+CommitWAL 段的回收额外要求：该段内所有 txn 都满足上面两条。
 
-新增 `Options::sharded_wal`（默认 `true`，可通过环境/命令行关闭）：
+## 9. 开关与格式标记（意见 7）
 
-- `false`：走现有全局 WAL 路径（保留作为回退）；
-- `true`：走本文档描述的分片 WAL 路径。
+- `Options::sharded_wal` **默认 false**；打开后启用分片 WAL；
+- MANIFEST 增加 `wal_format` 字段（`1=global`、`2=sharded`）；
+- 打开已有库时：格式不匹配 → 拒绝打开并提示迁移；**禁止运行时混用**；
+- 迁移工具（后续）：把 `wal/*.log` 逐条转成 `wal/shard-N/*.log` 与 `wal/commit/*.log`。
 
-两套路径共用同一份 MemTable / Apply / ReadView / SSTable 代码，差异只在上面的
-"写日志 + 恢复"两处，便于对比与回退。
+## 10. 性能（意见 8）
 
-## 10. 性能预期
+预期（待实测，不作为结论）：跨分片事务需等待所有参与分片的日志持久化，并额外等待
+Commit 决策持久化，同步开销可能高于当前全局 WAL。实际影响取决于：
 
-| 批次类型 | 全局 WAL（现状） | 分片 WAL |
-| --- | --- | --- |
-| 单分片 | 1 fsync | **1 fsync** |
-| 跨分片 | 1 fsync | N 并行 fsync + 1 commit fsync |
+- 磁盘并发 fsync 行为；
+- 组提交批次大小（本设计已把 Fragment / SelfCommit / Commit 决策都做成可批量）；
+- 跨分片批次占比。
 
-导入批次几乎都跨分片，**单盘上预计吞吐下降 20–40%**；缓解手段：
-每个分片内对多个事务做组提交（一次 fsync 覆盖多批），Commit WAL 同样组提交。
-收益在日志架构与分片级生命周期，不在单盘吞吐。
+验证方式：`sharded_wal` 开/关各跑 `perf_ingest`、`perf_ingest_hot`、`perf_mixed`，
+分别报告单分片与跨分片场景。
 
-## 11. 实现步骤与验收
+## 11. 实现顺序（修订后）
 
 | 阶段 | 内容 | 验收 |
 | --- | --- | --- |
-| 1 | `ShardWAL` / `CommitWAL` 读写 + 单分片快路径 | 现有 23 个测试全绿 |
-| 2 | 跨分片两阶段提交 + 恢复 | 上述崩溃矩阵逐条覆盖 |
-| 3 | 日志回收按分片推进 | Flush 后各分片段能独立清理 |
-| 4 | 故障注入 ≥50 次（写入/刷盘/发布/合并/回收） | 每次"要么数据完好、要么干净失败" |
-| 5 | 开关打开做 A/B 基准 | 单分片/跨分片分别报告 |
+| 1 | 段管理 + 记录编解码 + `kSelfCommit` 快路径（开关默认关） | 现有 23 测试全绿 |
+| 2 | `kFragment` + `kCommitBatch` + 组提交 | 跨分片测试通过 |
+| 3 | 恢复：精确匹配、只截尾、Expire 重放 | §6.1 矩阵逐条覆盖 |
+| 4 | 段级回收（§8 三个条件） | Flush/Compaction 后段可独立删除 |
+| 5 | 故障注入 ≥50 次 | 要么数据完好，要么干净失败 |
+| 6 | 开关打开做 A/B | 单分片/跨分片分别报数 |
