@@ -1681,8 +1681,8 @@ Status Engine::CompactLocked(size_t threshold) {
         ++impl_->next_file_number;
     }
 
-    if (published_metadata.empty()) return Status::Ok();
-
+    // published_metadata may be empty when every point in the merged level is
+    // already expired; the obsolete loop below still reclaims those files.
     std::vector<std::shared_ptr<SstableMetadata>> retained;
     retained.reserve(impl_->sstable_metadata.size());
     for (const auto& sstable : impl_->sstable_metadata) {
@@ -1769,7 +1769,7 @@ Status Engine::GetStats(EngineStats* stats) const {
     for (const auto& shard : impl_->shards) {
         stats->mutable_points += shard->point_count();
     }
-    stats->immutable_points = impl_->points_since_flush;
+    stats->immutable_points = 0;
     std::error_code ec;
     stats->wal_bytes = std::filesystem::exists(impl_->wal_path, ec)
                            ? std::filesystem::file_size(impl_->wal_path, ec)

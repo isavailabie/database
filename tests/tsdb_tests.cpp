@@ -308,7 +308,10 @@ void TestMultiLevelCompaction(const std::filesystem::path& path) {
     Status status;
     auto engine = Engine::Open(path, Options{4, 100000}, &status);
     AssertOk(status);
-    for (int flush = 0; flush < 6; ++flush) {
+    // Two phases of 8 flushes each. The second Compact() cascades level-0
+    // into level-1 and then merges the two level-1 SSTables into level-2.
+    const int total_flushes = 16;
+    for (int flush = 0; flush < total_flushes; ++flush) {
         std::vector<DataPoint> batch;
         for (int i = 0; i < 50; ++i) {
             batch.push_back({static_cast<uint64_t>(770 + (i % 4)),
@@ -317,17 +320,18 @@ void TestMultiLevelCompaction(const std::filesystem::path& path) {
         }
         AssertOk(engine->WriteBatch(batch));
         AssertOk(engine->Flush());
+        if (flush == 7) AssertOk(engine->Compact());
     }
     AssertOk(engine->Compact());
     std::unique_ptr<Cursor> cursor;
-    AssertOk(engine->Scan({770, 771, 772, 773}, 0, 10000, &cursor));
-    assert(Read(cursor.get()).size() == 300);
+    AssertOk(engine->Scan({770, 771, 772, 773}, 0, 20000, &cursor));
+    assert(Read(cursor.get()).size() == 16 * 50);
     AssertOk(engine->Close());
 
     auto reopened = Engine::Open(path, Options{4, 100000}, &status);
     AssertOk(status);
-    AssertOk(reopened->Scan({770, 771, 772, 773}, 0, 10000, &cursor));
-    assert(Read(cursor.get()).size() == 300);
+    AssertOk(reopened->Scan({770, 771, 772, 773}, 0, 20000, &cursor));
+    assert(Read(cursor.get()).size() == 16 * 50);
     AssertOk(reopened->Close());
 }
 
