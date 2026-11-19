@@ -11,10 +11,11 @@
 int main(int argc, char** argv) {
     size_t seconds_limit = 10;
     if (argc > 1) seconds_limit = std::stoull(argv[1]);
+    const bool keep = argc > 2 && std::string(argv[2]) == "--keep";
 
-    const auto path =
-        std::filesystem::temp_directory_path() / "tsdb-mixed-benchmark";
-    std::filesystem::remove_all(path);
+    const auto path = std::filesystem::temp_directory_path() /
+                      (keep ? "tsdb-ingest-benchmark" : "tsdb-mixed-benchmark");
+    if (!keep) std::filesystem::remove_all(path);
 
     tsdb::Status status;
     auto engine = tsdb::Engine::Open(
@@ -33,7 +34,9 @@ int main(int argc, char** argv) {
 
     for (uint64_t writer_id = 0; writer_id < 4; ++writer_id) {
         threads.emplace_back([&, writer_id] {
-            uint64_t timestamp = writer_id * 100000000ULL;
+            const uint64_t timestamp_base =
+                keep ? 1000000000000ULL : 0;
+            uint64_t timestamp = timestamp_base + writer_id * 100000000ULL;
             while (!stop.load(std::memory_order_relaxed)) {
                 std::vector<tsdb::DataPoint> batch;
                 batch.reserve(100);
