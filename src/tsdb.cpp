@@ -732,7 +732,7 @@ struct Engine::Impl {
         auto& slot = shards[ShardFor(series_id)]->series[series_id];
         if (!slot) {
             slot = std::make_shared<SeriesPoints>();
-        } else if (!slot.unique()) {
+        } else if (slot.use_count() != 1) {
             slot = std::make_shared<SeriesPoints>(*slot);
         }
         (*slot)[timestamp] = VersionedPoint{point, version};
@@ -806,7 +806,7 @@ struct Engine::Impl {
             auto& slot = next->series[point.point.series_id];
             if (!slot) {
                 slot = std::make_shared<SeriesPoints>();
-            } else if (!slot.unique()) {
+            } else if (slot.use_count() != 1) {
                 slot = std::make_shared<SeriesPoints>(*slot);
             }
             (*slot)[point.point.timestamp_ms] = point;
@@ -2321,7 +2321,7 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
                 ++series_it;
                 continue;
             }
-            if (!series_it->second.unique()) {
+            if (series_it->second.use_count() != 1) {
                 series_it->second =
                     std::make_shared<SeriesPoints>(*series_it->second);
             }
