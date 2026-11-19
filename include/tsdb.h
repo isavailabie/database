@@ -72,6 +72,10 @@ struct Options {
     size_t cpu_budget{4};
     uint64_t hot_series_point_limit{10000000};
     size_t compaction_sstable_threshold{8};
+    // Backpressure: pause writers when more than this many SSTables are live,
+    // so the per-series index of a burst of flushes cannot blow the RSS budget.
+    // 0 disables the limit.
+    size_t max_live_sstables{256};
     bool enable_background_gc{true};
     // Directory for WAL segments; empty means <db>/wal. Pointing it at a
     // separate disk keeps WAL fsyncs from contending with SSTable I/O.

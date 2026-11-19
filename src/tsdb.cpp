@@ -651,6 +651,9 @@ struct Engine::Impl {
     std::condition_variable flush_cv;
     std::thread flush_worker;
     std::condition_variable compaction_cv;
+    // Signalled by the compaction worker whenever the live SSTable count drops,
+    // so writers waiting on max_live_sstables can make progress.
+    std::condition_variable compaction_done_cv;
     std::thread compaction_worker;
     std::condition_variable write_cv;
     std::thread write_worker;
@@ -1779,6 +1782,20 @@ Engine::Engine(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {
                 });
             }
 
+            // Backpressure: a burst of flushes can outrun compaction, and every
+            // live SSTable keeps a full per-series index. Pause the group until
+            // compaction drains the backlog so peak RSS stays bounded.
+            if (impl_->options.max_live_sstables > 0 &&
+                impl_->options.enable_background_compaction) {
+                while (impl_->sstable_metadata.size() >
+                           impl_->options.max_live_sstables &&
+                       !impl_->stopping_write &&
+                       !impl_->stopping_compaction) {
+                    impl_->compaction_done_cv.wait_for(
+                        lock, std::chrono::milliseconds(5));
+                }
+            }
+
             std::vector<std::shared_ptr<PendingWrite>> group;
             size_t queued_bytes = 0;
             while (!impl_->write_queue.empty() &&
@@ -1884,6 +1901,8 @@ Engine::Engine(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {
                 if (impl_->options.enable_background_gc) {
                     (void)impl_->GarbageCollectLocked();
                 }
+                // Wake writers paused by max_live_sstables backpressure.
+                impl_->compaction_done_cv.notify_all();
             }
         });
     }
