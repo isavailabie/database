@@ -47,6 +47,7 @@ ctest --test-dir build --output-on-failure
 - SSTable SeriesIndex（含字节长度）和按需磁盘分页读取
 - 有界流式 Compaction：磁盘多 SSTable 归并 + 过期过滤
 - Size-tiered Compaction：按层级归并，避免 O(N²) 写放大
+- Compaction 归并 I/O 期间释放全局锁，不阻塞前台写入
 - 后台 Flush、阈值触发 Compaction 和后台 GC
 - 引用计数 GC：读取并发下也能回收过期 SSTable 文件
 - ReadView、过期视图和物理过期清理
@@ -64,4 +65,6 @@ ctest --test-dir build --output-on-failure
   恢复约 19.9 秒，WAL 重放 0 字节。
 - 60 分钟混合读写：约 1481 万点写入、34.6 万次扫描、0 扫描错误、
   0 待回收 SSTable、峰值 RSS 约 113 MiB、20 次合并、148 次刷盘。
+- 1 亿点之上的 60 分钟混合读写（严格验收）：约 1133 万点追加写入、
+  26.4 万次扫描、0 扫描错误、峰值 RSS 约 125 MiB、16 次合并、114 次刷盘。
 
