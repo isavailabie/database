@@ -7,6 +7,9 @@
 #include <thread>
 #include <vector>
 
+#include <sys/wait.h>
+#include <unistd.h>
+
 using namespace tsdb;
 
 namespace {
@@ -403,6 +406,33 @@ void TestSstableChecksum(const std::filesystem::path& path) {
     assert(engine == nullptr);
 }
 
+void TestCrashRecovery(const std::filesystem::path& path) {
+    const pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        // Child: write and crash without flushing/Close, so the WAL keeps
+        // the committed (fsynced) records for replay.
+        Status status;
+        auto engine = Engine::Open(path, Options{4, 1000000}, &status);
+        if (!status.ok) _exit(2);
+        if (!engine->WriteBatch({{5, 100, 1.0}, {5, 200, 2.0}}).ok) _exit(3);
+        _exit(0);
+    }
+    int child_status = 0;
+    waitpid(pid, &child_status, 0);
+    assert(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
+
+    Status status;
+    auto engine = Engine::Open(path, Options{4, 1000000}, &status);
+    AssertOk(status);
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({5}, 0, 1000, &cursor));
+    const auto points = Read(cursor.get());
+    assert(points.size() == 2);
+    assert(points[0].timestamp_ms == 100 && points[1].timestamp_ms == 200);
+    AssertOk(engine->Close());
+}
+
 }  // namespace
 
 int main() {
@@ -423,6 +453,7 @@ int main() {
     TestMultiLevelCompaction(root / "multi_level_compaction");
     TestNegativeTimestampRecovery(root / "negative_ts_recovery");
     TestGcReclaimsWhileViewActive(root / "gc_refcount");
+    TestCrashRecovery(root / "crash_recovery");
     TestSstableChecksum(root / "checksum");
     std::cout << "all tests passed\n";
 }
