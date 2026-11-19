@@ -510,6 +510,44 @@ void TestLargeSeriesStreaming(const std::filesystem::path& path) {
     AssertOk(engine->Close());
 }
 
+void TestPageIndexSelectiveScan(const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(path, Options{4, 100000}, &status);
+    AssertOk(status);
+    // 1000 points => ~8 pages of 128 points for the single series.
+    std::vector<DataPoint> batch;
+    batch.reserve(1000);
+    for (int i = 0; i < 1000; ++i) {
+        batch.push_back({920, static_cast<int64_t>(i), static_cast<double>(i)});
+    }
+    AssertOk(engine->WriteBatch(batch));
+    AssertOk(engine->Flush());
+
+    const auto scan = [&](int64_t lo, int64_t hi) {
+        std::unique_ptr<Cursor> cursor;
+        AssertOk(engine->Scan({920}, lo, hi, &cursor));
+        return Read(cursor.get());
+    };
+    // Ranges that start/end inside pages and span page boundaries.
+    auto points = scan(0, 10);
+    assert(points.size() == 10 && points.front().timestamp_ms == 0);
+    points = scan(500, 520);
+    assert(points.size() == 20 && points.front().timestamp_ms == 500);
+    points = scan(999, 1000);
+    assert(points.size() == 1 && points.front().timestamp_ms == 999);
+    points = scan(128, 256);
+    assert(points.size() == 128 && points.front().timestamp_ms == 128);
+    points = scan(0, 1000);
+    assert(points.size() == 1000);
+    points = scan(1000, 2000);
+    assert(points.empty());
+    // Expiration must also prune pages.
+    AssertOk(engine->ExpireBefore(600));
+    points = scan(0, 1000);
+    assert(points.size() == 400 && points.front().timestamp_ms == 600);
+    AssertOk(engine->Close());
+}
+
 void TestCrashRecovery(const std::filesystem::path& path) {
     const pid_t pid = fork();
     assert(pid >= 0);
@@ -657,8 +695,7 @@ int main(int argc, char** argv) {
         {"incremental_flush", [&] { TestMultipleIncrementalFlushes(root / "incremental"); }},
         {"physical_expiration_gc", [&] { TestPhysicalExpirationAndGC(root / "physical_expiration"); }},
         {"large_series_paging", [&] { TestLargeSeriesPaging(root / "large_series_paging"); }},
-        {"large_series_streaming", [&] { TestLargeSeriesStreaming(root / "large_series_streaming"); }},
-        {"flush_clears_memtable", [&] { TestFlushClearsMemtable(root / "flush_clears_memtable"); }},
+        {"large_series_streaming", [&] { TestLargeSeriesStreaming(root / "large_series_streaming"); }},        {"flush_clears_memtable", [&] { TestFlushClearsMemtable(root / "flush_clears_memtable"); }},
         {"compaction_merges", [&] { TestCompactionMergesSstables(root / "compaction_merges"); }},
         {"compaction_drops_expired", [&] { TestCompactionDropsExpired(root / "compaction_drops_expired"); }},
         {"multi_level_compaction", [&] { TestMultiLevelCompaction(root / "multi_level_compaction"); }},
@@ -668,6 +705,7 @@ int main(int argc, char** argv) {
         {"crash_recovery_expire", [&] { TestCrashRecoveryExpire(root / "crash_recovery_expire"); }},
         {"torn_wal_tail", [&] { TestTornWalTailRecovery(root / "torn_wal_tail"); }},
         {"concurrent_compaction_stress", [&] { TestConcurrentCompactionStress(root / "concurrent_compaction_stress"); }},
+        {"page_index_selective_scan", [&] { TestPageIndexSelectiveScan(root / "page_index_selective"); }},
         {"sstable_checksum", [&] { TestSstableChecksum(root / "checksum"); }},
         {"cursor_outlives_engine", [&] { TestCursorOutlivesEngine(root / "cursor_lifetime"); }},
         {"sharded_wal", [&] { TestShardedWal(root / "sharded_wal"); }},

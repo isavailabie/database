@@ -32,6 +32,16 @@
 namespace tsdb {
 namespace {
 
+// One 128-point page inside a series chunk. Records are time-sorted within a
+// chunk, so a page's [min,max] lets a selective scan seek past pages that do
+// not intersect the query range instead of decoding the whole chunk.
+struct SstablePageIndexEntry {
+    uint64_t offset{};
+    uint64_t point_count{};
+    int64_t min_timestamp{std::numeric_limits<int64_t>::max()};
+    int64_t max_timestamp{std::numeric_limits<int64_t>::min()};
+};
+
 struct SstableIndexEntry {
     uint64_t series_id{};
     uint64_t offset{};
@@ -39,6 +49,7 @@ struct SstableIndexEntry {
     uint64_t point_count{};
     int64_t min_timestamp{std::numeric_limits<int64_t>::max()};
     int64_t max_timestamp{std::numeric_limits<int64_t>::min()};
+    std::vector<SstablePageIndexEntry> pages;
 };
 
 struct SstableMetadata {
@@ -322,6 +333,16 @@ struct SstableWriter {
     uint64_t payload_bytes{0};
     SstableMetadata metadata;
     uint32_t magic{kEncodedSstableMagic};
+    // Page index being accumulated for the current series.
+    SstablePageIndexEntry page;
+    uint64_t page_series{0};
+    bool have_page{false};
+
+    void FlushPage() {
+        if (!have_page) return;
+        metadata.series[page_series].pages.push_back(page);
+        have_page = false;
+    }
 
     bool Open(const std::filesystem::path& temp) {
         out.open(temp, std::ios::binary | std::ios::trunc);
@@ -334,10 +355,12 @@ struct SstableWriter {
 
     void Append(uint64_t series_id, int64_t timestamp, double value,
                 CommitVersion version) {
+        const uint64_t record_offset =
+            sizeof(uint32_t) + sizeof(uint64_t) + payload_bytes;
         auto& entry = metadata.series[series_id];
         entry.series_id = series_id;
         if (entry.point_count == 0) {
-            entry.offset = sizeof(uint32_t) + sizeof(uint64_t) + payload_bytes;
+            entry.offset = record_offset;
         }
         char buf[10];
         size_t n = 0;
@@ -372,6 +395,17 @@ struct SstableWriter {
         entry.max_timestamp = std::max(entry.max_timestamp, timestamp);
         metadata.min_timestamp = std::min(metadata.min_timestamp, timestamp);
         metadata.max_timestamp = std::max(metadata.max_timestamp, timestamp);
+        if (!have_page || page_series != series_id ||
+            page.point_count == kDiskPageRecords) {
+            FlushPage();
+            page = SstablePageIndexEntry{};
+            page.offset = record_offset;
+            page_series = series_id;
+            have_page = true;
+        }
+        ++page.point_count;
+        page.min_timestamp = std::min(page.min_timestamp, timestamp);
+        page.max_timestamp = std::max(page.max_timestamp, timestamp);
         ++count;
     }
 
@@ -382,6 +416,7 @@ struct SstableWriter {
     }
 
     bool Finish() {
+        FlushPage();
         out.write(reinterpret_cast<const char*>(&hash), sizeof(hash));
         out.flush();
         out.seekp(sizeof(uint32_t), std::ios::beg);
@@ -1087,6 +1122,16 @@ struct Engine::Impl {
             reader.in.seekg(sizeof(uint32_t) + sizeof(uint64_t),
                             std::ios::beg);
             if (!reader.in) return Status::Error("cannot read SSTable");
+            // Records arrive grouped by series and time-sorted within a series,
+            // so pages are simply every kDiskPageRecords consecutive records.
+            SstablePageIndexEntry page;
+            uint64_t page_series = 0;
+            bool have_page = false;
+            const auto flush_page = [&]() {
+                if (!have_page) return;
+                result->series[page_series].pages.push_back(page);
+                have_page = false;
+            };
             for (uint64_t i = 0; i < count; ++i) {
                 const uint64_t record_offset =
                     sizeof(uint32_t) + sizeof(uint64_t) + reader.bytes;
@@ -1113,7 +1158,20 @@ struct Engine::Impl {
                     std::min(result->min_timestamp, timestamp);
                 result->max_timestamp =
                     std::max(result->max_timestamp, timestamp);
+
+                if (!have_page || page_series != series_id ||
+                    page.point_count == kDiskPageRecords) {
+                    flush_page();
+                    page = SstablePageIndexEntry{};
+                    page.offset = record_offset;
+                    page_series = series_id;
+                    have_page = true;
+                }
+                ++page.point_count;
+                page.min_timestamp = std::min(page.min_timestamp, timestamp);
+                page.max_timestamp = std::max(page.max_timestamp, timestamp);
             }
+            flush_page();
             uint64_t recorded_checksum = 0;
             reader.in.read(reinterpret_cast<char*>(&recorded_checksum),
                            sizeof(recorded_checksum));
@@ -1996,6 +2054,13 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
         SeriesPoints::const_iterator mem_end;
         std::unique_ptr<StreamingReader> file;
         uint64_t remaining{0};
+        // Page index of the series chunk (encoded SSTables only). Drives
+        // seeking past pages whose time range misses the query.
+        const std::vector<SstablePageIndexEntry>* pages{nullptr};
+        size_t page_index{0};
+        // File offset of the next record to decode; lets page advancement skip
+        // the seek when pages are contiguous (the common full-scan case).
+        uint64_t current_offset{0};
         // Legacy raw (fixed record) SSTables are still readable.
         bool raw{false};
         std::unique_ptr<std::ifstream> raw_file;
@@ -2054,7 +2119,19 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
                 if (!source->file->in) continue;
                 source->file->in.seekg(entry.offset, std::ios::beg);
                 if (!source->file->in) continue;
-                source->remaining = entry.point_count;
+                // A range that covers the whole chunk decodes sequentially; only
+                // selective ranges pay for page traversal/seeking.
+                const bool full_range =
+                    start <= entry.min_timestamp && end > entry.max_timestamp;
+                if (full_range) {
+                    source->remaining = entry.point_count;
+                    source->pages = nullptr;
+                } else {
+                    source->remaining = 0;
+                    source->pages = &entry.pages;
+                    source->page_index = 0;
+                    source->current_offset = entry.offset;
+                }
             } else {
                 source->raw = true;
                 source->raw_file = std::make_unique<std::ifstream>(
@@ -2091,7 +2168,32 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
                 state->heap.push(item);
                 return;
             }
-            if (source.remaining == 0) return;
+            if (source.remaining == 0) {
+                // Encoded sources advance page by page, seeking past pages that
+                // do not intersect [start, end) (or are fully expired).
+                if (source.raw || !source.pages) return;
+                bool found = false;
+                while (source.page_index < source.pages->size()) {
+                    const auto& page = (*source.pages)[source.page_index];
+                    ++source.page_index;
+                    if (page.max_timestamp < state->start ||
+                        page.min_timestamp >= state->end ||
+                        page.max_timestamp < cutoff) {
+                        continue;
+                    }
+                    if (page.offset != source.current_offset) {
+                        source.file->in.seekg(
+                            static_cast<std::streamoff>(page.offset),
+                            std::ios::beg);
+                        if (!source.file->in) return;
+                        source.current_offset = page.offset;
+                    }
+                    source.remaining = page.point_count;
+                    found = true;
+                    break;
+                }
+                if (!found) return;
+            }
             if (source.raw) {
                 constexpr size_t kRecord = sizeof(uint64_t) + sizeof(int64_t) +
                                            sizeof(double) + sizeof(CommitVersion);
@@ -2139,6 +2241,7 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
             uint64_t zigzag_timestamp = 0;
             double disk_value = 0.0;
             uint64_t disk_version = 0;
+            const uint64_t bytes_before = source.file->bytes;
             if (!source.file->ReadUvarint(&disk_series) ||
                 !source.file->ReadUvarint(&zigzag_timestamp) ||
                 !source.file->ReadDouble(&disk_value) ||
@@ -2146,6 +2249,7 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
                 source.remaining = 0;
                 return;
             }
+            source.current_offset += source.file->bytes - bytes_before;
             --source.remaining;
             const int64_t timestamp = ZigzagDecode(zigzag_timestamp);
             if (timestamp >= state->end) {
