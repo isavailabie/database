@@ -451,6 +451,32 @@ void TestCrashRecovery(const std::filesystem::path& path) {
     AssertOk(engine->Close());
 }
 
+void TestCrashRecoveryExpire(const std::filesystem::path& path) {
+    const pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        Status status;
+        auto engine = Engine::Open(path, Options{4, 1000000}, &status);
+        if (!status.ok) _exit(2);
+        if (!engine->WriteBatch({{6, 100, 1.0}, {6, 500, 2.0}}).ok) _exit(3);
+        if (!engine->ExpireBefore(300).ok) _exit(4);
+        _exit(0);
+    }
+    int child_status = 0;
+    waitpid(pid, &child_status, 0);
+    assert(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
+
+    Status status;
+    auto engine = Engine::Open(path, Options{4, 1000000}, &status);
+    AssertOk(status);
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({6}, 0, 1000, &cursor));
+    const auto points = Read(cursor.get());
+    assert(points.size() == 1 && points[0].timestamp_ms == 500);
+    assert(!engine->Put({6, 200, 3.0}).ok);
+    AssertOk(engine->Close());
+}
+
 }  // namespace
 
 int main() {
@@ -473,6 +499,7 @@ int main() {
     TestNegativeTimestampRecovery(root / "negative_ts_recovery");
     TestGcReclaimsWhileViewActive(root / "gc_refcount");
     TestCrashRecovery(root / "crash_recovery");
+    TestCrashRecoveryExpire(root / "crash_recovery_expire");
     TestSstableChecksum(root / "checksum");
     std::cout << "all tests passed\n";
 }

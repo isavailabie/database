@@ -1008,7 +1008,12 @@ struct Engine::Impl {
                     ApplyPoints(points, version);
                 }
             } else if (type == kExpireRecord) {
-                if (!Read(payload, payload_offset, &cutoff)) return Status::Error("invalid WAL");
+                if (!Read(payload, payload_offset, &version)) {
+                    return Status::Error("invalid WAL");
+                }
+                if (!Read(payload, payload_offset, &cutoff)) {
+                    return Status::Error("invalid WAL");
+                }
             } else {
                 return Status::Error("unknown WAL record");
             }
