@@ -93,3 +93,17 @@ python3 benchmark/runner.py --source "$PWD" --output build/eval-quick --profile 
   0 待回收 SSTable、峰值 RSS 约 113 MiB、20 次合并、148 次刷盘。
 - 1 亿点之上的 60 分钟混合读写（严格验收）：约 1133 万点追加写入、
   26.4 万次扫描、0 扫描错误、峰值 RSS 约 125 MiB、16 次合并、114 次刷盘。
+
+单盘优化补充（macOS 实机；上方作者机器的数据保留）：
+
+- **写路径**：无快照持有时原地应用 fragment，省去整片/整 Series 的 COW。
+  批量导入 2M 点 0.93s→0.48s、10M 点 5.7s→2.9s（约 2×）。
+- **峰值内存**：对活跃 SSTable 数做写者背压（`Options::max_live_sstables`，默认
+  256）。1 亿点导入峰值 RSS **978 MiB→229 MiB**，耗时 58.7s→103.7s（仍远低于
+  60 分钟上限）。原因：快速导入会跑赢 Compaction，堆积上千个 SSTable，而每个
+  SSTable 都带一份全 Series 索引。
+- **WAL 独立盘**：`Options::wal_dir` 可把 WAL 段放到与 SSTable 不同的磁盘；
+  Manifest 记录 `WAL_DIR`，目录变更时拒绝启动以免丢未刷盘段。单盘上分片并发
+  WAL 仍更慢（15%），默认关闭；多盘场景见 `doc/sharding.md` §6。
+- **选择性查询**：SSTable Series Chunk 增加 128 点/页的 `[min,max]` 时间索引，
+  窄范围查询约 5.7×（87µs→15µs），全量扫描不变。
