@@ -1222,6 +1222,16 @@ Engine::Engine(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {
             if (impl_->stopping_write && impl_->write_queue.empty()) return;
             if (impl_->write_queue.empty()) continue;
 
+            // Linger briefly before starting the group. Without it the first
+            // queued request is committed immediately, so concurrent writers
+            // each pay their own WAL fsync instead of sharing one. The lock is
+            // released while waiting, so the other writers can join.
+            constexpr size_t kGroupTarget = 8;
+            impl_->write_cv.wait_for(lock, std::chrono::microseconds(200), [&] {
+                return impl_->write_queue.size() >= kGroupTarget ||
+                       impl_->stopping_write;
+            });
+
             std::vector<std::shared_ptr<PendingWrite>> group;
             size_t queued_bytes = 0;
             while (!impl_->write_queue.empty() &&

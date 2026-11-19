@@ -1,0 +1,9 @@
+/home/asussqy/data/database/build-p2/CMakeFiles/tsdb.dir
+/home/asussqy/data/database/build-p2/CMakeFiles/tsdb_tests.dir
+/home/asussqy/data/database/build-p2/CMakeFiles/tsdb_bench.dir
+/home/asussqy/data/database/build-p2/CMakeFiles/tsdb_mixed_bench.dir
+/home/asussqy/data/database/build-p2/CMakeFiles/tsdb_recover.dir
+/home/asussqy/data/database/build-p2/CMakeFiles/tsdb_fault_test.dir
+/home/asussqy/data/database/build-p2/CMakeFiles/test.dir
+/home/asussqy/data/database/build-p2/CMakeFiles/edit_cache.dir
+/home/asussqy/data/database/build-p2/CMakeFiles/rebuild_cache.dir

@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/tsdb_mixed_bench.dir/benchmarks/mixed.cpp.o -o tsdb_mixed_bench  libtsdb.a 

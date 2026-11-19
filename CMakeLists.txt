@@ -1,7 +1,11 @@
 cmake_minimum_required(VERSION 3.16)
 project(tsdb LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -17,6 +21,9 @@ target_link_libraries(tsdb_bench PRIVATE tsdb)
 
 add_executable(tsdb_mixed_bench benchmarks/mixed.cpp)
 target_link_libraries(tsdb_mixed_bench PRIVATE tsdb)
+
+add_executable(tsdb_recover benchmarks/recover.cpp)
+target_link_libraries(tsdb_recover PRIVATE tsdb)
 
 add_executable(tsdb_fault_test tests/fault_injection.cpp)
 target_link_libraries(tsdb_fault_test PRIVATE tsdb)
