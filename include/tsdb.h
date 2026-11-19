@@ -121,11 +121,13 @@ public:
 
 private:
     struct Impl;
-    explicit Engine(std::unique_ptr<Impl> impl);
+    explicit Engine(std::shared_ptr<Impl> impl);
     Status FlushLocked(bool incremental = true);
     Status CompactRoundLocked(std::unique_lock<std::mutex>& lock,
                               size_t threshold);
-    std::unique_ptr<Impl> impl_;
+    // Shared so that a Cursor created by Scan can keep the engine state alive
+    // until the cursor is destroyed, even if the Engine object is gone.
+    std::shared_ptr<Impl> impl_;
 };
 
 }  // namespace tsdb

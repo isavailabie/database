@@ -123,7 +123,9 @@ bool ReadUvarint(const std::string& input, size_t& offset, uint64_t* value) {
 }
 
 uint64_t ZigzagEncode(int64_t value) {
-    return static_cast<uint64_t>((value << 1) ^ (value >> 63));
+    // Go through unsigned: left shifting a negative int64_t is undefined.
+    return (static_cast<uint64_t>(value) << 1) ^
+           (static_cast<uint64_t>(value) >> 63);
 }
 
 int64_t ZigzagDecode(uint64_t value) {
@@ -138,6 +140,15 @@ bool SyncFile(const std::filesystem::path& path) {
     const bool ok = ::fsync(fd) == 0;
     ::close(fd);
     return ok;
+}
+
+// Best-effort rollback of a partially written WAL record. A failure here is not
+// actionable: the caller reports the original write error to the client anyway.
+void TruncateWalBestEffort(int fd, off_t size) {
+    const int truncated = ::ftruncate(fd, size);
+    const int synced = ::fsync(fd);
+    (void)truncated;
+    (void)synced;
 }
 
 void PinCurrentThread(size_t cpu_budget, size_t index) {
@@ -214,15 +225,13 @@ bool AppendWalRecord(int fd, uint8_t type,
         const ssize_t result =
             ::write(fd, record.data() + written, record.size() - written);
         if (result <= 0) {
-            ::ftruncate(fd, record_start);
-            ::fsync(fd);
+            TruncateWalBestEffort(fd, record_start);
             return false;
         }
         written += static_cast<size_t>(result);
     }
     if (::fsync(fd) == 0) return true;
-    ::ftruncate(fd, record_start);
-    ::fsync(fd);
+    TruncateWalBestEffort(fd, record_start);
     return false;
 }
 
@@ -245,8 +254,7 @@ bool AppendWalRecordNoSync(int fd, uint8_t type,
         const ssize_t result =
             ::write(fd, record.data() + written, record.size() - written);
         if (result <= 0) {
-            ::ftruncate(fd, record_start);
-            ::fsync(fd);
+            TruncateWalBestEffort(fd, record_start);
             return false;
         }
         written += static_cast<size_t>(result);
@@ -556,6 +564,7 @@ struct Engine::Impl {
     std::vector<std::filesystem::path> current_files;
     std::vector<std::shared_ptr<SstableMetadata>> sstable_metadata;
     uint64_t wal_bytes_replayed{0};
+    uint64_t wal_valid_bytes{0};
     uint64_t next_file_number{1};
     int wal_fd{-1};
     uint64_t compaction_count{0};
@@ -1109,90 +1118,99 @@ struct Engine::Impl {
         return Status::Ok();
     }
 
+    // Parses one WAL transaction payload and applies it. Returns false when the
+    // payload is malformed (a torn tail), in which case nothing is applied.
+    bool ApplyWalTxn(const std::string& payload, CommitVersion* version) {
+        size_t payload_offset = 0;
+        uint32_t encoded_magic = 0;
+        if (Read(payload, payload_offset, &encoded_magic) &&
+            encoded_magic == kEncodedWalPayloadMagic) {
+            if (!Read(payload, payload_offset, version)) return false;
+            uint32_t count = 0;
+            if (!Read(payload, payload_offset, &count)) return false;
+            if (count > payload.size()) return false;
+            std::vector<DataPoint> points(count);
+            for (auto& point : points) {
+                uint64_t series_id = 0;
+                uint64_t zigzag_timestamp = 0;
+                if (!ReadUvarint(payload, payload_offset, &series_id) ||
+                    !ReadUvarint(payload, payload_offset, &zigzag_timestamp) ||
+                    !Read(payload, payload_offset, &point.value)) {
+                    return false;
+                }
+                point.series_id = series_id;
+                point.timestamp_ms = ZigzagDecode(zigzag_timestamp);
+            }
+            ApplyPoints(points, *version);
+            return true;
+        }
+        payload_offset = 0;
+        if (!Read(payload, payload_offset, version)) return false;
+        uint32_t count = 0;
+        if (!Read(payload, payload_offset, &count)) return false;
+        if (count > payload.size()) return false;
+        std::vector<DataPoint> points(count);
+        for (auto& point : points) {
+            if (!Read(payload, payload_offset, &point.series_id) ||
+                !Read(payload, payload_offset, &point.timestamp_ms) ||
+                !Read(payload, payload_offset, &point.value)) {
+                return false;
+            }
+        }
+        ApplyPoints(points, *version);
+        return true;
+    }
+
+    // Replays complete records only. A torn tail (crash between the write and
+    // the fsync, or a partially written record) ends the log: everything from
+    // the first malformed byte on is discarded and the file is later truncated
+    // to wal_valid_bytes, so a second crash cannot make the log unreadable.
     Status ReplayWal() {
         if (!std::filesystem::exists(wal_path)) return Status::Ok();
         std::string data;
         if (!ReadFile(wal_path, &data)) return Status::Error("cannot read WAL");
         size_t offset = 0;
         while (offset < data.size()) {
+            const size_t record_start = offset;
             uint32_t magic = 0;
             uint8_t type = 0;
             uint64_t length = 0;
             uint64_t checksum = 0;
-            const size_t record_start = offset;
             if (!Read(data, offset, &magic) || !Read(data, offset, &type) ||
                 !Read(data, offset, &length)) {
                 break;
             }
-            if (magic != kWalMagic) return Status::Error("corrupt WAL magic");
-            if (offset + sizeof(checksum) + length > data.size()) {
+            if (magic != kWalMagic) break;
+            if (length > data.size() - offset ||
+                offset + sizeof(checksum) + length > data.size()) {
                 break;
             }
             if (!Read(data, offset, &checksum)) break;
             std::string payload = data.substr(offset, length);
             offset += length;
-            if (checksum != Checksum(payload)) return Status::Error("corrupt WAL checksum");
-            wal_bytes_replayed += offset - record_start;
+            if (checksum != Checksum(payload)) break;
+
+            const size_t record_end = offset;
             size_t payload_offset = 0;
             CommitVersion version = 0;
+            bool applied = false;
             if (type == kTxnRecord) {
-                uint32_t encoded_magic = 0;
-                if (payload.size() >= sizeof(uint32_t) &&
-                    Read(payload, payload_offset, &encoded_magic) &&
-                    encoded_magic == kEncodedWalPayloadMagic) {
-                    if (!Read(payload, payload_offset, &version)) {
-                        return Status::Error("invalid encoded WAL");
-                    }
-                    uint32_t count = 0;
-                    if (!Read(payload, payload_offset, &count)) {
-                        return Status::Error("invalid encoded WAL");
-                    }
-                    std::vector<DataPoint> points(count);
-                    for (auto& point : points) {
-                        uint64_t series_id = 0;
-                        uint64_t zigzag_timestamp = 0;
-                        if (!ReadUvarint(payload, payload_offset, &series_id) ||
-                            !ReadUvarint(payload, payload_offset,
-                                         &zigzag_timestamp) ||
-                            !Read(payload, payload_offset, &point.value)) {
-                            return Status::Error("invalid encoded WAL");
-                        }
-                        point.series_id = series_id;
-                        point.timestamp_ms = ZigzagDecode(zigzag_timestamp);
-                    }
-                    ApplyPoints(points, version);
-                } else {
-                    payload_offset = 0;
-                    if (!Read(payload, payload_offset, &version)) return Status::Error("invalid WAL");
-                    uint32_t count = 0;
-                    if (!Read(payload, payload_offset, &count)) return Status::Error("invalid WAL");
-                    std::vector<DataPoint> points(count);
-                    for (auto& point : points) {
-                        if (!Read(payload, payload_offset, &point.series_id) ||
-                            !Read(payload, payload_offset, &point.timestamp_ms) ||
-                            !Read(payload, payload_offset, &point.value)) {
-                            return Status::Error("invalid WAL");
-                        }
-                    }
-                    ApplyPoints(points, version);
-                }
+                applied = ApplyWalTxn(payload, &version);
             } else if (type == kExpireRecord) {
-                if (!Read(payload, payload_offset, &version)) {
-                    return Status::Error("invalid WAL");
-                }
-                if (!Read(payload, payload_offset, &cutoff)) {
-                    return Status::Error("invalid WAL");
-                }
-            } else {
-                return Status::Error("unknown WAL record");
+                applied = Read(payload, payload_offset, &version) &&
+                          Read(payload, payload_offset, &cutoff);
             }
+            if (!applied) break;
+
+            wal_bytes_replayed += record_end - record_start;
+            wal_valid_bytes = record_end;
             next_version = std::max(next_version, version + 1);
         }
         return Status::Ok();
     }
 };
 
-Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
+Engine::Engine(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {
     impl_->owner = this;
     impl_->write_worker = std::thread([this] {
         PinCurrentThread(impl_->options.cpu_budget, 0);
@@ -1230,8 +1248,7 @@ Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
             }
             if (ok) ok = ::fsync(impl_->wal_fd) == 0;
             if (!ok && wal_record_start >= 0) {
-                ::ftruncate(impl_->wal_fd, wal_record_start);
-                ::fsync(impl_->wal_fd);
+                TruncateWalBestEffort(impl_->wal_fd, wal_record_start);
             }
             if (ok) {
                 impl_->ApplyGroup(group);
@@ -1282,8 +1299,13 @@ Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
                 });
                 if (impl_->stopping_compaction) return;
                 impl_->compaction_requested = false;
-                while (impl_->ShouldCompactLocked(
-                    impl_->options.compaction_sstable_threshold)) {
+                // Bounded per wakeup: foreground flushing must not be starved by
+                // a merge loop that is refilled as fast as it drains.
+                for (size_t round = 0;
+                     round < 32 &&
+                     impl_->ShouldCompactLocked(
+                         impl_->options.compaction_sstable_threshold);
+                     ++round) {
                     if (!CompactRoundLocked(
                              lock,
                              impl_->options.compaction_sstable_threshold)
@@ -1324,7 +1346,7 @@ std::unique_ptr<Engine> Engine::Open(const std::filesystem::path& path,
             }
         }
     }
-    auto impl = std::make_unique<Impl>(path, options);
+    auto impl = std::make_shared<Impl>(path, options);
     impl->wal_path = path / "wal.log";
     impl->manifest_path = path / "MANIFEST";
     impl->shards.resize(options.shard_count);
@@ -1334,6 +1356,19 @@ std::unique_ptr<Engine> Engine::Open(const std::filesystem::path& path,
     if (!load_status.ok) return fail(load_status);
     load_status = impl->ReplayWal();
     if (!load_status.ok) return fail(load_status);
+    // Drop a torn tail before appending again: otherwise the next crash would
+    // leave a valid record behind a malformed one and the log could never be
+    // replayed again (every later open would fail its magic/checksum check).
+    if (std::filesystem::exists(impl->wal_path)) {
+        std::error_code size_ec;
+        const auto wal_size =
+            std::filesystem::file_size(impl->wal_path, size_ec);
+        if (!size_ec && wal_size > impl->wal_valid_bytes &&
+            ::truncate(impl->wal_path.c_str(),
+                       static_cast<off_t>(impl->wal_valid_bytes)) != 0) {
+            return fail(Status::Error("cannot truncate WAL tail"));
+        }
+    }
     impl->wal_fd = ::open(impl->wal_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (impl->wal_fd < 0) return fail(Status::Error("cannot open WAL"));
     if (status) *status = Status::Ok();
@@ -1590,9 +1625,9 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
             advance(item.source);
             return item.point;
         },
-        [this, state] {
-            std::lock_guard lock(impl_->mutex);
-            if (impl_->active_read_views > 0) --impl_->active_read_views;
+        [impl = impl_, state] {
+            std::lock_guard lock(impl->mutex);
+            if (impl->active_read_views > 0) --impl->active_read_views;
             for (const auto& sstable : state->view.sstables) {
                 if (sstable->refs > 0) --sstable->refs;
             }
@@ -1666,9 +1701,11 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
         return Status::Error("WAL sync failed");
     }
     impl_->cutoff = cutoff;
+    bool removed_sstable = false;
     std::vector<std::shared_ptr<SstableMetadata>> retained_sstables;
     for (const auto& sstable : impl_->sstable_metadata) {
         if (sstable->max_timestamp < cutoff) {
+            removed_sstable = true;
             impl_->obsolete_sstables.push_back(sstable);
             for (auto it = impl_->current_files.begin();
                  it != impl_->current_files.end();) {
@@ -1683,6 +1720,15 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
         }
     }
     impl_->sstable_metadata = std::move(retained_sstables);
+    if (removed_sstable) {
+        // Publish the shrunken file set before GC may unlink those SSTables: a
+        // crash that leaves the old Manifest on disk would otherwise point at
+        // files that are already gone and the engine could not reopen.
+        // The expire itself is already durable in the WAL, so reporting the
+        // error is enough - a retry with the same cutoff is a no-op.
+        auto publish_status = impl_->PublishManifestLocked(impl_->current_files);
+        if (!publish_status.ok) return publish_status;
+    }
     if (impl_->options.enable_background_compaction) {
         impl_->compaction_requested = true;
         impl_->compaction_cv.notify_one();
@@ -1835,7 +1881,9 @@ Status Engine::Flush() {
 Status Engine::Compact() {
     std::unique_lock lock(impl_->mutex);
     if (impl_->closed) return Status::Error("engine is closed");
-    while (impl_->ShouldCompactLocked(2)) {
+    // Bounded: with writers flushing continuously a shard can refill its level
+    // as fast as it is merged, which would keep this loop spinning forever.
+    for (size_t round = 0; round < 64 && impl_->ShouldCompactLocked(2); ++round) {
         auto status = CompactRoundLocked(lock, 2);
         if (!status.ok) return status;
     }

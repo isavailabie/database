@@ -2,8 +2,10 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <thread>
 #include <vector>
@@ -407,6 +409,23 @@ void TestSstableChecksum(const std::filesystem::path& path) {
     assert(engine == nullptr);
 }
 
+// A cursor keeps its own read view, so it must remain valid (and closeable)
+// after the Engine that produced it has been destroyed.
+void TestCursorOutlivesEngine(const std::filesystem::path& path) {
+    std::unique_ptr<Cursor> cursor;
+    {
+        Status status;
+        auto engine = Engine::Open(path, Options{4, 1000}, &status);
+        AssertOk(status);
+        AssertOk(engine->Put({42, 100, 1.0}));
+        AssertOk(engine->Scan({42}, 0, 200, &cursor));
+        AssertOk(engine->Close());
+    }
+    auto point = cursor->NextPoint();
+    assert(point && point->timestamp_ms == 100);
+    cursor->Close();
+}
+
 void TestLargeSeriesStreaming(const std::filesystem::path& path) {
     Status status;
     auto engine = Engine::Open(path, Options{4, 100000}, &status);
@@ -478,6 +497,41 @@ void TestCrashRecoveryExpire(const std::filesystem::path& path) {
     AssertOk(engine->Close());
 }
 
+// A torn WAL tail must be dropped on recovery. Otherwise the next crash would
+// append valid records behind the garbage, and every later open would fail its
+// magic/checksum check (the log would be unreadable forever).
+void TestTornWalTailRecovery(const std::filesystem::path& path) {
+    auto crash_write = [&path](uint64_t series_id, int64_t timestamp) {
+        const pid_t pid = fork();
+        assert(pid >= 0);
+        if (pid == 0) {
+            Status status;
+            auto engine = Engine::Open(path, Options{4, 1000}, &status);
+            if (!status.ok) _exit(2);
+            if (!engine->Put({series_id, timestamp, 1.0}).ok) _exit(3);
+            _exit(0);
+        }
+        int child_status = 0;
+        waitpid(pid, &child_status, 0);
+        assert(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
+    };
+
+    crash_write(31, 100);
+    {
+        std::ofstream wal(path / "wal.log", std::ios::binary | std::ios::app);
+        wal << 'T';  // torn record tail, as a crash mid-write would leave
+    }
+    crash_write(31, 200);  // opens (must truncate), commits, crashes again
+
+    Status status;
+    auto engine = Engine::Open(path, Options{4, 1000}, &status);
+    AssertOk(status);
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({31}, 0, 1000, &cursor));
+    assert(Read(cursor.get()).size() == 2);
+    AssertOk(engine->Close());
+}
+
 void TestConcurrentCompactionStress(const std::filesystem::path& path) {
     Status status;
     auto engine = Engine::Open(path, Options{4, 5000}, &status);
@@ -519,28 +573,56 @@ void TestConcurrentCompactionStress(const std::filesystem::path& path) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     const auto root = TestPath();
-    TestTimestampEncodingRoundTrip();
-    TestWriteScanAndAtomicValidation(root / "atomic");
-    TestReadViewAndExpiration(root / "views");
-    TestRecovery(root / "recovery");
-    TestConcurrentGroupCommit(root / "group_commit");
-    TestQueueBackpressure(root / "queue");
-    TestNegativeWindowsAndDuplicateSeries(root / "negative");
-    TestMultipleIncrementalFlushes(root / "incremental");
-    TestPhysicalExpirationAndGC(root / "physical_expiration");
-    TestLargeSeriesPaging(root / "large_series_paging");
-    TestLargeSeriesStreaming(root / "large_series_streaming");
-    TestFlushClearsMemtable(root / "flush_clears_memtable");
-    TestCompactionMergesSstables(root / "compaction_merges");
-    TestCompactionDropsExpired(root / "compaction_drops_expired");
-    TestMultiLevelCompaction(root / "multi_level_compaction");
-    TestNegativeTimestampRecovery(root / "negative_ts_recovery");
-    TestGcReclaimsWhileViewActive(root / "gc_refcount");
-    TestCrashRecovery(root / "crash_recovery");
-    TestCrashRecoveryExpire(root / "crash_recovery_expire");
-    TestConcurrentCompactionStress(root / "concurrent_compaction_stress");
-    TestSstableChecksum(root / "checksum");
+    struct Case {
+        const char* name;
+        std::function<void()> run;
+    };
+    const std::vector<Case> cases = {
+        {"timestamp_encoding", [&] { TestTimestampEncodingRoundTrip(); }},
+        {"write_scan_atomic", [&] { TestWriteScanAndAtomicValidation(root / "atomic"); }},
+        {"readview_expiration", [&] { TestReadViewAndExpiration(root / "views"); }},
+        {"recovery", [&] { TestRecovery(root / "recovery"); }},
+        {"concurrent_group_commit", [&] { TestConcurrentGroupCommit(root / "group_commit"); }},
+        {"queue_backpressure", [&] { TestQueueBackpressure(root / "queue"); }},
+        {"negative_windows", [&] { TestNegativeWindowsAndDuplicateSeries(root / "negative"); }},
+        {"incremental_flush", [&] { TestMultipleIncrementalFlushes(root / "incremental"); }},
+        {"physical_expiration_gc", [&] { TestPhysicalExpirationAndGC(root / "physical_expiration"); }},
+        {"large_series_paging", [&] { TestLargeSeriesPaging(root / "large_series_paging"); }},
+        {"large_series_streaming", [&] { TestLargeSeriesStreaming(root / "large_series_streaming"); }},
+        {"flush_clears_memtable", [&] { TestFlushClearsMemtable(root / "flush_clears_memtable"); }},
+        {"compaction_merges", [&] { TestCompactionMergesSstables(root / "compaction_merges"); }},
+        {"compaction_drops_expired", [&] { TestCompactionDropsExpired(root / "compaction_drops_expired"); }},
+        {"multi_level_compaction", [&] { TestMultiLevelCompaction(root / "multi_level_compaction"); }},
+        {"negative_ts_recovery", [&] { TestNegativeTimestampRecovery(root / "negative_ts_recovery"); }},
+        {"gc_refcount", [&] { TestGcReclaimsWhileViewActive(root / "gc_refcount"); }},
+        {"crash_recovery", [&] { TestCrashRecovery(root / "crash_recovery"); }},
+        {"crash_recovery_expire", [&] { TestCrashRecoveryExpire(root / "crash_recovery_expire"); }},
+        {"torn_wal_tail", [&] { TestTornWalTailRecovery(root / "torn_wal_tail"); }},
+        {"concurrent_compaction_stress", [&] { TestConcurrentCompactionStress(root / "concurrent_compaction_stress"); }},
+        {"sstable_checksum", [&] { TestSstableChecksum(root / "checksum"); }},
+        {"cursor_outlives_engine", [&] { TestCursorOutlivesEngine(root / "cursor_lifetime"); }},
+    };
+    const std::string filter = argc > 1 ? argv[1] : std::string();
+    size_t ran = 0;
+    for (size_t i = 0; i < cases.size(); ++i) {
+        if (!filter.empty() && filter != std::to_string(i + 1) &&
+            std::string(cases[i].name).find(filter) == std::string::npos) {
+            continue;
+        }
+        std::cout << "[" << (i + 1) << "/" << cases.size() << "] "
+                  << cases[i].name << " ... " << std::flush;
+        const auto started = std::chrono::steady_clock::now();
+        cases[i].run();
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started);
+        std::cout << "ok (" << elapsed.count() << " ms)" << std::endl;
+        ++ran;
+    }
+    if (ran == 0) {
+        std::cerr << "no test matched '" << filter << "'\n";
+        return 2;
+    }
     std::cout << "all tests passed\n";
 }
