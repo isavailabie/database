@@ -1433,21 +1433,37 @@ struct Engine::Impl {
             }
         }
         bool ok = true;
-        for (size_t shard_id = 0; shard_id < per_shard.size() && ok; ++shard_id) {
+        std::vector<char> shard_ok(per_shard.size(), 0);
+        std::vector<std::thread> writers;
+        for (size_t shard_id = 0; shard_id < per_shard.size(); ++shard_id) {
             if (per_shard[shard_id].empty()) continue;
-            for (const PendingWrite* request : per_shard[shard_id]) {
-                std::vector<DataPoint> points;
-                for (const auto& point : request->points) {
-                    if (ShardFor(point.series_id) == shard_id) points.push_back(point);
+            shard_ok[shard_id] = 1;
+            writers.emplace_back([this, shard_id, &per_shard, &shard_ok] {
+                for (const PendingWrite* request : per_shard[shard_id]) {
+                    std::vector<DataPoint> points;
+                    for (const auto& point : request->points) {
+                        if (ShardFor(point.series_id) == shard_id) {
+                            points.push_back(point);
+                        }
+                    }
+                    if (!AppendWalRecordNoSync(
+                            shard_wal_fd[shard_id], kTxnRecord,
+                            WalPayloadTxn(request->version, points))) {
+                        shard_ok[shard_id] = 0;
+                        return;
+                    }
                 }
-                if (!AppendWalRecordNoSync(shard_wal_fd[shard_id], kTxnRecord,
-                                           WalPayloadTxn(request->version, points))) {
-                    ok = false;
-                    break;
-                }
+                if (::fsync(shard_wal_fd[shard_id]) != 0) shard_ok[shard_id] = 0;
+            });
+        }
+        for (auto& writer : writers) writer.join();
+        for (size_t shard_id = 0; shard_id < per_shard.size(); ++shard_id) {
+            if (per_shard[shard_id].empty()) continue;
+            if (shard_ok[shard_id] == 0) {
+                ok = false;
+            } else {
+                ++wal_syncs;
             }
-            if (ok) ok = ::fsync(shard_wal_fd[shard_id]) == 0;
-            if (ok) ++wal_syncs;
         }
         if (!ok) return false;
         std::string payload;
