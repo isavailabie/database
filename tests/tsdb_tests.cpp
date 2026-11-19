@@ -406,6 +406,24 @@ void TestSstableChecksum(const std::filesystem::path& path) {
     assert(engine == nullptr);
 }
 
+void TestLargeSeriesStreaming(const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(path, Options{4, 100000}, &status);
+    AssertOk(status);
+    std::vector<DataPoint> batch;
+    batch.reserve(100000);
+    for (int i = 0; i < 100000; ++i) {
+        batch.push_back({910, static_cast<int64_t>(i * 10),
+                         static_cast<double>(i)});
+    }
+    AssertOk(engine->WriteBatch(batch));
+    AssertOk(engine->Flush());
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({910}, 0, 2000000, &cursor));
+    assert(Read(cursor.get()).size() == 100000);
+    AssertOk(engine->Close());
+}
+
 void TestCrashRecovery(const std::filesystem::path& path) {
     const pid_t pid = fork();
     assert(pid >= 0);
@@ -447,6 +465,7 @@ int main() {
     TestMultipleIncrementalFlushes(root / "incremental");
     TestPhysicalExpirationAndGC(root / "physical_expiration");
     TestLargeSeriesPaging(root / "large_series_paging");
+    TestLargeSeriesStreaming(root / "large_series_streaming");
     TestFlushClearsMemtable(root / "flush_clears_memtable");
     TestCompactionMergesSstables(root / "compaction_merges");
     TestCompactionDropsExpired(root / "compaction_drops_expired");

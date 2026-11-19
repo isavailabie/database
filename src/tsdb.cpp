@@ -343,67 +343,6 @@ struct SstableWriter {
     }
 };
 
-bool ReadSeriesPoints(const SstableMetadata& sstable, uint64_t series_id,
-                      std::vector<VersionedPoint>* out) {
-    const auto it = sstable.series.find(series_id);
-    if (it == sstable.series.end()) return true;
-    const auto& entry = it->second;
-    const int fd = ::open(sstable.path.c_str(), O_RDONLY);
-    if (fd < 0) return false;
-    bool ok = true;
-    if (sstable.encoding == kEncodedSstableMagic) {
-        std::vector<char> buffer(entry.byte_length);
-        const ssize_t bytes =
-            ::pread(fd, buffer.data(), buffer.size(), entry.offset);
-        if (bytes > 0) {
-            std::string payload(buffer.data(), static_cast<size_t>(bytes));
-            size_t offset = 0;
-            for (uint64_t i = 0; i < entry.point_count; ++i) {
-                uint64_t sid = 0;
-                uint64_t zigzag_timestamp = 0;
-                double value = 0.0;
-                uint64_t version = 0;
-                if (!ReadUvarint(payload, offset, &sid) ||
-                    !ReadUvarint(payload, offset, &zigzag_timestamp) ||
-                    !Read(payload, offset, &value) ||
-                    !ReadUvarint(payload, offset, &version)) {
-                    ok = false;
-                    break;
-                }
-                out->push_back({{sid, ZigzagDecode(zigzag_timestamp), value},
-                                static_cast<CommitVersion>(version)});
-            }
-        }
-    } else {
-        const size_t record_size = sizeof(uint64_t) + sizeof(int64_t) +
-                                   sizeof(double) + sizeof(CommitVersion);
-        std::vector<char> buffer(entry.point_count * record_size);
-        const ssize_t bytes =
-            ::pread(fd, buffer.data(), buffer.size(), entry.offset);
-        const size_t complete = static_cast<size_t>(bytes) / record_size;
-        for (size_t j = 0; j < complete; ++j) {
-            const char* record = buffer.data() + j * record_size;
-            uint64_t sid = 0;
-            int64_t timestamp = 0;
-            double value = 0.0;
-            CommitVersion version = 0;
-            std::memcpy(&sid, record, sizeof(uint64_t));
-            std::memcpy(&timestamp, record + sizeof(uint64_t), sizeof(int64_t));
-            std::memcpy(&value,
-                        record + sizeof(uint64_t) + sizeof(int64_t),
-                        sizeof(double));
-            std::memcpy(&version,
-                        record + sizeof(uint64_t) + sizeof(int64_t) +
-                            sizeof(double),
-                        sizeof(CommitVersion));
-            out->push_back({{sid, timestamp, value}, version});
-        }
-        ok = complete == entry.point_count;
-    }
-    ::close(fd);
-    return ok;
-}
-
 struct StreamingReader {
     std::ifstream in;
     uint64_t hash{1469598103934665603ULL};
@@ -442,6 +381,89 @@ struct StreamingReader {
         return true;
     }
 };
+
+constexpr size_t kInlineReadBytes = 1 * 1024 * 1024;
+
+bool ReadSeriesPoints(const SstableMetadata& sstable, uint64_t series_id,
+                      std::vector<VersionedPoint>* out) {
+    const auto it = sstable.series.find(series_id);
+    if (it == sstable.series.end()) return true;
+    const auto& entry = it->second;
+    out->reserve(entry.point_count);
+    if (sstable.encoding == kEncodedSstableMagic) {
+        if (entry.byte_length <= kInlineReadBytes) {
+            const int fd = ::open(sstable.path.c_str(), O_RDONLY);
+            if (fd < 0) return false;
+            std::vector<char> buffer(entry.byte_length);
+            const ssize_t bytes =
+                ::pread(fd, buffer.data(), buffer.size(), entry.offset);
+            ::close(fd);
+            if (bytes <= 0) return false;
+            std::string payload(buffer.data(), static_cast<size_t>(bytes));
+            size_t offset = 0;
+            for (uint64_t i = 0; i < entry.point_count; ++i) {
+                uint64_t sid = 0;
+                uint64_t zigzag_timestamp = 0;
+                double value = 0.0;
+                uint64_t version = 0;
+                if (!ReadUvarint(payload, offset, &sid) ||
+                    !ReadUvarint(payload, offset, &zigzag_timestamp) ||
+                    !Read(payload, offset, &value) ||
+                    !ReadUvarint(payload, offset, &version)) {
+                    return false;
+                }
+                out->push_back({{sid, ZigzagDecode(zigzag_timestamp), value},
+                                static_cast<CommitVersion>(version)});
+            }
+            return true;
+        }
+        StreamingReader reader(sstable.path);
+        reader.in.seekg(entry.offset, std::ios::beg);
+        if (!reader.in) return false;
+        for (uint64_t i = 0; i < entry.point_count; ++i) {
+            uint64_t sid = 0;
+            uint64_t zigzag_timestamp = 0;
+            double value = 0.0;
+            uint64_t version = 0;
+            if (!reader.ReadUvarint(&sid) ||
+                !reader.ReadUvarint(&zigzag_timestamp) ||
+                !reader.ReadDouble(&value) ||
+                !reader.ReadUvarint(&version)) {
+                return false;
+            }
+            out->push_back({{sid, ZigzagDecode(zigzag_timestamp), value},
+                            static_cast<CommitVersion>(version)});
+        }
+        return true;
+    }
+    const int fd = ::open(sstable.path.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    const size_t record_size = sizeof(uint64_t) + sizeof(int64_t) +
+                               sizeof(double) + sizeof(CommitVersion);
+    std::vector<char> buffer(entry.point_count * record_size);
+    const ssize_t bytes =
+        ::pread(fd, buffer.data(), buffer.size(), entry.offset);
+    const size_t complete = static_cast<size_t>(bytes) / record_size;
+    for (size_t j = 0; j < complete; ++j) {
+        const char* record = buffer.data() + j * record_size;
+        uint64_t sid = 0;
+        int64_t timestamp = 0;
+        double value = 0.0;
+        CommitVersion version = 0;
+        std::memcpy(&sid, record, sizeof(uint64_t));
+        std::memcpy(&timestamp, record + sizeof(uint64_t), sizeof(int64_t));
+        std::memcpy(&value,
+                    record + sizeof(uint64_t) + sizeof(int64_t),
+                    sizeof(double));
+        std::memcpy(&version,
+                    record + sizeof(uint64_t) + sizeof(int64_t) +
+                        sizeof(double),
+                    sizeof(CommitVersion));
+        out->push_back({{sid, timestamp, value}, version});
+    }
+    ::close(fd);
+    return complete == entry.point_count;
+}
 
 }  // namespace
 
@@ -1249,40 +1271,68 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
             const int fd = ::open(sstable->path.c_str(), O_RDONLY);
             if (fd < 0) continue;
             if (sstable->encoding == kEncodedSstableMagic) {
-                std::vector<char> encoded_page(entry.byte_length);
-                const ssize_t bytes =
-                    ::pread(fd, encoded_page.data(), encoded_page.size(),
-                            entry.offset);
-                if (bytes > 0) {
-                    std::string payload(
-                        encoded_page.data(), static_cast<size_t>(bytes));
-                    size_t encoded_offset = 0;
-                    for (uint64_t i = 0; i < entry.point_count; ++i) {
-                        uint64_t disk_series = 0;
-                        uint64_t zigzag_timestamp = 0;
-                        double disk_value = 0.0;
-                        uint64_t disk_version = 0;
-                        if (!ReadUvarint(payload, encoded_offset, &disk_series) ||
-                            !ReadUvarint(payload, encoded_offset,
-                                         &zigzag_timestamp) ||
-                            !Read(payload, encoded_offset, &disk_value) ||
-                            !ReadUvarint(payload, encoded_offset,
-                                         &disk_version)) {
-                            break;
+                const auto insert = [&](uint64_t disk_series,
+                                        int64_t disk_timestamp,
+                                        double disk_value,
+                                        uint64_t disk_version) {
+                    if (disk_timestamp >= start && disk_timestamp < end &&
+                        disk_timestamp >= view.cutoff &&
+                        disk_version <= view.version) {
+                        const auto existing = merged.find(disk_timestamp);
+                        if (existing == merged.end() ||
+                            disk_version >= existing->second.version) {
+                            merged[disk_timestamp] = VersionedPoint{
+                                {disk_series, disk_timestamp, disk_value},
+                                static_cast<CommitVersion>(disk_version)};
                         }
-                        const int64_t disk_timestamp =
-                            ZigzagDecode(zigzag_timestamp);
-                        if (disk_timestamp >= start && disk_timestamp < end &&
-                            disk_timestamp >= view.cutoff &&
-                            disk_version <= view.version) {
-                            const auto existing = merged.find(disk_timestamp);
-                            if (existing == merged.end() ||
-                                disk_version >= existing->second.version) {
-                                merged[disk_timestamp] =
-                                    VersionedPoint{
-                                        {disk_series, disk_timestamp, disk_value},
-                                        static_cast<CommitVersion>(disk_version)};
+                    }
+                };
+                if (entry.byte_length <= kInlineReadBytes) {
+                    std::vector<char> encoded_page(entry.byte_length);
+                    const ssize_t bytes =
+                        ::pread(fd, encoded_page.data(), encoded_page.size(),
+                                entry.offset);
+                    if (bytes > 0) {
+                        std::string payload(
+                            encoded_page.data(), static_cast<size_t>(bytes));
+                        size_t encoded_offset = 0;
+                        for (uint64_t i = 0; i < entry.point_count; ++i) {
+                            uint64_t disk_series = 0;
+                            uint64_t zigzag_timestamp = 0;
+                            double disk_value = 0.0;
+                            uint64_t disk_version = 0;
+                            if (!ReadUvarint(payload, encoded_offset,
+                                             &disk_series) ||
+                                !ReadUvarint(payload, encoded_offset,
+                                             &zigzag_timestamp) ||
+                                !Read(payload, encoded_offset, &disk_value) ||
+                                !ReadUvarint(payload, encoded_offset,
+                                             &disk_version)) {
+                                break;
                             }
+                            insert(disk_series,
+                                   ZigzagDecode(zigzag_timestamp), disk_value,
+                                   disk_version);
+                        }
+                    }
+                } else {
+                    StreamingReader reader(sstable->path);
+                    reader.in.seekg(entry.offset, std::ios::beg);
+                    if (reader.in) {
+                        for (uint64_t i = 0; i < entry.point_count; ++i) {
+                            uint64_t disk_series = 0;
+                            uint64_t zigzag_timestamp = 0;
+                            double disk_value = 0.0;
+                            uint64_t disk_version = 0;
+                            if (!reader.ReadUvarint(&disk_series) ||
+                                !reader.ReadUvarint(&zigzag_timestamp) ||
+                                !reader.ReadDouble(&disk_value) ||
+                                !reader.ReadUvarint(&disk_version)) {
+                                break;
+                            }
+                            insert(disk_series,
+                                   ZigzagDecode(zigzag_timestamp), disk_value,
+                                   disk_version);
                         }
                     }
                 }
