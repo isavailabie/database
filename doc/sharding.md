@@ -148,6 +148,29 @@ Compaction 是**分片内、分层**的：同片同层 ≥8 个文件归并成�
 
 因此在单盘（课程验收环境）上，`Options::sharded_wal` 保持默认 `false`。
 
+### 6.2 独立 WAL 盘：`Options::wal_dir`
+
+WAL 段目录默认是 `<db>/wal`，可通过 `Options::wal_dir` 指到**另一块盘**，
+让 WAL fsync 不再和 SSTable 的刷盘/合并抢同一块盘：
+
+```cpp
+tsdb::Options opts;
+opts.wal_dir = "/mnt/wal";   // SSTable 仍在 db/sst，WAL 在独立盘
+opts.sharded_wal = true;     // 可选：分片 WAL
+```
+
+- Manifest 记录 `WAL_DIR`；若下次启动时该目录变了，`Open` 直接报错
+  `WAL directory changed since last open`，避免把未刷盘段丢在旧盘；
+- 分片 WAL 复用同一覆盖：`wal_dir/shard-N/` + `wal_dir/commit/`；
+- 基准和恢复程序都支持 `--wal-dir DIR`：
+  `./tsdb_mixed_bench 60 --wal-dir /mnt/wal [--sharded-wal]`、
+  `./tsdb_bench 1000000 --wal-dir /mnt/wal`、`./tsdb_recover DIR --wal-dir /mnt/wal`。
+
+> 说明：本机只有一块物理盘，同盘不同目录的 A/B 不会带来吞吐提升
+> （实测全局 237k 点/s、分片 220k 点/s，仍是 fsync 次数差异）。
+> 独立盘的价值要放到**两个真实设备**上才能体现；分片 fsync 要真正并行，
+> 还需要每分片 WAL 落在各自独立的盘上 + 单分片自提交（见 6.1 第 2 点）。
+
 ## 7. 实测（1M 点，磁盘，非 tmpfs）
 
 | 场景 | 结果 |
