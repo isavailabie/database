@@ -6,6 +6,33 @@
 #include <iostream>
 #include <vector>
 
+namespace {
+
+// WAL segments are numbered; the newest one is the active log.
+std::filesystem::path NewestWalSegment(const std::filesystem::path& path) {
+    std::filesystem::path newest;
+    uint64_t best = 0;
+    std::error_code ec;
+    for (const auto& entry :
+         std::filesystem::directory_iterator(path / "wal", ec)) {
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().extension() != ".log") continue;
+        uint64_t number = 0;
+        try {
+            number = std::stoull(entry.path().stem().string());
+        } catch (...) {
+            continue;
+        }
+        if (newest.empty() || number > best) {
+            best = number;
+            newest = entry.path();
+        }
+    }
+    return newest;
+}
+
+}  // namespace
+
 int main() {
     size_t injected = 0;
 
@@ -38,8 +65,8 @@ int main() {
                               std::ios::binary);
             tmp << "orphan";
         } else if (i % 5 == 2) {
-            std::ofstream wal(path / "wal.log", std::ios::binary |
-                                                std::ios::app);
+            std::ofstream wal(NewestWalSegment(path),
+                              std::ios::binary | std::ios::app);
             wal << "T";
         } else if (i % 5 == 3) {
             for (const auto& entry :

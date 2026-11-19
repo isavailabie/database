@@ -215,6 +215,10 @@ int main(int argc, char** argv) {
               << " wal_bytes=" << stats.wal_bytes
               << " visible_version=" << stats.visible_version
               << " commits=" << stats.visible_version
+              << " wal_syncs=" << stats.wal_syncs
+              << " syncs_per_second="
+              << (elapsed > 0 ? static_cast<double>(stats.wal_syncs) / elapsed
+                              : 0.0)
               << " points_per_commit="
               << (stats.visible_version
                       ? static_cast<double>(written_count) /

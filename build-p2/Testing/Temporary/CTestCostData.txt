@@ -1,3 +1,3 @@
-tsdb_tests 3 0.716203
-tsdb_fault_test 3 0.0155356
+tsdb_tests 12 0.194655
+tsdb_fault_test 12 0.0125086
 ---

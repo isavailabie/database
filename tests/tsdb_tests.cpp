@@ -36,6 +36,29 @@ std::vector<DataPoint> Read(Cursor* cursor) {
     return result;
 }
 
+// WAL segments are numbered; the newest one is the active log.
+std::filesystem::path NewestWalSegment(const std::filesystem::path& path) {
+    std::filesystem::path newest;
+    uint64_t best = 0;
+    std::error_code ec;
+    for (const auto& entry :
+         std::filesystem::directory_iterator(path / "wal", ec)) {
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().extension() != ".log") continue;
+        uint64_t number = 0;
+        try {
+            number = std::stoull(entry.path().stem().string());
+        } catch (...) {
+            continue;
+        }
+        if (newest.empty() || number > best) {
+            best = number;
+            newest = entry.path();
+        }
+    }
+    return newest;
+}
+
 void TestWriteScanAndAtomicValidation(const std::filesystem::path& path) {
     Status status;
     auto engine = Engine::Open(path, Options{4, 1000}, &status);
@@ -518,7 +541,8 @@ void TestTornWalTailRecovery(const std::filesystem::path& path) {
 
     crash_write(31, 100);
     {
-        std::ofstream wal(path / "wal.log", std::ios::binary | std::ios::app);
+        std::ofstream wal(NewestWalSegment(path),
+                          std::ios::binary | std::ios::app);
         wal << 'T';  // torn record tail, as a crash mid-write would leave
     }
     crash_write(31, 200);  // opens (must truncate), commits, crashes again

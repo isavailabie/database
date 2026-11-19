@@ -82,6 +82,7 @@ struct EngineStats {
     size_t immutable_points{};
     uint64_t wal_bytes{};
     uint64_t wal_bytes_replayed{};
+    uint64_t wal_syncs{};
     uint64_t compaction_count{};
     uint64_t flush_count{};
     size_t pending_batches{};

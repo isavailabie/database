@@ -165,18 +165,25 @@ int main(int argc, char** argv) {
         }
         compaction_seconds = bench::Seconds(bench::Clock::now() - compact_started);
     }
+    // Capture the write-phase counters before Close(), which flushes and would
+    // otherwise attribute the final flush to the reopened engine instead.
+    tsdb::EngineStats write_stats;
+    (void)engine->GetStats(&write_stats);
     if (!engine->Close().ok) {
         std::cerr << "close failed\n";
         return 4;
     }
 
-    const auto wal_path = args.path / "wal.log";
     uint64_t wal_bytes = 0;
     {
         std::error_code ec;
-        if (std::filesystem::exists(wal_path, ec)) {
-            const auto size = std::filesystem::file_size(wal_path, ec);
-            if (!ec) wal_bytes = static_cast<uint64_t>(size);
+        for (const auto& entry :
+             std::filesystem::directory_iterator(args.path / "wal", ec)) {
+            if (!entry.is_regular_file()) continue;
+            std::error_code size_ec;
+            const auto size =
+                std::filesystem::file_size(entry.path(), size_ec);
+            if (!size_ec) wal_bytes += static_cast<uint64_t>(size);
         }
     }
 
@@ -217,6 +224,7 @@ int main(int argc, char** argv) {
               << " sstables=" << stats.sstable_count
               << " sstable_bytes=" << stats.sstable_bytes
               << " recovery_seconds=" << recovery_seconds
+              << " flush_count=" << write_stats.flush_count
               << " wal_bytes=" << wal_bytes
               << " wal_bytes_replayed=" << stats.wal_bytes_replayed
               << " recovered_points=" << recovered << '\n';

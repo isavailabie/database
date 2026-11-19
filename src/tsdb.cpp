@@ -1,7 +1,9 @@
 #include "tsdb.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
@@ -142,6 +144,17 @@ bool SyncFile(const std::filesystem::path& path) {
     return ok;
 }
 
+// WAL segments live in db/wal/000001.log, 000002.log, ... and are replayed in
+// numeric order. Rotation lets a flush retire the segments it has already
+// covered instead of truncating one shared file.
+std::filesystem::path WalSegmentPath(const std::filesystem::path& dir,
+                                     uint64_t number) {
+    char name[32];
+    std::snprintf(name, sizeof(name), "%06llu.log",
+                  static_cast<unsigned long long>(number));
+    return dir / name;
+}
+
 // Best-effort rollback of a partially written WAL record. A failure here is not
 // actionable: the caller reports the original write error to the client anyway.
 void TruncateWalBestEffort(int fd, off_t size) {
@@ -168,11 +181,16 @@ struct VersionedPoint {
     CommitVersion version{};
 };
 
+using SeriesPoints = std::map<int64_t, VersionedPoint>;
+
 struct ShardData {
-    std::map<uint64_t, std::map<int64_t, VersionedPoint>> series;
+    // Snapshots share the per-series maps: a commit clones only the series it
+    // actually writes, never the whole shard. Copying the outer map stays cheap
+    // (a few thousand shared_ptr) regardless of how many points are resident.
+    std::map<uint64_t, std::shared_ptr<SeriesPoints>> series;
     size_t point_count() const {
         size_t count = 0;
-        for (const auto& [_, points] : series) count += points.size();
+        for (const auto& [_, points] : series) count += points->size();
         return count;
     }
 };
@@ -532,13 +550,19 @@ struct PendingWrite {
     bool done{false};
 };
 
+// One commit split by shard: the unit of work of a shard worker.
+struct ShardFragment {
+    std::vector<VersionedPoint> points;
+};
+
 struct Engine::Impl {
     explicit Impl(std::filesystem::path root, Options opts)
         : root(std::move(root)), options(opts) {}
 
     std::filesystem::path root;
     Options options;
-    std::filesystem::path wal_path;
+    std::filesystem::path wal_dir;
+    uint64_t wal_segment{1};
     std::filesystem::path manifest_path;
     mutable std::mutex mutex;
     std::condition_variable flush_cv;
@@ -556,6 +580,19 @@ struct Engine::Impl {
     std::condition_variable close_cv;
     Engine* owner{nullptr};
     std::vector<std::shared_ptr<ShardData>> shards;
+    // Per-shard execution: each shard owns a mutex, a queue and a worker, so a
+    // commit is applied by the shards in parallel instead of by one thread.
+    std::vector<std::unique_ptr<std::mutex>> shard_mutex;
+    std::vector<std::unique_ptr<std::condition_variable>> shard_cv;
+    std::vector<std::deque<std::shared_ptr<ShardFragment>>> shard_queue;
+    std::vector<std::thread> shard_worker;
+    std::vector<bool> shard_stopping;
+    std::mutex ack_mutex;
+    std::condition_variable ack_cv;
+    size_t inflight_fragments{0};
+    // Highest commit version whose fragments have all been applied; readers
+    // never observe a partially applied batch.
+    CommitVersion visible_version{0};
     CommitVersion next_version{1};
     int64_t cutoff{std::numeric_limits<int64_t>::min()};
     bool closed{false};
@@ -565,6 +602,8 @@ struct Engine::Impl {
     std::vector<std::shared_ptr<SstableMetadata>> sstable_metadata;
     uint64_t wal_bytes_replayed{0};
     uint64_t wal_valid_bytes{0};
+    uint64_t wal_syncs{0};
+    size_t active_writers{0};
     uint64_t next_file_number{1};
     int wal_fd{-1};
     uint64_t compaction_count{0};
@@ -578,6 +617,13 @@ struct Engine::Impl {
     CommitVersion last_flushed_version{0};
     std::unordered_map<uint64_t, int64_t> last_timestamps;
 
+    // Each streaming cursor holds one decoder per (series, SSTable) pair it
+    // touches, so this cap bounds open descriptors rather than result memory.
+    static constexpr size_t kMaxConcurrentScans = 16;
+    std::mutex scan_mu;
+    std::condition_variable scan_cv;
+    size_t active_scans{0};
+
     size_t ShardFor(uint64_t series_id) const {
         uint64_t value = series_id;
         value ^= value >> 30;
@@ -590,10 +636,15 @@ struct Engine::Impl {
 
     ReadView ViewLocked() const {
         ReadView view;
-        view.version = next_version - 1;
+        // Only fully applied batches are visible: a reader never observes half
+        // of a cross-shard commit.
+        view.version = visible_version;
         view.cutoff = cutoff;
         view.shards.reserve(shards.size());
-        for (const auto& shard : shards) view.shards.push_back(shard);
+        for (size_t i = 0; i < shards.size(); ++i) {
+            std::lock_guard lock(*shard_mutex[i]);
+            view.shards.push_back(shards[i]);
+        }
         for (const auto& sstable : sstable_metadata) {
             view.sstables.push_back(sstable);
             ++sstable->refs;
@@ -634,6 +685,23 @@ struct Engine::Impl {
         return Status::Ok();
     }
 
+    // Appends one point to the (already copy-on-write cloned) shard. The series
+    // map is cloned lazily on first write, so a 10-point batch touching three
+    // series copies three series maps instead of the whole shard.
+    void AppendToMemtable(uint64_t series_id, int64_t timestamp,
+                          const DataPoint& point, CommitVersion version) {
+        auto& slot = shards[ShardFor(series_id)]->series[series_id];
+        if (!slot) {
+            slot = std::make_shared<SeriesPoints>();
+        } else if (!slot.unique()) {
+            slot = std::make_shared<SeriesPoints>(*slot);
+        }
+        (*slot)[timestamp] = VersionedPoint{point, version};
+        last_timestamps[series_id] = timestamp;
+        memtable_bytes += sizeof(DataPoint) + sizeof(CommitVersion);
+        ++hot_series_points[series_id];
+    }
+
     void ApplyPoints(const std::vector<DataPoint>& points, CommitVersion version) {
         std::set<size_t> touched;
         for (const auto& point : points) touched.insert(ShardFor(point.series_id));
@@ -641,17 +709,70 @@ struct Engine::Impl {
             shards[shard_id] = std::make_shared<ShardData>(*shards[shard_id]);
         }
         for (const auto& point : points) {
-            shards[ShardFor(point.series_id)]->series[point.series_id]
-                [point.timestamp_ms] = VersionedPoint{point, version};
-            last_timestamps[point.series_id] = point.timestamp_ms;
-            memtable_bytes += sizeof(DataPoint) + sizeof(CommitVersion);
-            ++hot_series_points[point.series_id];
+            AppendToMemtable(point.series_id, point.timestamp_ms, point, version);
         }
     }
 
     void ClearMemtableLocked() {
-        for (auto& shard : shards) shard = std::make_shared<ShardData>();
+        for (size_t i = 0; i < shards.size(); ++i) {
+            std::lock_guard lock(*shard_mutex[i]);
+            shards[i] = std::make_shared<ShardData>();
+        }
         memtable_bytes = 0;
+    }
+
+    // Splits a committed group by shard, hands every fragment to that shard's
+    // worker and waits until all of them have been applied. Called with the
+    // global mutex held, so no flush or expire can interleave with a commit.
+    void DispatchGroup(const std::vector<std::shared_ptr<PendingWrite>>& group) {
+        std::vector<std::shared_ptr<ShardFragment>> fragments(shards.size());
+        for (const auto& request : group) {
+            for (const auto& point : request->points) {
+                const size_t shard_id = ShardFor(point.series_id);
+                if (!fragments[shard_id]) {
+                    fragments[shard_id] = std::make_shared<ShardFragment>();
+                }
+                fragments[shard_id]->points.push_back(
+                    VersionedPoint{point, request->version});
+                last_timestamps[point.series_id] = point.timestamp_ms;
+                memtable_bytes += sizeof(DataPoint) + sizeof(CommitVersion);
+                ++hot_series_points[point.series_id];
+            }
+        }
+        size_t pending = 0;
+        for (const auto& fragment : fragments) {
+            if (fragment) ++pending;
+        }
+        if (pending == 0) return;
+        {
+            std::lock_guard guard(ack_mutex);
+            inflight_fragments = pending;
+        }
+        for (size_t i = 0; i < fragments.size(); ++i) {
+            if (!fragments[i]) continue;
+            {
+                std::lock_guard lock(*shard_mutex[i]);
+                shard_queue[i].push_back(fragments[i]);
+            }
+            shard_cv[i]->notify_one();
+        }
+        std::unique_lock ack_lock(ack_mutex);
+        ack_cv.wait(ack_lock, [&] { return inflight_fragments == 0; });
+    }
+
+    void ApplyFragment(size_t shard_id, const ShardFragment& fragment) {
+        std::lock_guard lock(*shard_mutex[shard_id]);
+        auto next = std::make_shared<ShardData>(*shards[shard_id]);
+        for (const auto& point : fragment.points) {
+            auto& slot = next->series[point.point.series_id];
+            if (!slot) {
+                slot = std::make_shared<SeriesPoints>();
+            } else if (!slot.unique()) {
+                slot = std::make_shared<SeriesPoints>(*slot);
+            }
+            (*slot)[point.point.timestamp_ms] = point;
+        }
+        shards[shard_id] = next;
     }
 
     Status WriteMergedShard(
@@ -903,27 +1024,6 @@ struct Engine::Impl {
         return Status::Ok();
     }
 
-    void ApplyGroup(const std::vector<std::shared_ptr<PendingWrite>>& group) {
-        std::set<size_t> touched;
-        for (const auto& request : group) {
-            for (const auto& point : request->points) {
-                touched.insert(ShardFor(point.series_id));
-            }
-        }
-        for (size_t shard_id : touched) {
-            shards[shard_id] = std::make_shared<ShardData>(*shards[shard_id]);
-        }
-        for (const auto& request : group) {
-            for (const auto& point : request->points) {
-                shards[ShardFor(point.series_id)]->series[point.series_id]
-                    [point.timestamp_ms] = VersionedPoint{point, request->version};
-                last_timestamps[point.series_id] = point.timestamp_ms;
-                memtable_bytes += sizeof(DataPoint) + sizeof(CommitVersion);
-                ++hot_series_points[point.series_id];
-            }
-        }
-    }
-
     Status ReadSstableMetadata(const std::filesystem::path& path,
                                size_t shard_id,
                                std::shared_ptr<SstableMetadata>* metadata) {
@@ -1161,14 +1261,39 @@ struct Engine::Impl {
         return true;
     }
 
+    std::vector<uint64_t> ListWalSegments() const {
+        std::vector<uint64_t> segments;
+        std::error_code ec;
+        if (!std::filesystem::exists(wal_dir, ec)) return segments;
+        for (const auto& entry :
+             std::filesystem::directory_iterator(wal_dir, ec)) {
+            if (!entry.is_regular_file()) continue;
+            if (entry.path().extension() != ".log") continue;
+            const std::string stem = entry.path().stem().string();
+            if (stem.empty()) continue;
+            bool digits = true;
+            for (const char c : stem) {
+                if (std::isdigit(static_cast<unsigned char>(c)) == 0) {
+                    digits = false;
+                    break;
+                }
+            }
+            if (!digits) continue;
+            try {
+                segments.push_back(std::stoull(stem));
+            } catch (...) {
+                continue;
+            }
+        }
+        std::sort(segments.begin(), segments.end());
+        return segments;
+    }
+
     // Replays complete records only. A torn tail (crash between the write and
-    // the fsync, or a partially written record) ends the log: everything from
-    // the first malformed byte on is discarded and the file is later truncated
-    // to wal_valid_bytes, so a second crash cannot make the log unreadable.
-    Status ReplayWal() {
-        if (!std::filesystem::exists(wal_path)) return Status::Ok();
-        std::string data;
-        if (!ReadFile(wal_path, &data)) return Status::Error("cannot read WAL");
+    // the fsync, or a partially written record) is only legal in the newest
+    // segment: it is truncated there, while older segments must be intact.
+    bool ReplaySegment(const std::string& data, size_t* valid_bytes) {
+        *valid_bytes = 0;
         size_t offset = 0;
         while (offset < data.size()) {
             const size_t record_start = offset;
@@ -1203,10 +1328,54 @@ struct Engine::Impl {
             if (!applied) break;
 
             wal_bytes_replayed += record_end - record_start;
-            wal_valid_bytes = record_end;
             next_version = std::max(next_version, version + 1);
+            *valid_bytes = record_end;
+        }
+        return *valid_bytes == data.size();
+    }
+
+    Status ReplayWal() {
+        const auto segments = ListWalSegments();
+        for (size_t i = 0; i < segments.size(); ++i) {
+            const auto path = WalSegmentPath(wal_dir, segments[i]);
+            std::string data;
+            if (!ReadFile(path, &data)) return Status::Error("cannot read WAL");
+            size_t valid = 0;
+            const bool complete = ReplaySegment(data, &valid);
+            if (!complete && i + 1 != segments.size()) {
+                return Status::Error("corrupt WAL segment");
+            }
+            wal_valid_bytes = valid;
+            wal_segment = segments[i];
         }
         return Status::Ok();
+    }
+
+    // Called by a flush while it holds the global lock and after it published a
+    // manifest covering every record written so far: the older segments can be
+    // dropped, and later commits continue in a fresh one.
+    bool RotateWalLocked() {
+        const uint64_t next = wal_segment + 1;
+        const auto path = WalSegmentPath(wal_dir, next);
+        const int fd =
+            ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
+        if (fd < 0) return false;
+        if (::fsync(fd) != 0) {
+            ::close(fd);
+            return false;
+        }
+        if (wal_fd >= 0) ::close(wal_fd);
+        wal_fd = fd;
+        wal_segment = next;
+        // Deleting the retired segments does not depend on the directory sync
+        // succeeding: the manifest already covers them either way.
+        const bool synced = SyncDirectory(wal_dir);
+        for (const uint64_t number : ListWalSegments()) {
+            if (number >= wal_segment) continue;
+            std::error_code ec;
+            std::filesystem::remove(WalSegmentPath(wal_dir, number), ec);
+        }
+        return synced;
     }
 };
 
@@ -1222,15 +1391,18 @@ Engine::Engine(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {
             if (impl_->stopping_write && impl_->write_queue.empty()) return;
             if (impl_->write_queue.empty()) continue;
 
-            // Linger briefly before starting the group. Without it the first
-            // queued request is committed immediately, so concurrent writers
-            // each pay their own WAL fsync instead of sharing one. The lock is
-            // released while waiting, so the other writers can join.
-            constexpr size_t kGroupTarget = 8;
-            impl_->write_cv.wait_for(lock, std::chrono::microseconds(200), [&] {
-                return impl_->write_queue.size() >= kGroupTarget ||
-                       impl_->stopping_write;
-            });
+            // Collect a group before committing. When several writers are
+            // already waiting, block until they have all queued their batch so
+            // that one WAL fsync covers all of them; with a single writer there
+            // is nothing to wait for, so the fast path pays no extra latency.
+            // The lock is released while waiting, so the writers can enqueue.
+            const size_t target = std::min<size_t>(impl_->active_writers, 8);
+            if (target > 1) {
+                impl_->write_cv.wait_for(lock, std::chrono::milliseconds(2), [&] {
+                    return impl_->write_queue.size() >= target ||
+                           impl_->stopping_write;
+                });
+            }
 
             std::vector<std::shared_ptr<PendingWrite>> group;
             size_t queued_bytes = 0;
@@ -1257,11 +1429,15 @@ Engine::Engine(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {
                 request->wal_end = ::lseek(impl_->wal_fd, 0, SEEK_END);
             }
             if (ok) ok = ::fsync(impl_->wal_fd) == 0;
+            if (ok) ++impl_->wal_syncs;
             if (!ok && wal_record_start >= 0) {
                 TruncateWalBestEffort(impl_->wal_fd, wal_record_start);
             }
             if (ok) {
-                impl_->ApplyGroup(group);
+                // Hand the batch to the shard workers and wait for every shard
+                // to apply it; only then does the commit become visible.
+                impl_->DispatchGroup(group);
+                impl_->visible_version = impl_->next_version - 1;
                 for (const auto& request : group) {
                     impl_->points_since_flush += request->points.size();
                     request->status = Status::Ok();
@@ -1329,6 +1505,35 @@ Engine::Engine(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {
             }
         });
     }
+    for (size_t i = 0; i < impl_->shards.size(); ++i) {
+        impl_->shard_worker.emplace_back([this, i] {
+            // Shard workers are bursty (they sleep between commits); pinning
+            // them to the same cores as the coordinator and readers only adds
+            // contention, so they stay unpinned inside the 4-core budget.
+            while (true) {
+                std::shared_ptr<ShardFragment> fragment;
+                {
+                    std::unique_lock lock(*impl_->shard_mutex[i]);
+                    impl_->shard_cv[i]->wait(lock, [&] {
+                        return impl_->shard_stopping[i] ||
+                               !impl_->shard_queue[i].empty();
+                    });
+                    if (impl_->shard_queue[i].empty()) {
+                        if (impl_->shard_stopping[i]) return;
+                        continue;
+                    }
+                    fragment = impl_->shard_queue[i].front();
+                    impl_->shard_queue[i].pop_front();
+                }
+                impl_->ApplyFragment(i, *fragment);
+                {
+                    std::lock_guard guard(impl_->ack_mutex);
+                    if (impl_->inflight_fragments > 0) --impl_->inflight_fragments;
+                }
+                impl_->ack_cv.notify_all();
+            }
+        });
+    }
 }
 
 std::unique_ptr<Engine> Engine::Open(const std::filesystem::path& path,
@@ -1357,29 +1562,40 @@ std::unique_ptr<Engine> Engine::Open(const std::filesystem::path& path,
         }
     }
     auto impl = std::make_shared<Impl>(path, options);
-    impl->wal_path = path / "wal.log";
+    impl->wal_dir = path / "wal";
     impl->manifest_path = path / "MANIFEST";
+    std::filesystem::create_directories(impl->wal_dir, ec);
+    if (ec) return fail(Status::Error("cannot create WAL directory"));
     impl->shards.resize(options.shard_count);
     for (auto& shard : impl->shards) shard = std::make_shared<ShardData>();
+    impl->shard_mutex.resize(options.shard_count);
+    impl->shard_cv.resize(options.shard_count);
+    impl->shard_queue.resize(options.shard_count);
+    impl->shard_stopping.assign(options.shard_count, false);
+    for (size_t i = 0; i < options.shard_count; ++i) {
+        impl->shard_mutex[i] = std::make_unique<std::mutex>();
+        impl->shard_cv[i] = std::make_unique<std::condition_variable>();
+    }
     impl->covered_commit_versions.assign(options.shard_count, 0);
     auto load_status = impl->LoadManifest();
     if (!load_status.ok) return fail(load_status);
     load_status = impl->ReplayWal();
     if (!load_status.ok) return fail(load_status);
-    // Drop a torn tail before appending again: otherwise the next crash would
-    // leave a valid record behind a malformed one and the log could never be
-    // replayed again (every later open would fail its magic/checksum check).
-    if (std::filesystem::exists(impl->wal_path)) {
+    impl->visible_version = impl->next_version - 1;
+    // Drop a torn tail in the newest segment before appending again: otherwise
+    // the next crash would leave a valid record behind a malformed one and the
+    // log could never be replayed again.
+    const auto active_path = WalSegmentPath(impl->wal_dir, impl->wal_segment);
+    if (std::filesystem::exists(active_path)) {
         std::error_code size_ec;
-        const auto wal_size =
-            std::filesystem::file_size(impl->wal_path, size_ec);
+        const auto wal_size = std::filesystem::file_size(active_path, size_ec);
         if (!size_ec && wal_size > impl->wal_valid_bytes &&
-            ::truncate(impl->wal_path.c_str(),
+            ::truncate(active_path.c_str(),
                        static_cast<off_t>(impl->wal_valid_bytes)) != 0) {
             return fail(Status::Error("cannot truncate WAL tail"));
         }
     }
-    impl->wal_fd = ::open(impl->wal_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    impl->wal_fd = ::open(active_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (impl->wal_fd < 0) return fail(Status::Error("cannot open WAL"));
     if (status) *status = Status::Ok();
     return std::unique_ptr<Engine>(new Engine(std::move(impl)));
@@ -1426,8 +1642,12 @@ Status Engine::WriteBatch(const std::vector<DataPoint>& points,
     auto request = std::make_shared<PendingWrite>();
     request->points = points;
     impl_->write_queue.push_back(request);
+    // Lets the coordinator know how many writers a group can contain, so it
+    // waits for them instead of committing one request per WAL fsync.
+    ++impl_->active_writers;
     impl_->write_cv.notify_one();
     impl_->write_cv.wait(lock, [&] { return request->done; });
+    --impl_->active_writers;
     if (request->status.ok && version) *version = request->version;
     return request->status;
 }
@@ -1436,32 +1656,58 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
                     int64_t end, std::unique_ptr<Cursor>* cursor) const {
     if (!cursor) return Status::Error("cursor output is null");
     if (start > end) return Status::Error("start must not exceed end");
-    std::lock_guard lock(impl_->mutex);
+    std::unique_lock lock(impl_->mutex);
     if (impl_->closed || impl_->closing) return Status::Error("engine is closed");
     const auto view = impl_->ViewLocked();
     ++impl_->active_read_views;
+    // The view (shard snapshots + referenced SSTables) is immutable, so the
+    // cursor decodes and merges without the global lock: a long scan no longer
+    // blocks writers, and its memory does not grow with the result size.
+    lock.unlock();
 
-    using SeriesMap = std::map<int64_t, VersionedPoint>;
+    // Bound the number of cursors that can hold decoder state at once.
+    {
+        std::unique_lock gate(impl_->scan_mu);
+        impl_->scan_cv.wait(gate, [&] {
+            return impl_->active_scans < Impl::kMaxConcurrentScans;
+        });
+        ++impl_->active_scans;
+    }
+
+    // Streaming scan: one source per (series, SSTable) plus one per series for
+    // the memtable snapshot. Sources decode on demand and are merged by
+    // (timestamp, series_id), so memory is proportional to the number of
+    // sources rather than to the number of points returned.
     struct Source {
-        std::shared_ptr<SeriesMap> owner;
-        SeriesMap::const_iterator it;
-        SeriesMap::const_iterator end;
         uint64_t series_id{};
+        std::shared_ptr<const SeriesPoints> memtable;
+        SeriesPoints::const_iterator mem_it;
+        SeriesPoints::const_iterator mem_end;
+        std::unique_ptr<StreamingReader> file;
+        uint64_t remaining{0};
+        // Legacy raw (fixed record) SSTables are still readable.
+        bool raw{false};
+        std::unique_ptr<std::ifstream> raw_file;
+        std::streamoff raw_offset{0};
+        uint64_t raw_index{0};
     };
-    struct HeapItem {
+    struct Item {
+        int64_t timestamp{};
+        uint64_t series_id{};
+        double value{};
+        CommitVersion version{};
         size_t source{};
-        DataPoint point;
     };
-    struct Compare {
-        bool operator()(const HeapItem& left, const HeapItem& right) const {
-            return std::tie(left.point.timestamp_ms, left.point.series_id) >
-                   std::tie(right.point.timestamp_ms, right.point.series_id);
+    struct ItemGreater {
+        bool operator()(const Item& left, const Item& right) const {
+            return std::tie(left.timestamp, left.series_id) >
+                   std::tie(right.timestamp, right.series_id);
         }
     };
     struct StreamState {
         ReadView view;
-        std::vector<Source> sources;
-        std::priority_queue<HeapItem, std::vector<HeapItem>, Compare> heap;
+        std::vector<std::shared_ptr<Source>> sources;
+        std::priority_queue<Item, std::vector<Item>, ItemGreater> heap;
         int64_t start{};
         int64_t end{};
     };
@@ -1470,157 +1716,140 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
     state->view = view;
     state->start = start;
     state->end = end;
+
     std::set<uint64_t> unique_series(series_ids.begin(), series_ids.end());
     for (const auto series_id : unique_series) {
-        auto merged_owner = std::make_shared<SeriesMap>();
-        auto& merged = *merged_owner;
-        const auto& series =
-            view.shards[impl_->ShardFor(series_id)]->series;
-        const auto series_it = series.find(series_id);
-        if (series_it != series.end()) {
-            for (const auto& [timestamp, value] : series_it->second) {
-                merged[timestamp] = value;
-            }
+        const size_t shard_id = impl_->ShardFor(series_id);
+        const auto& shard_series = view.shards[shard_id]->series;
+        const auto series_it = shard_series.find(series_id);
+        if (series_it != shard_series.end() && series_it->second) {
+            auto source = std::make_shared<Source>();
+            source->series_id = series_id;
+            source->memtable = series_it->second;
+            source->mem_it = series_it->second->begin();
+            source->mem_end = series_it->second->end();
+            state->sources.push_back(std::move(source));
         }
         for (const auto& sstable : view.sstables) {
-            if (sstable->shard_id != impl_->ShardFor(series_id)) continue;
+            if (sstable->shard_id != shard_id) continue;
             const auto entry_it = sstable->series.find(series_id);
             if (entry_it == sstable->series.end()) continue;
             const auto& entry = entry_it->second;
             if (entry.max_timestamp < start || entry.min_timestamp >= end) continue;
-            const int fd = ::open(sstable->path.c_str(), O_RDONLY);
-            if (fd < 0) continue;
+            auto source = std::make_shared<Source>();
+            source->series_id = series_id;
             if (sstable->encoding == kEncodedSstableMagic) {
-                const auto insert = [&](uint64_t disk_series,
-                                        int64_t disk_timestamp,
-                                        double disk_value,
-                                        uint64_t disk_version) {
-                    if (disk_timestamp >= start && disk_timestamp < end &&
-                        disk_timestamp >= view.cutoff &&
-                        disk_version <= view.version) {
-                        const auto existing = merged.find(disk_timestamp);
-                        if (existing == merged.end() ||
-                            disk_version >= existing->second.version) {
-                            merged[disk_timestamp] = VersionedPoint{
-                                {disk_series, disk_timestamp, disk_value},
-                                static_cast<CommitVersion>(disk_version)};
-                        }
-                    }
-                };
-                if (entry.byte_length <= kInlineReadBytes) {
-                    std::vector<char> encoded_page(entry.byte_length);
-                    const ssize_t bytes =
-                        ::pread(fd, encoded_page.data(), encoded_page.size(),
-                                entry.offset);
-                    if (bytes > 0) {
-                        std::string payload(
-                            encoded_page.data(), static_cast<size_t>(bytes));
-                        size_t encoded_offset = 0;
-                        for (uint64_t i = 0; i < entry.point_count; ++i) {
-                            uint64_t disk_series = 0;
-                            uint64_t zigzag_timestamp = 0;
-                            double disk_value = 0.0;
-                            uint64_t disk_version = 0;
-                            if (!ReadUvarint(payload, encoded_offset,
-                                             &disk_series) ||
-                                !ReadUvarint(payload, encoded_offset,
-                                             &zigzag_timestamp) ||
-                                !Read(payload, encoded_offset, &disk_value) ||
-                                !ReadUvarint(payload, encoded_offset,
-                                             &disk_version)) {
-                                break;
-                            }
-                            insert(disk_series,
-                                   ZigzagDecode(zigzag_timestamp), disk_value,
-                                   disk_version);
-                        }
-                    }
-                } else {
-                    StreamingReader reader(sstable->path);
-                    reader.in.seekg(entry.offset, std::ios::beg);
-                    if (reader.in) {
-                        for (uint64_t i = 0; i < entry.point_count; ++i) {
-                            uint64_t disk_series = 0;
-                            uint64_t zigzag_timestamp = 0;
-                            double disk_value = 0.0;
-                            uint64_t disk_version = 0;
-                            if (!reader.ReadUvarint(&disk_series) ||
-                                !reader.ReadUvarint(&zigzag_timestamp) ||
-                                !reader.ReadDouble(&disk_value) ||
-                                !reader.ReadUvarint(&disk_version)) {
-                                break;
-                            }
-                            insert(disk_series,
-                                   ZigzagDecode(zigzag_timestamp), disk_value,
-                                   disk_version);
-                        }
-                    }
-                }
-                ::close(fd);
-                continue;
+                source->file = std::make_unique<StreamingReader>(sstable->path);
+                if (!source->file->in) continue;
+                source->file->in.seekg(entry.offset, std::ios::beg);
+                if (!source->file->in) continue;
+                source->remaining = entry.point_count;
+            } else {
+                source->raw = true;
+                source->raw_file = std::make_unique<std::ifstream>(
+                    sstable->path, std::ios::binary);
+                if (!*source->raw_file) continue;
+                source->raw_offset = static_cast<std::streamoff>(entry.offset);
+                source->remaining = entry.point_count;
             }
-            const size_t record_size =
-                sizeof(uint64_t) + sizeof(int64_t) +
-                sizeof(double) + sizeof(CommitVersion);
-            for (uint64_t i = 0; i < entry.point_count;
-                 i += kDiskPageRecords) {
-                const uint64_t batch =
-                    std::min(kDiskPageRecords, entry.point_count - i);
-                std::vector<char> page(batch * record_size);
-                const ssize_t bytes =
-                    ::pread(fd, page.data(), page.size(),
-                            entry.offset + i * record_size);
-                if (bytes < 0) break;
-                const size_t complete =
-                    static_cast<size_t>(bytes) / record_size;
-                for (size_t j = 0; j < complete; ++j) {
-                    const char* record = page.data() + j * record_size;
-                    uint64_t disk_series = 0;
-                    int64_t disk_timestamp = 0;
-                    double disk_value = 0.0;
-                    CommitVersion disk_version = 0;
-                    std::memcpy(&disk_series, record, sizeof(uint64_t));
-                    std::memcpy(&disk_timestamp,
-                                record + sizeof(uint64_t), sizeof(int64_t));
-                    std::memcpy(&disk_value,
-                                record + sizeof(uint64_t) + sizeof(int64_t),
-                                sizeof(double));
-                    std::memcpy(&disk_version,
-                                record + sizeof(uint64_t) + sizeof(int64_t) +
-                                    sizeof(double),
-                                sizeof(CommitVersion));
-                    if (disk_timestamp >= start && disk_timestamp < end &&
-                        disk_timestamp >= view.cutoff &&
-                        disk_version <= view.version) {
-                        const auto existing = merged.find(disk_timestamp);
-                        if (existing == merged.end() ||
-                            disk_version >= existing->second.version) {
-                            merged[disk_timestamp] =
-                                VersionedPoint{
-                                    {disk_series, disk_timestamp, disk_value},
-                                    disk_version};
-                        }
-                    }
-                }
-            }
-            ::close(fd);
+            state->sources.push_back(std::move(source));
         }
-        if (merged.empty()) continue;
-        state->sources.push_back(
-            {merged_owner, merged.begin(), merged.end(), series_id});
     }
 
-    auto advance = [state](size_t source_index) {
-        auto& source = state->sources[source_index];
-        while (source.it != source.end &&
-               (source.it->first < state->start ||
-                source.it->first >= state->end ||
-                source.it->first < state->view.cutoff ||
-                source.it->second.version > state->view.version)) {
-            ++source.it;
-        }
-        if (source.it != source.end && source.it->first < state->end) {
-            state->heap.push({source_index, source.it->second.point});
+    auto advance = [state](size_t index) {
+        auto& source = *state->sources[index];
+        const int64_t cutoff = state->view.cutoff;
+        const CommitVersion visible = state->view.version;
+        while (true) {
+            Item item;
+            item.source = index;
+            item.series_id = source.series_id;
+            if (source.memtable) {
+                while (source.mem_it != source.mem_end &&
+                       (source.mem_it->first < state->start ||
+                        source.mem_it->first >= state->end ||
+                        source.mem_it->first < cutoff ||
+                        source.mem_it->second.version > visible)) {
+                    ++source.mem_it;
+                }
+                if (source.mem_it == source.mem_end) return;
+                item.timestamp = source.mem_it->first;
+                item.value = source.mem_it->second.point.value;
+                item.version = source.mem_it->second.version;
+                ++source.mem_it;
+                state->heap.push(item);
+                return;
+            }
+            if (source.remaining == 0) return;
+            if (source.raw) {
+                constexpr size_t kRecord = sizeof(uint64_t) + sizeof(int64_t) +
+                                           sizeof(double) + sizeof(CommitVersion);
+                char record[kRecord];
+                source.raw_file->seekg(
+                    source.raw_offset +
+                        static_cast<std::streamoff>(source.raw_index * kRecord),
+                    std::ios::beg);
+                source.raw_file->read(record, kRecord);
+                if (!*source.raw_file) {
+                    source.remaining = 0;
+                    return;
+                }
+                ++source.raw_index;
+                --source.remaining;
+                uint64_t sid = 0;
+                int64_t timestamp = 0;
+                double value = 0.0;
+                CommitVersion version = 0;
+                std::memcpy(&sid, record, sizeof(uint64_t));
+                std::memcpy(&timestamp, record + sizeof(uint64_t),
+                            sizeof(int64_t));
+                std::memcpy(&value,
+                            record + sizeof(uint64_t) + sizeof(int64_t),
+                            sizeof(double));
+                std::memcpy(&version,
+                            record + sizeof(uint64_t) + sizeof(int64_t) +
+                                sizeof(double),
+                            sizeof(CommitVersion));
+                if (timestamp >= state->end) {
+                    source.remaining = 0;
+                    return;
+                }
+                if (timestamp < state->start || timestamp < cutoff ||
+                    version > visible) {
+                    continue;
+                }
+                item.timestamp = timestamp;
+                item.value = value;
+                item.version = version;
+                state->heap.push(item);
+                return;
+            }
+            uint64_t disk_series = 0;
+            uint64_t zigzag_timestamp = 0;
+            double disk_value = 0.0;
+            uint64_t disk_version = 0;
+            if (!source.file->ReadUvarint(&disk_series) ||
+                !source.file->ReadUvarint(&zigzag_timestamp) ||
+                !source.file->ReadDouble(&disk_value) ||
+                !source.file->ReadUvarint(&disk_version)) {
+                source.remaining = 0;
+                return;
+            }
+            --source.remaining;
+            const int64_t timestamp = ZigzagDecode(zigzag_timestamp);
+            if (timestamp >= state->end) {
+                source.remaining = 0;
+                return;
+            }
+            if (timestamp < state->start || timestamp < cutoff ||
+                disk_version > visible) {
+                continue;
+            }
+            item.timestamp = timestamp;
+            item.value = disk_value;
+            item.version = static_cast<CommitVersion>(disk_version);
+            state->heap.push(item);
+            return;
         }
     };
     for (size_t i = 0; i < state->sources.size(); ++i) advance(i);
@@ -1628,19 +1857,34 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
     *cursor = std::make_unique<Cursor>(
         [state, advance]() mutable -> std::optional<DataPoint> {
             if (state->heap.empty()) return std::nullopt;
-            const auto item = state->heap.top();
+            Item best = state->heap.top();
             state->heap.pop();
-            auto& source = state->sources[item.source];
-            ++source.it;
-            advance(item.source);
-            return item.point;
+            advance(best.source);
+            // Duplicate timestamps of one series may live in several SSTables;
+            // emit a single point, keeping the newest commit version.
+            while (!state->heap.empty() &&
+                   state->heap.top().timestamp == best.timestamp &&
+                   state->heap.top().series_id == best.series_id) {
+                const Item duplicate = state->heap.top();
+                state->heap.pop();
+                if (duplicate.version > best.version) best = duplicate;
+                advance(duplicate.source);
+            }
+            return DataPoint{best.series_id, best.timestamp, best.value};
         },
         [impl = impl_, state] {
-            std::lock_guard lock(impl->mutex);
-            if (impl->active_read_views > 0) --impl->active_read_views;
-            for (const auto& sstable : state->view.sstables) {
-                if (sstable->refs > 0) --sstable->refs;
+            {
+                std::lock_guard lock(impl->mutex);
+                if (impl->active_read_views > 0) --impl->active_read_views;
+                for (const auto& sstable : state->view.sstables) {
+                    if (sstable->refs > 0) --sstable->refs;
+                }
             }
+            {
+                std::lock_guard gate(impl->scan_mu);
+                if (impl->active_scans > 0) --impl->active_scans;
+            }
+            impl->scan_cv.notify_one();
         });
     return Status::Ok();
 }
@@ -1710,6 +1954,7 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
         --impl_->next_version;
         return Status::Error("WAL sync failed");
     }
+    ++impl_->wal_syncs;
     impl_->cutoff = cutoff;
     bool removed_sstable = false;
     std::vector<std::shared_ptr<SstableMetadata>> retained_sstables;
@@ -1745,16 +1990,33 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
     }
     constexpr size_t kRecordBytes = sizeof(DataPoint) + sizeof(CommitVersion);
     for (size_t shard_id = 0; shard_id < impl_->shards.size(); ++shard_id) {
+        std::lock_guard shard_lock(*impl_->shard_mutex[shard_id]);
         impl_->shards[shard_id] =
             std::make_shared<ShardData>(*impl_->shards[shard_id]);
         auto& points_by_series = impl_->shards[shard_id]->series;
         for (auto series_it = points_by_series.begin();
              series_it != points_by_series.end();) {
+            // Probe first: only clone the series that actually lose a point.
+            bool expiring = false;
+            for (const auto& [timestamp, _value] : *series_it->second) {
+                if (timestamp < cutoff) {
+                    expiring = true;
+                    break;
+                }
+            }
+            if (!expiring) {
+                ++series_it;
+                continue;
+            }
+            if (!series_it->second.unique()) {
+                series_it->second =
+                    std::make_shared<SeriesPoints>(*series_it->second);
+            }
+            auto& points = *series_it->second;
             size_t removed = 0;
-            for (auto point_it = series_it->second.begin();
-                 point_it != series_it->second.end();) {
+            for (auto point_it = points.begin(); point_it != points.end();) {
                 if (point_it->first < cutoff) {
-                    point_it = series_it->second.erase(point_it);
+                    point_it = points.erase(point_it);
                     ++removed;
                 } else {
                     ++point_it;
@@ -1763,7 +2025,7 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
             if (removed > 0) {
                 impl_->memtable_bytes -= removed * kRecordBytes;
             }
-            if (series_it->second.empty()) {
+            if (points.empty()) {
                 series_it = points_by_series.erase(series_it);
             } else {
                 ++series_it;
@@ -1788,9 +2050,13 @@ Status Engine::FlushLocked(bool incremental) {
         const auto temp = file.string() + ".tmp";
         SstableWriter writer;
         if (!writer.Open(temp)) return Status::Error("cannot create SSTable");
-        const auto& data = *impl_->shards[shard_id];
-        for (const auto& [_, points] : data.series) {
-            for (const auto& [__, value] : points) {
+        std::shared_ptr<ShardData> data;
+        {
+            std::lock_guard shard_lock(*impl_->shard_mutex[shard_id]);
+            data = impl_->shards[shard_id];
+        }
+        for (const auto& [_, points] : data->series) {
+            for (const auto& [__, value] : *points) {
                 if (value.version <= impl_->last_flushed_version) continue;
                 writer.Append(value.point.series_id,
                               value.point.timestamp_ms, value.point.value,
@@ -1832,10 +2098,6 @@ Status Engine::FlushLocked(bool incremental) {
                                 new_files.begin(), new_files.end());
     auto status = impl_->PublishManifestLocked(impl_->current_files);
     if (!status.ok) return status;
-    if (::ftruncate(impl_->wal_fd, 0) != 0 ||
-        ::fsync(impl_->wal_fd) != 0) {
-        return Status::Error("WAL truncate sync failed");
-    }
     impl_->sstable_metadata.insert(impl_->sstable_metadata.end(),
                                    published_metadata.begin(),
                                    published_metadata.end());
@@ -1844,6 +2106,10 @@ Status Engine::FlushLocked(bool incremental) {
     impl_->hot_series_points.clear();
     impl_->ClearMemtableLocked();
     ++impl_->flush_count;
+    // Best effort, and only after the in-memory state above is committed: the
+    // manifest already covers every record written so far, so a failed rotation
+    // just leaves a stale segment to be replayed (and dropped by the next one).
+    (void)impl_->RotateWalLocked();
     return Status::Ok();
 }
 
@@ -1919,7 +2185,20 @@ Status Engine::Close() {
         impl_->stopping_compaction = true;
         impl_->compaction_cv.notify_all();
     }
+    // The coordinator drains the queue first; only after it is gone may the
+    // shard workers be told to stop, otherwise a fragment could be queued for a
+    // worker that has already exited.
     if (impl_->write_worker.joinable()) impl_->write_worker.join();
+    {
+        std::lock_guard lock(impl_->mutex);
+        for (size_t i = 0; i < impl_->shard_stopping.size(); ++i) {
+            impl_->shard_stopping[i] = true;
+            impl_->shard_cv[i]->notify_all();
+        }
+    }
+    for (auto& worker : impl_->shard_worker) {
+        if (worker.joinable()) worker.join();
+    }
     if (impl_->flush_worker.joinable()) impl_->flush_worker.join();
     if (impl_->compaction_worker.joinable()) impl_->compaction_worker.join();
     std::lock_guard lock(impl_->mutex);
@@ -1938,18 +2217,24 @@ Status Engine::Close() {
 Status Engine::GetStats(EngineStats* stats) const {
     if (!stats) return Status::Error("stats output is null");
     std::lock_guard lock(impl_->mutex);
-    stats->visible_version = impl_->next_version - 1;
+    stats->visible_version = impl_->visible_version;
     stats->expiration_cutoff = impl_->cutoff;
     stats->mutable_points = 0;
-    for (const auto& shard : impl_->shards) {
-        stats->mutable_points += shard->point_count();
+    for (size_t i = 0; i < impl_->shards.size(); ++i) {
+        std::lock_guard shard_lock(*impl_->shard_mutex[i]);
+        stats->mutable_points += impl_->shards[i]->point_count();
     }
     stats->immutable_points = 0;
-    std::error_code ec;
-    stats->wal_bytes = std::filesystem::exists(impl_->wal_path, ec)
-                           ? std::filesystem::file_size(impl_->wal_path, ec)
-                           : 0;
+    uint64_t wal_bytes = 0;
+    for (const uint64_t number : impl_->ListWalSegments()) {
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(
+            WalSegmentPath(impl_->wal_dir, number), ec);
+        if (!ec) wal_bytes += static_cast<uint64_t>(size);
+    }
+    stats->wal_bytes = wal_bytes;
     stats->wal_bytes_replayed = impl_->wal_bytes_replayed;
+    stats->wal_syncs = impl_->wal_syncs;
     stats->compaction_count = impl_->compaction_count;
     stats->flush_count = impl_->flush_count;
     stats->pending_batches = impl_->write_queue.size();
@@ -1982,8 +2267,9 @@ Status Engine::GetStats(EngineStats* stats) const {
 #endif
     }
     stats->rss_bytes = stats->peak_rss_bytes;
-    stats->engine_threads =
-        2 + (impl_->options.enable_background_compaction ? 1 : 0);
+    stats->engine_threads = 2 +
+                            (impl_->options.enable_background_compaction ? 1 : 0) +
+                            impl_->shards.size();
     stats->memtable_bytes = impl_->memtable_bytes;
     return Status::Ok();
 }

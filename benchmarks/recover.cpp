@@ -36,10 +36,13 @@ int main(int argc, char** argv) {
     uint64_t wal_bytes = 0;
     {
         std::error_code ec;
-        const auto wal_path = path / "wal.log";
-        if (std::filesystem::exists(wal_path, ec)) {
-            const auto size = std::filesystem::file_size(wal_path, ec);
-            if (!ec) wal_bytes = static_cast<uint64_t>(size);
+        for (const auto& entry :
+             std::filesystem::directory_iterator(path / "wal", ec)) {
+            if (!entry.is_regular_file()) continue;
+            std::error_code size_ec;
+            const auto size =
+                std::filesystem::file_size(entry.path(), size_ec);
+            if (!size_ec) wal_bytes += static_cast<uint64_t>(size);
         }
     }
 
