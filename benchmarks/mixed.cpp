@@ -35,6 +35,7 @@ struct Args {
     std::filesystem::path path;
     std::string csv;
     bool keep{false};
+    bool sharded_wal{false};
 };
 
 Args ParseArgs(int argc, char** argv) {
@@ -69,6 +70,8 @@ Args ParseArgs(int argc, char** argv) {
             args.csv = value(&index);
         } else if (flag == "--keep") {
             args.keep = true;
+        } else if (flag == "--sharded-wal") {
+            args.sharded_wal = true;
         } else {
             std::cerr << "unknown flag " << flag << '\n';
             std::exit(2);
@@ -92,7 +95,7 @@ int main(int argc, char** argv) {
 
     tsdb::Status status;
     auto engine = tsdb::Engine::Open(
-        args.path, tsdb::Options{.shard_count = 4, .memtable_max_points = 100000},
+        args.path, tsdb::Options{.shard_count = 4, .memtable_max_points = 100000, .sharded_wal = args.sharded_wal},
         &status);
     if (!status.ok || !engine) {
         std::cerr << status.message << '\n';

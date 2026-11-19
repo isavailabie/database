@@ -33,6 +33,7 @@ struct Args {
     bool keep{false};
     bool crash{false};
     bool compact{false};
+    bool sharded_wal{false};
 };
 
 Args ParseArgs(int argc, char** argv) {
@@ -69,6 +70,8 @@ Args ParseArgs(int argc, char** argv) {
             args.crash = true;
         } else if (flag == "--compact") {
             args.compact = true;
+        } else if (flag == "--sharded-wal") {
+            args.sharded_wal = true;
         } else {
             std::cerr << "unknown flag " << flag << '\n';
             std::exit(2);
@@ -96,7 +99,7 @@ int main(int argc, char** argv) {
 
     tsdb::Status status;
     auto engine = tsdb::Engine::Open(
-        args.path, tsdb::Options{.shard_count = 4, .memtable_max_points = 100000},
+        args.path, tsdb::Options{.shard_count = 4, .memtable_max_points = 100000, .sharded_wal = args.sharded_wal},
         &status);
     if (!status.ok || !engine) {
         std::cerr << status.message << '\n';
@@ -190,7 +193,7 @@ int main(int argc, char** argv) {
     const auto recovery_started = bench::Clock::now();
     status = tsdb::Status::Ok();
     auto reopened = tsdb::Engine::Open(
-        args.path, tsdb::Options{.shard_count = 4, .memtable_max_points = 100000},
+        args.path, tsdb::Options{.shard_count = 4, .memtable_max_points = 100000, .sharded_wal = args.sharded_wal},
         &status);
     if (!status.ok || !reopened) {
         std::cerr << "recovery failed: " << status.message << '\n';

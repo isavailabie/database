@@ -23,10 +23,13 @@ int main(int argc, char** argv) {
     }
     const std::filesystem::path path = argv[1];
     std::string csv;
+    bool sharded_wal = false;
     for (int index = 2; index < argc; ++index) {
         const std::string flag = argv[index];
         if (flag == "--csv" && index + 1 < argc) {
             csv = argv[++index];
+        } else if (flag == "--sharded-wal") {
+            sharded_wal = true;
         } else {
             std::cerr << "unknown flag " << flag << '\n';
             return 2;
@@ -49,7 +52,7 @@ int main(int argc, char** argv) {
     const auto started = bench::Clock::now();
     tsdb::Status status;
     auto engine = tsdb::Engine::Open(
-        path, tsdb::Options{.shard_count = 4, .memtable_max_points = 100000},
+        path, tsdb::Options{.shard_count = 4, .memtable_max_points = 100000, .sharded_wal = sharded_wal},
         &status);
     if (!status.ok || !engine) {
         std::cerr << "open failed: " << status.message << '\n';
