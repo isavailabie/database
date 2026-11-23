@@ -14,6 +14,8 @@
 #include <thread>
 #include <vector>
 
+#include "check.h"
+
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -69,14 +71,14 @@ void TestWriteScanAndAtomicValidation(const std::filesystem::path& path) {
     AssertOk(status);
     CommitVersion version = 0;
     AssertOk(engine->WriteBatch({{1, 1000, 1.0}, {2, 500, 2.0}}, &version));
-    assert(version == 1);
+    CHECK(version == 1);
     auto bad = engine->WriteBatch({{1, 2000, 3.0}, {1, 1500, 4.0}});
-    assert(!bad.ok);
+    CHECK(!bad.ok);
     std::unique_ptr<Cursor> cursor;
     AssertOk(engine->Scan({1, 2}, 0, 2000, &cursor));
     const auto points = Read(cursor.get());
-    assert(points.size() == 2);
-    assert(points[0].series_id == 2 && points[1].series_id == 1);
+    CHECK(points.size() == 2);
+    CHECK(points[0].series_id == 2 && points[1].series_id == 1);
     AssertOk(engine->Close());
 }
 
@@ -90,23 +92,23 @@ void TestReadViewAndExpiration(const std::filesystem::path& path) {
     AssertOk(engine->Put({1, 1500, 2.0}));
     AssertOk(engine->ExpireBefore(1200));
     auto old_points = Read(old_view.get());
-    assert(old_points.size() == 1);
+    CHECK(old_points.size() == 1);
     std::unique_ptr<Cursor> current;
     AssertOk(engine->Scan({1}, 0, 2000, &current));
     const auto current_points = Read(current.get());
-    assert(current_points.size() == 1 && current_points[0].timestamp_ms == 1500);
+    CHECK(current_points.size() == 1 && current_points[0].timestamp_ms == 1500);
     std::unique_ptr<Cursor> empty;
     AssertOk(engine->Scan({1}, 1500, 1500, &empty));
-    assert(Read(empty.get()).empty());
+    CHECK(Read(empty.get()).empty());
     std::unique_ptr<Cursor> reversed;
     auto reversed_status = engine->Scan({1}, 1501, 1500, &reversed);
-    assert(!reversed_status.ok);
+    CHECK(!reversed_status.ok);
     AssertOk(engine->Compact());
     std::unique_ptr<Cursor> compacted;
     AssertOk(engine->Scan({1}, 0, 2000, &compacted));
     const auto compacted_points = Read(compacted.get());
-    assert(compacted_points.size() == 1 && compacted_points[0].timestamp_ms == 1500);
-    assert(old_points.size() == 1);
+    CHECK(compacted_points.size() == 1 && compacted_points[0].timestamp_ms == 1500);
+    CHECK(old_points.size() == 1);
     AssertOk(engine->GarbageCollect());
     AssertOk(engine->Close());
 }
@@ -127,11 +129,11 @@ void TestRecovery(const std::filesystem::path& path) {
     std::unique_ptr<Cursor> cursor;
     AssertOk(engine->Scan({10, 11}, 0, 1000, &cursor));
     auto recovered = Read(cursor.get());
-    assert(recovered.size() == 3);
+    CHECK(recovered.size() == 3);
     std::unique_ptr<Cursor> aggregate;
     AssertOk(engine->Aggregate({10}, 0, 1000, 200, AggregateOp::Count, &aggregate));
     auto result = aggregate->NextAggregate();
-    assert(result && result->count == 1);
+    CHECK(result && result->count == 1);
     AssertOk(engine->Close());
 }
 
@@ -148,16 +150,16 @@ void TestConcurrentGroupCommit(const std::filesystem::path& path) {
                     {{100 + thread_id, static_cast<int64_t>(thread_id * 1000 + i),
                       static_cast<double>(i)}},
                     &versions[thread_id]);
-                assert(write_status.ok);
+                CHECK(write_status.ok);
             }
         });
     }
     for (auto& writer : writers) writer.join();
-    assert(versions[0] > 0 && versions[1] > 0 &&
+    CHECK(versions[0] > 0 && versions[1] > 0 &&
            versions[2] > 0 && versions[3] > 0);
     std::unique_ptr<Cursor> cursor;
     AssertOk(engine->Scan({100, 101, 102, 103}, 0, 5000, &cursor));
-    assert(Read(cursor.get()).size() == 160);
+    CHECK(Read(cursor.get()).size() == 160);
     AssertOk(engine->Close());
 }
 
@@ -172,7 +174,7 @@ void TestQueueBackpressure(const std::filesystem::path& path) {
     AssertOk(engine->Put({300, 100, 1.0}, &version));
     AssertOk(engine->Put({300, 200, 2.0}, &version));
     auto out_of_order = engine->Put({300, 150, 3.0});
-    assert(!out_of_order.ok);
+    CHECK(!out_of_order.ok);
     AssertOk(engine->Close());
 }
 
@@ -186,12 +188,12 @@ void TestPhysicalExpirationAndGC(const std::filesystem::path& path) {
     AssertOk(engine->Scan({600}, 0, 300, &old_view));
     AssertOk(engine->ExpireBefore(300));
     AssertOk(engine->GarbageCollect());
-    assert(old_view->NextPoint().has_value());
+    CHECK(old_view->NextPoint().has_value());
     old_view->Close();
     AssertOk(engine->GarbageCollect());
     std::unique_ptr<Cursor> new_view;
     AssertOk(engine->Scan({600}, 0, 300, &new_view));
-    assert(Read(new_view.get()).empty());
+    CHECK(Read(new_view.get()).empty());
     AssertOk(engine->Close());
 }
 
@@ -211,9 +213,9 @@ void TestMultipleIncrementalFlushes(const std::filesystem::path& path) {
     std::unique_ptr<Cursor> cursor;
     AssertOk(engine->Scan({500, 501}, 0, 300, &cursor));
     auto points = Read(cursor.get());
-    assert(points.size() == 4);
-    assert(points[0].timestamp_ms == 100);
-    assert(points[2].timestamp_ms == 200);
+    CHECK(points.size() == 4);
+    CHECK(points[0].timestamp_ms == 100);
+    CHECK(points[2].timestamp_ms == 200);
     AssertOk(engine->Close());
 }
 
@@ -233,9 +235,9 @@ void TestTimestampEncodingRoundTrip() {
     std::unique_ptr<Cursor> cursor;
     AssertOk(engine->Scan({700}, -2000, 3000, &cursor));
     auto points = Read(cursor.get());
-    assert(points.size() == 5);
-    assert(points[0].timestamp_ms == -1600);
-    assert(points.back().timestamp_ms == 2000);
+    CHECK(points.size() == 5);
+    CHECK(points[0].timestamp_ms == -1600);
+    CHECK(points.back().timestamp_ms == 2000);
     AssertOk(engine->Close());
 }
 
@@ -247,13 +249,13 @@ void TestNegativeWindowsAndDuplicateSeries(const std::filesystem::path& path) {
                                  {400, -1499, 3.0}}));
     std::unique_ptr<Cursor> cursor;
     AssertOk(engine->Scan({400, 400}, -1600, -1400, &cursor));
-    assert(Read(cursor.get()).size() == 3);
+    CHECK(Read(cursor.get()).size() == 3);
     std::unique_ptr<Cursor> aggregate;
     AssertOk(engine->Aggregate({400, 400}, -1600, -1400, 200,
                                AggregateOp::Count, &aggregate));
     uint64_t count = 0;
     while (auto result = aggregate->NextAggregate()) count += result->count;
-    assert(count == 3);
+    CHECK(count == 3);
     AssertOk(engine->Close());
 }
 
@@ -271,7 +273,7 @@ void TestLargeSeriesPaging(const std::filesystem::path& path) {
     AssertOk(engine->Flush());
     std::unique_ptr<Cursor> cursor;
     AssertOk(engine->Scan({900}, 0, 1000000, &cursor));
-    assert(Read(cursor.get()).size() == 10000);
+    CHECK(Read(cursor.get()).size() == 10000);
     AssertOk(engine->Close());
 }
 
@@ -282,15 +284,15 @@ void TestFlushClearsMemtable(const std::filesystem::path& path) {
     AssertOk(engine->WriteBatch({{800, 100, 1.0}, {801, 100, 2.0}}));
     EngineStats before;
     AssertOk(engine->GetStats(&before));
-    assert(before.mutable_points == 2);
+    CHECK(before.mutable_points == 2);
     AssertOk(engine->Flush());
     EngineStats after;
     AssertOk(engine->GetStats(&after));
-    assert(after.mutable_points == 0);
-    assert(after.memtable_bytes == 0);
+    CHECK(after.mutable_points == 0);
+    CHECK(after.memtable_bytes == 0);
     std::unique_ptr<Cursor> cursor;
     AssertOk(engine->Scan({800, 801}, 0, 200, &cursor));
-    assert(Read(cursor.get()).size() == 2);
+    CHECK(Read(cursor.get()).size() == 2);
     AssertOk(engine->Close());
 }
 
@@ -311,13 +313,13 @@ void TestCompactionMergesSstables(const std::filesystem::path& path) {
     AssertOk(engine->Compact());
     std::unique_ptr<Cursor> cursor;
     AssertOk(engine->Scan({700, 701, 702, 703}, 0, 10000, &cursor));
-    assert(Read(cursor.get()).size() == 300);
+    CHECK(Read(cursor.get()).size() == 300);
     AssertOk(engine->Close());
 
     auto reopened = Engine::Open(path, Options{4, 100000}, &status);
     AssertOk(status);
     AssertOk(reopened->Scan({700, 701, 702, 703}, 0, 10000, &cursor));
-    assert(Read(cursor.get()).size() == 300);
+    CHECK(Read(cursor.get()).size() == 300);
     AssertOk(reopened->Close());
 }
 
@@ -333,7 +335,7 @@ void TestCompactionDropsExpired(const std::filesystem::path& path) {
     std::unique_ptr<Cursor> cursor;
     AssertOk(engine->Scan({900}, 0, 1000, &cursor));
     const auto points = Read(cursor.get());
-    assert(points.size() == 1 && points[0].timestamp_ms == 300);
+    CHECK(points.size() == 1 && points[0].timestamp_ms == 300);
     AssertOk(engine->Close());
 }
 
@@ -358,13 +360,13 @@ void TestMultiLevelCompaction(const std::filesystem::path& path) {
     AssertOk(engine->Compact());
     std::unique_ptr<Cursor> cursor;
     AssertOk(engine->Scan({770, 771, 772, 773}, 0, 20000, &cursor));
-    assert(Read(cursor.get()).size() == 16 * 50);
+    CHECK(Read(cursor.get()).size() == 16 * 50);
     AssertOk(engine->Close());
 
     auto reopened = Engine::Open(path, Options{4, 100000}, &status);
     AssertOk(status);
     AssertOk(reopened->Scan({770, 771, 772, 773}, 0, 20000, &cursor));
-    assert(Read(cursor.get()).size() == 16 * 50);
+    CHECK(Read(cursor.get()).size() == 16 * 50);
     AssertOk(reopened->Close());
 }
 
@@ -381,10 +383,10 @@ void TestNegativeTimestampRecovery(const std::filesystem::path& path) {
     auto engine = Engine::Open(path, Options{4, 100000}, &status);
     AssertOk(status);
     AssertOk(engine->Put({950, 0, 3.0}));
-    assert(!engine->Put({950, -500, 4.0}).ok);
+    CHECK(!engine->Put({950, -500, 4.0}).ok);
     std::unique_ptr<Cursor> cursor;
     AssertOk(engine->Scan({950}, -2000, 2000, &cursor));
-    assert(Read(cursor.get()).size() == 3);
+    CHECK(Read(cursor.get()).size() == 3);
     AssertOk(engine->Close());
 }
 
@@ -400,12 +402,12 @@ void TestGcReclaimsWhileViewActive(const std::filesystem::path& path) {
     AssertOk(engine->Flush());
     AssertOk(engine->Compact());
     AssertOk(engine->GarbageCollect());
-    assert(held->NextPoint().has_value());
+    CHECK(held->NextPoint().has_value());
     held->Close();
     AssertOk(engine->GarbageCollect());
     std::unique_ptr<Cursor> cursor;
     AssertOk(engine->Scan({960}, 0, 300, &cursor));
-    assert(Read(cursor.get()).size() == 2);
+    CHECK(Read(cursor.get()).size() == 2);
     AssertOk(engine->Close());
 }
 
@@ -421,7 +423,7 @@ void TestSstableChecksum(const std::filesystem::path& path) {
     for (const auto& entry : std::filesystem::recursive_directory_iterator(path)) {
         if (entry.path().extension() == ".sst") sstable = entry.path();
     }
-    assert(!sstable.empty());
+    CHECK(!sstable.empty());
     std::fstream file(sstable, std::ios::binary | std::ios::in | std::ios::out);
     file.seekg(-1, std::ios::end);
     char byte = 0;
@@ -432,8 +434,8 @@ void TestSstableChecksum(const std::filesystem::path& path) {
     file.close();
     Status status;
     auto engine = Engine::Open(path, Options{4, 1000}, &status);
-    assert(!status.ok);
-    assert(engine == nullptr);
+    CHECK(!status.ok);
+    CHECK(engine == nullptr);
 }
 
 // Exercises the optional per-shard WAL path: a cross-shard batch, an expire
@@ -456,12 +458,12 @@ void TestShardedWal(const std::filesystem::path& path) {
         AssertOk(status);
         std::unique_ptr<Cursor> cursor;
         AssertOk(engine->Scan({1, 2, 3}, 0, 1000, &cursor));
-        assert(Read(cursor.get()).size() == 2);
+        CHECK(Read(cursor.get()).size() == 2);
         AssertOk(engine->Close());
     }
 
     const pid_t pid = fork();
-    assert(pid >= 0);
+    CHECK(pid >= 0);
     if (pid == 0) {
         Status status;
         auto engine = Engine::Open(path, options, &status);
@@ -471,14 +473,14 @@ void TestShardedWal(const std::filesystem::path& path) {
     }
     int child_status = 0;
     waitpid(pid, &child_status, 0);
-    assert(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
+    CHECK(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
 
     Status status;
     auto engine = Engine::Open(path, options, &status);
     AssertOk(status);
     std::unique_ptr<Cursor> cursor;
     AssertOk(engine->Scan({7}, 0, 1000, &cursor));
-    assert(Read(cursor.get()).size() == 1);
+    CHECK(Read(cursor.get()).size() == 1);
     AssertOk(engine->Close());
 }
 void TestWalOnSeparateDir(const std::filesystem::path& path) {
@@ -488,7 +490,7 @@ void TestWalOnSeparateDir(const std::filesystem::path& path) {
                           .wal_dir = wal_dir};
     // Crash (no Close) so the WAL on the separate directory must be replayed.
     const pid_t pid = fork();
-    assert(pid >= 0);
+    CHECK(pid >= 0);
     if (pid == 0) {
         Status status;
         auto engine = Engine::Open(path, options, &status);
@@ -498,8 +500,8 @@ void TestWalOnSeparateDir(const std::filesystem::path& path) {
     }
     int child_status = 0;
     waitpid(pid, &child_status, 0);
-    assert(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
-    assert(std::filesystem::exists(wal_dir));
+    CHECK(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
+    CHECK(std::filesystem::exists(wal_dir));
 
     // Reopen with the same WAL directory: records are replayed from it.
     Status status;
@@ -507,7 +509,7 @@ void TestWalOnSeparateDir(const std::filesystem::path& path) {
     AssertOk(status);
     std::unique_ptr<Cursor> cursor;
     AssertOk(engine->Scan({7}, 0, 1000, &cursor));
-    assert(Read(cursor.get()).size() == 2);
+    CHECK(Read(cursor.get()).size() == 2);
     // Flush records the WAL directory in the manifest.
     AssertOk(engine->Close());
 
@@ -517,8 +519,8 @@ void TestWalOnSeparateDir(const std::filesystem::path& path) {
         Options{.shard_count = 4, .memtable_max_points = 1000000,
                 .wal_dir = path / "wal-other"},
         &status);
-    assert(wrong == nullptr);
-    assert(!status.ok);
+    CHECK(wrong == nullptr);
+    CHECK(!status.ok);
 
     // The sharded (concurrent) WAL honours the same override.
     const auto sharded_dir = path / "wal-sharded";
@@ -534,8 +536,8 @@ void TestWalOnSeparateDir(const std::filesystem::path& path) {
         AssertOk(sharded->Put({9, 100, 1.0}));
         AssertOk(sharded->Close());
     }
-    assert(std::filesystem::exists(sharded_dir / "shard-0"));
-    assert(std::filesystem::exists(sharded_dir / "commit"));
+    CHECK(std::filesystem::exists(sharded_dir / "shard-0"));
+    CHECK(std::filesystem::exists(sharded_dir / "commit"));
 }
 
 void TestCursorOutlivesEngine(const std::filesystem::path& path) {
@@ -549,7 +551,7 @@ void TestCursorOutlivesEngine(const std::filesystem::path& path) {
         AssertOk(engine->Close());
     }
     auto point = cursor->NextPoint();
-    assert(point && point->timestamp_ms == 100);
+    CHECK(point && point->timestamp_ms == 100);
     cursor->Close();
 }
 
@@ -567,7 +569,7 @@ void TestLargeSeriesStreaming(const std::filesystem::path& path) {
     AssertOk(engine->Flush());
     std::unique_ptr<Cursor> cursor;
     AssertOk(engine->Scan({910}, 0, 2000000, &cursor));
-    assert(Read(cursor.get()).size() == 100000);
+    CHECK(Read(cursor.get()).size() == 100000);
     AssertOk(engine->Close());
 }
 
@@ -591,27 +593,27 @@ void TestPageIndexSelectiveScan(const std::filesystem::path& path) {
     };
     // Ranges that start/end inside pages and span page boundaries.
     auto points = scan(0, 10);
-    assert(points.size() == 10 && points.front().timestamp_ms == 0);
+    CHECK(points.size() == 10 && points.front().timestamp_ms == 0);
     points = scan(500, 520);
-    assert(points.size() == 20 && points.front().timestamp_ms == 500);
+    CHECK(points.size() == 20 && points.front().timestamp_ms == 500);
     points = scan(999, 1000);
-    assert(points.size() == 1 && points.front().timestamp_ms == 999);
+    CHECK(points.size() == 1 && points.front().timestamp_ms == 999);
     points = scan(128, 256);
-    assert(points.size() == 128 && points.front().timestamp_ms == 128);
+    CHECK(points.size() == 128 && points.front().timestamp_ms == 128);
     points = scan(0, 1000);
-    assert(points.size() == 1000);
+    CHECK(points.size() == 1000);
     points = scan(1000, 2000);
-    assert(points.empty());
+    CHECK(points.empty());
     // Expiration must also prune pages.
     AssertOk(engine->ExpireBefore(600));
     points = scan(0, 1000);
-    assert(points.size() == 400 && points.front().timestamp_ms == 600);
+    CHECK(points.size() == 400 && points.front().timestamp_ms == 600);
     AssertOk(engine->Close());
 }
 
 void TestCrashRecovery(const std::filesystem::path& path) {
     const pid_t pid = fork();
-    assert(pid >= 0);
+    CHECK(pid >= 0);
     if (pid == 0) {
         // Child: write and crash without flushing/Close, so the WAL keeps
         // the committed (fsynced) records for replay.
@@ -623,7 +625,7 @@ void TestCrashRecovery(const std::filesystem::path& path) {
     }
     int child_status = 0;
     waitpid(pid, &child_status, 0);
-    assert(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
+    CHECK(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
 
     Status status;
     auto engine = Engine::Open(path, Options{4, 1000000}, &status);
@@ -631,14 +633,14 @@ void TestCrashRecovery(const std::filesystem::path& path) {
     std::unique_ptr<Cursor> cursor;
     AssertOk(engine->Scan({5}, 0, 1000, &cursor));
     const auto points = Read(cursor.get());
-    assert(points.size() == 2);
-    assert(points[0].timestamp_ms == 100 && points[1].timestamp_ms == 200);
+    CHECK(points.size() == 2);
+    CHECK(points[0].timestamp_ms == 100 && points[1].timestamp_ms == 200);
     AssertOk(engine->Close());
 }
 
 void TestCrashRecoveryExpire(const std::filesystem::path& path) {
     const pid_t pid = fork();
-    assert(pid >= 0);
+    CHECK(pid >= 0);
     if (pid == 0) {
         Status status;
         auto engine = Engine::Open(path, Options{4, 1000000}, &status);
@@ -649,7 +651,7 @@ void TestCrashRecoveryExpire(const std::filesystem::path& path) {
     }
     int child_status = 0;
     waitpid(pid, &child_status, 0);
-    assert(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
+    CHECK(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
 
     Status status;
     auto engine = Engine::Open(path, Options{4, 1000000}, &status);
@@ -657,8 +659,8 @@ void TestCrashRecoveryExpire(const std::filesystem::path& path) {
     std::unique_ptr<Cursor> cursor;
     AssertOk(engine->Scan({6}, 0, 1000, &cursor));
     const auto points = Read(cursor.get());
-    assert(points.size() == 1 && points[0].timestamp_ms == 500);
-    assert(!engine->Put({6, 200, 3.0}).ok);
+    CHECK(points.size() == 1 && points[0].timestamp_ms == 500);
+    CHECK(!engine->Put({6, 200, 3.0}).ok);
     AssertOk(engine->Close());
 }
 
@@ -668,7 +670,7 @@ void TestCrashRecoveryExpire(const std::filesystem::path& path) {
 void TestTornWalTailRecovery(const std::filesystem::path& path) {
     auto crash_write = [&path](uint64_t series_id, int64_t timestamp) {
         const pid_t pid = fork();
-        assert(pid >= 0);
+        CHECK(pid >= 0);
         if (pid == 0) {
             Status status;
             auto engine = Engine::Open(path, Options{4, 1000}, &status);
@@ -678,7 +680,7 @@ void TestTornWalTailRecovery(const std::filesystem::path& path) {
         }
         int child_status = 0;
         waitpid(pid, &child_status, 0);
-        assert(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
+        CHECK(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
     };
 
     crash_write(31, 100);
@@ -694,7 +696,7 @@ void TestTornWalTailRecovery(const std::filesystem::path& path) {
     AssertOk(status);
     std::unique_ptr<Cursor> cursor;
     AssertOk(engine->Scan({31}, 0, 1000, &cursor));
-    assert(Read(cursor.get()).size() == 2);
+    CHECK(Read(cursor.get()).size() == 2);
     AssertOk(engine->Close());
 }
 
@@ -803,7 +805,7 @@ void WriteWalSegment(const std::filesystem::path& db_path, uint64_t number,
     std::filesystem::create_directories(db_path / "wal");
     std::ofstream out(db_path / "wal" / name,
                       std::ios::binary | std::ios::trunc);
-    assert(out);
+    CHECK(out);
     out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
 }
 
@@ -832,14 +834,14 @@ void TestVectorAppendOrder(const std::filesystem::path& path) {
         std::unique_ptr<Cursor> cursor;
         AssertOk(engine->Scan({series_id}, 0, 5000, &cursor));
         const auto points = Read(cursor.get());
-        assert(points.size() == 700);
+        CHECK(points.size() == 700);
         for (size_t i = 0; i < points.size(); ++i) {
-            assert(points[i].series_id == series_id);
-            assert(points[i].timestamp_ms == 1000 + static_cast<int64_t>(i));
+            CHECK(points[i].series_id == series_id);
+            CHECK(points[i].timestamp_ms == 1000 + static_cast<int64_t>(i));
             const double expected = series_id == 1
                                         ? static_cast<double>(i)
                                         : static_cast<double>(i) * 2.0;
-            assert(points[i].value == expected);
+            CHECK(points[i].value == expected);
         }
     }
     AssertOk(engine->Close());
@@ -867,14 +869,14 @@ void TestVectorReplayOrder(const std::filesystem::path& path) {
     // would pass even if the replay path ignored it entirely.
     EngineStats replayed;
     AssertOk(engine->GetStats(&replayed));
-    assert(replayed.wal_bytes_replayed > 0);
+    CHECK(replayed.wal_bytes_replayed > 0);
     std::unique_ptr<Cursor> cursor;
     AssertOk(engine->Scan({7}, 0, 1000, &cursor));
     const auto points = Read(cursor.get());
-    assert(points.size() == 3);
-    assert(points[0].timestamp_ms == 100 && points[0].value == 1.0);
-    assert(points[1].timestamp_ms == 200 && points[1].value == 2.0);
-    assert(points[2].timestamp_ms == 300 && points[2].value == 3.0);
+    CHECK(points.size() == 3);
+    CHECK(points[0].timestamp_ms == 100 && points[0].value == 1.0);
+    CHECK(points[1].timestamp_ms == 200 && points[1].value == 2.0);
+    CHECK(points[2].timestamp_ms == 300 && points[2].value == 3.0);
 
     // The order must survive the flush: the SSTable writer requires ascending
     // timestamps inside a series chunk.
@@ -882,9 +884,9 @@ void TestVectorReplayOrder(const std::filesystem::path& path) {
     std::unique_ptr<Cursor> flushed;
     AssertOk(engine->Scan({7}, 0, 1000, &flushed));
     const auto flushed_points = Read(flushed.get());
-    assert(flushed_points.size() == 3);
+    CHECK(flushed_points.size() == 3);
     for (size_t i = 0; i < flushed_points.size(); ++i) {
-        assert(flushed_points[i].timestamp_ms ==
+        CHECK(flushed_points[i].timestamp_ms ==
                100 + static_cast<int64_t>(i) * 100);
     }
     AssertOk(engine->Close());
@@ -910,13 +912,13 @@ void TestDuplicateVersionDedup(const std::filesystem::path& path) {
     AssertOk(status);
     EngineStats replayed;
     AssertOk(engine->GetStats(&replayed));
-    assert(replayed.wal_bytes_replayed > 0);
+    CHECK(replayed.wal_bytes_replayed > 0);
     std::unique_ptr<Cursor> cursor;
     AssertOk(engine->Scan({9}, 0, 1000, &cursor));
     const auto points = Read(cursor.get());
-    assert(points.size() == 1);
-    assert(points[0].timestamp_ms == 500);
-    assert(points[0].value == 5.0);
+    CHECK(points.size() == 1);
+    CHECK(points[0].timestamp_ms == 500);
+    CHECK(points[0].value == 5.0);
 
     // The stale record is below the covered version, so the flush must skip it
     // rather than writing it into a second SSTable.
@@ -924,8 +926,8 @@ void TestDuplicateVersionDedup(const std::filesystem::path& path) {
     std::unique_ptr<Cursor> flushed;
     AssertOk(engine->Scan({9}, 0, 1000, &flushed));
     const auto flushed_points = Read(flushed.get());
-    assert(flushed_points.size() == 1);
-    assert(flushed_points[0].value == 5.0);
+    CHECK(flushed_points.size() == 1);
+    CHECK(flushed_points[0].value == 5.0);
     AssertOk(engine->Close());
 }
 
@@ -954,17 +956,17 @@ void TestCowReadViewIsolation(const std::filesystem::path& path) {
 
     // The old cursor must still see exactly the first 100 points.
     const auto old_points = Read(old_view.get());
-    assert(old_points.size() == 100);
+    CHECK(old_points.size() == 100);
     for (size_t i = 0; i < old_points.size(); ++i) {
-        assert(old_points[i].timestamp_ms == static_cast<int64_t>(i));
-        assert(old_points[i].value == static_cast<double>(i));
+        CHECK(old_points[i].timestamp_ms == static_cast<int64_t>(i));
+        CHECK(old_points[i].value == static_cast<double>(i));
     }
 
     std::unique_ptr<Cursor> fresh;
     AssertOk(engine->Scan({42}, 0, 1000, &fresh));
     const auto fresh_points = Read(fresh.get());
-    assert(fresh_points.size() == 200);
-    assert(fresh_points.back().timestamp_ms == 199);
+    CHECK(fresh_points.size() == 200);
+    CHECK(fresh_points.back().timestamp_ms == 199);
 
     // Same rule across a flush: a snapshot taken after the flush ignores the
     // write that follows it.
@@ -973,8 +975,8 @@ void TestCowReadViewIsolation(const std::filesystem::path& path) {
     AssertOk(engine->Scan({42}, 0, 1000, &after_flush));
     AssertOk(engine->Put({42, 200, 200.0}));
     const auto after_flush_points = Read(after_flush.get());
-    assert(after_flush_points.size() == 200);
-    assert(after_flush_points.back().timestamp_ms == 199);
+    CHECK(after_flush_points.size() == 200);
+    CHECK(after_flush_points.back().timestamp_ms == 199);
     AssertOk(engine->Close());
 }
 
@@ -986,24 +988,24 @@ void TestEmptyDataset(const std::filesystem::path& path) {
     std::unique_ptr<Cursor> cursor;
 
     AssertOk(engine->Scan({}, 0, 1000, &cursor));
-    assert(Read(cursor.get()).empty());
+    CHECK(Read(cursor.get()).empty());
 
     AssertOk(engine->Scan({123}, 0, 1000, &cursor));
-    assert(Read(cursor.get()).empty());
+    CHECK(Read(cursor.get()).empty());
 
     AssertOk(engine->Scan({123}, 500, 500, &cursor));
-    assert(Read(cursor.get()).empty());
+    CHECK(Read(cursor.get()).empty());
 
     AssertOk(engine->Aggregate({123}, 0, 1000, 10, AggregateOp::Sum, &cursor));
-    assert(!cursor->NextAggregate().has_value());
+    CHECK(!cursor->NextAggregate().has_value());
 
     AssertOk(engine->Aggregate({}, 0, 1000, 10, AggregateOp::Count, &cursor));
-    assert(!cursor->NextAggregate().has_value());
+    CHECK(!cursor->NextAggregate().has_value());
 
     // An engine that has only ever been flushed is still empty.
     AssertOk(engine->Flush());
     AssertOk(engine->Scan({123}, 0, 1000, &cursor));
-    assert(Read(cursor.get()).empty());
+    CHECK(Read(cursor.get()).empty());
     AssertOk(engine->Close());
 }
 
@@ -1028,28 +1030,28 @@ void TestAggregateBuckets(const std::filesystem::path& path) {
     };
 
     const auto sums = run(AggregateOp::Sum);
-    assert(sums.size() == 3);
-    assert(sums[0].bucket_start == -300 && sums[0].bucket_end == -200);
-    assert(sums[0].result == 5.0 && sums[0].count == 2);
-    assert(sums[1].bucket_start == -100 && sums[1].result == 7.0);
-    assert(sums[2].bucket_start == 100 && sums[2].bucket_end == 200);
-    assert(sums[2].result == 11.0);
+    CHECK(sums.size() == 3);
+    CHECK(sums[0].bucket_start == -300 && sums[0].bucket_end == -200);
+    CHECK(sums[0].result == 5.0 && sums[0].count == 2);
+    CHECK(sums[1].bucket_start == -100 && sums[1].result == 7.0);
+    CHECK(sums[2].bucket_start == 100 && sums[2].bucket_end == 200);
+    CHECK(sums[2].result == 11.0);
 
     const auto counts = run(AggregateOp::Count);
-    assert(counts.size() == 3);
-    assert(counts[0].count == 2 && counts[0].result == 2.0);
-    assert(counts[1].count == 1 && counts[2].count == 1);
+    CHECK(counts.size() == 3);
+    CHECK(counts[0].count == 2 && counts[0].result == 2.0);
+    CHECK(counts[1].count == 1 && counts[2].count == 1);
 
     const auto averages = run(AggregateOp::Avg);
-    assert(averages.size() == 3 && averages[0].result == 2.5);
+    CHECK(averages.size() == 3 && averages[0].result == 2.5);
 
     const auto minimums = run(AggregateOp::Min);
-    assert(minimums.size() == 3 && minimums[0].result == 2.0);
-    assert(minimums[1].result == 7.0 && minimums[2].result == 11.0);
+    CHECK(minimums.size() == 3 && minimums[0].result == 2.0);
+    CHECK(minimums[1].result == 7.0 && minimums[2].result == 11.0);
 
     const auto maximums = run(AggregateOp::Max);
-    assert(maximums.size() == 3 && maximums[0].result == 3.0);
-    assert(maximums[2].result == 11.0);
+    CHECK(maximums.size() == 3 && maximums[0].result == 3.0);
+    CHECK(maximums[2].result == 11.0);
     AssertOk(engine->Close());
 }
 
@@ -1067,15 +1069,15 @@ void TestExtremeTimestamps(const std::filesystem::path& path) {
     std::unique_ptr<Cursor> cursor;
     AssertOk(engine->Scan({1}, kMin, kMax, &cursor));
     const auto points = Read(cursor.get());
-    assert(points.size() == 2);
-    assert(points[0].timestamp_ms == kMin);
-    assert(points[1].timestamp_ms == kMin + 1);
+    CHECK(points.size() == 2);
+    CHECK(points[0].timestamp_ms == kMin);
+    CHECK(points[1].timestamp_ms == kMin + 1);
 
     // [start, end) is half-open, so the largest timestamp cannot be reached by
     // a range query; writing it is legal and it stays in the database.
     std::unique_ptr<Cursor> max_cursor;
     AssertOk(engine->Scan({2}, kMin, kMax, &max_cursor));
-    assert(Read(max_cursor.get()).empty());
+    CHECK(Read(max_cursor.get()).empty());
 
     AssertOk(engine->Flush());
     AssertOk(engine->Close());
@@ -1084,11 +1086,103 @@ void TestExtremeTimestamps(const std::filesystem::path& path) {
     std::unique_ptr<Cursor> again;
     AssertOk(reopened->Scan({1}, kMin, kMax, &again));
     const auto again_points = Read(again.get());
-    assert(again_points.size() == 2);
-    assert(again_points[0].timestamp_ms == kMin && again_points[0].value == 1.0);
-    assert(again_points[1].timestamp_ms == kMin + 1 &&
+    CHECK(again_points.size() == 2);
+    CHECK(again_points[0].timestamp_ms == kMin && again_points[0].value == 1.0);
+    CHECK(again_points[1].timestamp_ms == kMin + 1 &&
            again_points[1].value == 3.0);
     AssertOk(reopened->Close());
+}
+
+// Appending after a snapshot must reallocate the per-series vector and the
+// snapshot must survive it. A vector that grew geometrically has capacity at
+// most 2 * size, so writing size + 1 more points is guaranteed to reallocate
+// whatever the growth factor is; without COW the cursor's iterators dangle and
+// ASan reports a use-after-free.
+void TestCowVectorReallocation(const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(path, Options{4, 100000}, &status);
+    AssertOk(status);
+    constexpr int kInitial = 100;
+    std::vector<DataPoint> first;
+    first.reserve(kInitial);
+    for (int i = 0; i < kInitial; ++i) {
+        first.push_back({77, i, static_cast<double>(i)});
+    }
+    AssertOk(engine->WriteBatch(first));
+
+    std::unique_ptr<Cursor> old_view;
+    AssertOk(engine->Scan({77}, 0, 100000, &old_view));
+
+    std::vector<DataPoint> second;
+    second.reserve(kInitial + 1);
+    for (int i = kInitial; i <= 2 * kInitial; ++i) {
+        second.push_back({77, i, static_cast<double>(i)});
+    }
+    AssertOk(engine->WriteBatch(second));
+
+    const auto old_points = Read(old_view.get());
+    CHECK(old_points.size() == static_cast<size_t>(kInitial));
+    for (size_t i = 0; i < old_points.size(); ++i) {
+        CHECK(old_points[i].timestamp_ms == static_cast<int64_t>(i));
+        CHECK(old_points[i].value == static_cast<double>(i));
+    }
+
+    std::unique_ptr<Cursor> fresh;
+    AssertOk(engine->Scan({77}, 0, 100000, &fresh));
+    const auto fresh_points = Read(fresh.get());
+    CHECK(fresh_points.size() == static_cast<size_t>(2 * kInitial + 1));
+    CHECK(fresh_points.back().timestamp_ms == 2 * kInitial);
+
+    // The reallocated buffer must also survive a flush and land in the SSTable
+    // in timestamp order.
+    AssertOk(engine->Flush());
+    std::unique_ptr<Cursor> flushed;
+    AssertOk(engine->Scan({77}, 0, 100000, &flushed));
+    const auto flushed_points = Read(flushed.get());
+    CHECK(flushed_points.size() == static_cast<size_t>(2 * kInitial + 1));
+    for (size_t i = 0; i < flushed_points.size(); ++i) {
+        CHECK(flushed_points[i].timestamp_ms == static_cast<int64_t>(i));
+    }
+    AssertOk(engine->Close());
+}
+
+// A range wider than INT64_MAX: timestamp - start reaches 2^64 - 2, so the
+// bucket math has to be done in 128 bits. Without that this is signed overflow
+// (UB), which the UBSan build reports.
+void TestAggregateExtremeRange(const std::filesystem::path& path) {
+    constexpr int64_t kMin = std::numeric_limits<int64_t>::min();
+    constexpr int64_t kMax = std::numeric_limits<int64_t>::max();
+    Status status;
+    auto engine = Engine::Open(path, Options{4, 100000}, &status);
+    AssertOk(status);
+    AssertOk(engine->WriteBatch({{1, kMin, 1.0},
+                                 {1, -1, 2.0},
+                                 {1, 0, 3.0},
+                                 {1, kMax - 1, 4.0}}));
+
+    // One full-width window: [INT64_MIN, -1), [-1, INT64_MAX-1),
+    // [INT64_MAX-1, INT64_MAX).
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Aggregate({1}, kMin, kMax, kMax, AggregateOp::Count, &cursor));
+    std::vector<AggregateResult> buckets;
+    while (auto bucket = cursor->NextAggregate()) buckets.push_back(*bucket);
+    CHECK(buckets.size() == 3);
+    CHECK(buckets[0].bucket_start == kMin && buckets[0].count == 1);
+    CHECK(buckets[1].bucket_start == -1 && buckets[1].count == 2);
+    CHECK(buckets[2].bucket_start == kMax - 1 && buckets[2].count == 1);
+    CHECK(buckets[2].bucket_end == kMax);
+
+    // window == 1 over the same span: one bucket per point, sums preserved.
+    std::unique_ptr<Cursor> per_point;
+    AssertOk(engine->Aggregate({1}, kMin, kMax, 1, AggregateOp::Sum, &per_point));
+    std::vector<AggregateResult> points;
+    while (auto bucket = per_point->NextAggregate()) points.push_back(*bucket);
+    CHECK(points.size() == 4);
+    CHECK(points[0].bucket_start == kMin && points[0].result == 1.0);
+    CHECK(points[1].bucket_start == -1 && points[1].result == 2.0);
+    CHECK(points[2].bucket_start == 0 && points[2].result == 3.0);
+    CHECK(points[3].bucket_start == kMax - 1 && points[3].result == 4.0);
+    AssertOk(engine->Close());
 }
 
 }  // namespace
@@ -1132,9 +1226,12 @@ int main(int argc, char** argv) {
         {"empty_dataset", [&] { TestEmptyDataset(root / "empty_dataset"); }},
         {"aggregate_buckets", [&] { TestAggregateBuckets(root / "aggregate_buckets"); }},
         {"extreme_timestamps", [&] { TestExtremeTimestamps(root / "extreme_ts"); }},
+        {"cow_vector_reallocation", [&] { TestCowVectorReallocation(root / "cow_realloc"); }},
+        {"aggregate_extreme_range", [&] { TestAggregateExtremeRange(root / "aggregate_extreme"); }},
     };
     const std::string filter = argc > 1 ? argv[1] : std::string();
     size_t ran = 0;
+    size_t failed = 0;
     for (size_t i = 0; i < cases.size(); ++i) {
         if (!filter.empty() && filter != std::to_string(i + 1) &&
             std::string(cases[i].name).find(filter) == std::string::npos) {
@@ -1143,7 +1240,16 @@ int main(int argc, char** argv) {
         std::cout << "[" << (i + 1) << "/" << cases.size() << "] "
                   << cases[i].name << " ... " << std::flush;
         const auto started = std::chrono::steady_clock::now();
-        cases[i].run();
+        try {
+            cases[i].run();
+        } catch (const std::exception& error) {
+            // CHECK carries the expression, file and line; keep going so one
+            // failure does not hide the rest of the suite.
+            std::cout << "FAILED\n  " << error.what() << std::endl;
+            ++failed;
+            ++ran;
+            continue;
+        }
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - started);
         std::cout << "ok (" << elapsed.count() << " ms)" << std::endl;
@@ -1153,5 +1259,10 @@ int main(int argc, char** argv) {
         std::cerr << "no test matched '" << filter << "'\n";
         return 2;
     }
+    if (failed != 0) {
+        std::cerr << failed << " of " << ran << " tests failed\n";
+        return 1;
+    }
     std::cout << "all tests passed\n";
+    return 0;
 }

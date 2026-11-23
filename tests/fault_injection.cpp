@@ -1,5 +1,7 @@
 #include "tsdb.h"
 
+#include "check.h"
+
 #include <cassert>
 #include <filesystem>
 #include <fstream>
@@ -35,8 +37,10 @@ std::filesystem::path NewestWalSegment(const std::filesystem::path& path) {
 
 int main() {
     size_t injected = 0;
-
+    size_t round = 0;
+    try {
     for (size_t i = 0; i < 50; ++i) {
+        round = i;
         const auto path =
             std::filesystem::temp_directory_path() /
             ("tsdb-fault-" + std::to_string(i));
@@ -47,12 +51,12 @@ int main() {
             path, tsdb::Options{.shard_count = 4,
                                 .memtable_max_points = 1000},
             &status);
-        assert(status.ok);
+        CHECK(status.ok);
         tsdb::CommitVersion version = 0;
-        assert(engine->WriteBatch({{1, static_cast<int64_t>(i), 1.25}},
+        CHECK(engine->WriteBatch({{1, static_cast<int64_t>(i), 1.25}},
                                   &version).ok);
-        assert(engine->Flush().ok);
-        assert(engine->Close().ok);
+        CHECK(engine->Flush().ok);
+        CHECK(engine->Close().ok);
 
         const auto manifest = path / "MANIFEST";
         if (i % 5 == 0) {
@@ -92,15 +96,22 @@ int main() {
                                 .memtable_max_points = 1000},
             &status);
         if (i % 5 == 0 || i % 5 == 3) {
-            assert(reopened == nullptr);
+            CHECK(reopened == nullptr);
         } else {
-            assert(reopened != nullptr);
+            CHECK(reopened != nullptr);
             std::unique_ptr<tsdb::Cursor> cursor;
-            assert(reopened->Scan({1}, 0, 1000, &cursor).ok);
-            assert(reopened->Close().ok);
+            CHECK(reopened->Scan({1}, 0, 1000, &cursor).ok);
+            CHECK(reopened->Close().ok);
         }
         ++injected;
         std::filesystem::remove_all(path);
+    }
+    } catch (const std::exception& error) {
+        // CHECK failures land here so the round number is visible; the suite is
+        // only green when every one of the 50 rounds survives.
+        std::cerr << "fault injection round " << round
+                  << " failed: " << error.what() << '\n';
+        return 1;
     }
 
     std::cout << "fault_injections=" << injected << '\n';
