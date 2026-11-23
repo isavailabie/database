@@ -1094,10 +1094,10 @@ void TestExtremeTimestamps(const std::filesystem::path& path) {
 }
 
 // Appending after a snapshot must reallocate the per-series vector and the
-// snapshot must survive it. A vector that grew geometrically has capacity at
-// most 2 * size, so writing size + 1 more points is guaranteed to reallocate
-// whatever the growth factor is; without COW the cursor's iterators dangle and
-// ASan reports a use-after-free.
+// snapshot must survive it. The capacity is measured through the test hook, so
+// the "this write must reallocate" claim is grounded in the actual buffer rather
+// than in an assumed growth factor: growing past capacity forces a reallocation,
+// and without copy-on-write the cursor's iterators dangle (ASan reports it).
 void TestCowVectorReallocation(const std::filesystem::path& path) {
     Status status;
     auto engine = Engine::Open(path, Options{4, 100000}, &status);
@@ -1110,15 +1110,42 @@ void TestCowVectorReallocation(const std::filesystem::path& path) {
     }
     AssertOk(engine->WriteBatch(first));
 
+    // The snapshot pins the shard, so the next commit has to copy the buffer.
     std::unique_ptr<Cursor> old_view;
     AssertOk(engine->Scan({77}, 0, 100000, &old_view));
 
-    std::vector<DataPoint> second;
-    second.reserve(kInitial + 1);
-    for (int i = kInitial; i <= 2 * kInitial; ++i) {
-        second.push_back({77, i, static_cast<double>(i)});
+    // The cursor and the live shard share this buffer instance right now, so its
+    // capacity is exactly the one an in-place append would have to grow.
+    const auto before = testing::InspectSeriesBuffer(*engine, 77);
+    CHECK(before.point_count == static_cast<size_t>(kInitial));
+
+    // The vector layout reports the capacity the snapshot buffer actually has, so
+    // growing one past it is what forces the reallocation. The ordered-map layout
+    // has no capacity; there the write only has to be large enough to exercise
+    // the COW clone.
+    const bool measurable = before.capacity.has_value();
+    size_t target = static_cast<size_t>(2 * kInitial + 1);
+    if (measurable) {
+        CHECK(*before.capacity >= before.point_count);
+        target = *before.capacity + 1;
     }
+    CHECK(target > before.point_count);
+    std::vector<DataPoint> second;
+    second.reserve(target - before.point_count);
+    for (size_t i = static_cast<size_t>(kInitial); i < target; ++i) {
+        second.push_back({77, static_cast<int64_t>(i), static_cast<double>(i)});
+    }
+    CHECK(!second.empty());
     AssertOk(engine->WriteBatch(second));
+
+    const auto after = testing::InspectSeriesBuffer(*engine, 77);
+    CHECK(after.point_count == target);
+    if (measurable) {
+        // Proof that the write outgrew the buffer the snapshot holds.
+        CHECK(after.point_count > *before.capacity);
+        CHECK(after.capacity.has_value());
+        CHECK(*after.capacity >= after.point_count);
+    }
 
     const auto old_points = Read(old_view.get());
     CHECK(old_points.size() == static_cast<size_t>(kInitial));
@@ -1130,8 +1157,8 @@ void TestCowVectorReallocation(const std::filesystem::path& path) {
     std::unique_ptr<Cursor> fresh;
     AssertOk(engine->Scan({77}, 0, 100000, &fresh));
     const auto fresh_points = Read(fresh.get());
-    CHECK(fresh_points.size() == static_cast<size_t>(2 * kInitial + 1));
-    CHECK(fresh_points.back().timestamp_ms == 2 * kInitial);
+    CHECK(fresh_points.size() == target);
+    CHECK(fresh_points.back().timestamp_ms == static_cast<int64_t>(target - 1));
 
     // The reallocated buffer must also survive a flush and land in the SSTable
     // in timestamp order.
@@ -1139,7 +1166,7 @@ void TestCowVectorReallocation(const std::filesystem::path& path) {
     std::unique_ptr<Cursor> flushed;
     AssertOk(engine->Scan({77}, 0, 100000, &flushed));
     const auto flushed_points = Read(flushed.get());
-    CHECK(flushed_points.size() == static_cast<size_t>(2 * kInitial + 1));
+    CHECK(flushed_points.size() == target);
     for (size_t i = 0; i < flushed_points.size(); ++i) {
         CHECK(flushed_points[i].timestamp_ms == static_cast<int64_t>(i));
     }
@@ -1182,7 +1209,68 @@ void TestAggregateExtremeRange(const std::filesystem::path& path) {
     CHECK(points[1].bucket_start == -1 && points[1].result == 2.0);
     CHECK(points[2].bucket_start == 0 && points[2].result == 3.0);
     CHECK(points[3].bucket_start == kMax - 1 && points[3].result == 4.0);
+
+    // Parameter validation must reject these instead of computing a bucket.
+    std::unique_ptr<Cursor> invalid;
+    CHECK(!engine->Aggregate({1}, 0, 1000, 0, AggregateOp::Sum, &invalid).ok);
+    CHECK(!engine->Aggregate({1}, 0, 1000, -1, AggregateOp::Sum, &invalid).ok);
+    CHECK(!engine->Aggregate({1}, 1000, 0, 10, AggregateOp::Sum, &invalid).ok);
     AssertOk(engine->Close());
+}
+
+// Zigzag boundaries through both on-disk paths: the first reopen replays the WAL,
+// the second reads an SSTable. INT64_MAX itself is not covered because a
+// half-open [start, end) cannot include it; INT64_MAX - 1 exercises the same
+// 10-byte varint branch.
+void TestZigzagBoundaries(const std::filesystem::path& path) {
+    constexpr int64_t kMin = std::numeric_limits<int64_t>::min();
+    constexpr int64_t kMax = std::numeric_limits<int64_t>::max();
+    const std::vector<int64_t> values{kMin, kMin + 1, -1, 0, 1, kMax - 1};
+
+    const pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        Status child_status;
+        auto engine = Engine::Open(path, Options{4, 100000}, &child_status);
+        if (!child_status.ok) _exit(2);
+        for (size_t i = 0; i < values.size(); ++i) {
+            if (!engine->Put({1000 + i, values[i],
+                              static_cast<double>(i)})
+                     .ok) {
+                _exit(3);
+            }
+        }
+        _exit(0);  // crash without Close: the records stay in the WAL
+    }
+    int child_status = 0;
+    waitpid(pid, &child_status, 0);
+    CHECK(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
+
+    const auto check_all = [&](Engine* engine) {
+        for (size_t i = 0; i < values.size(); ++i) {
+            std::unique_ptr<Cursor> cursor;
+            AssertOk(engine->Scan({1000 + i}, kMin, kMax, &cursor));
+            const auto points = Read(cursor.get());
+            CHECK(points.size() == 1);
+            CHECK(points[0].timestamp_ms == values[i]);
+            CHECK(points[0].value == static_cast<double>(i));
+        }
+    };
+
+    Status status;
+    auto replayed = Engine::Open(path, Options{4, 100000}, &status);
+    AssertOk(status);
+    EngineStats replayed_stats;
+    AssertOk(replayed->GetStats(&replayed_stats));
+    CHECK(replayed_stats.wal_bytes_replayed > 0);  // the values came from the WAL
+    check_all(replayed.get());
+    AssertOk(replayed->Flush());
+    AssertOk(replayed->Close());
+
+    auto reopened = Engine::Open(path, Options{4, 100000}, &status);
+    AssertOk(status);
+    check_all(reopened.get());  // now from an SSTable
+    AssertOk(reopened->Close());
 }
 
 }  // namespace
@@ -1228,6 +1316,7 @@ int main(int argc, char** argv) {
         {"extreme_timestamps", [&] { TestExtremeTimestamps(root / "extreme_ts"); }},
         {"cow_vector_reallocation", [&] { TestCowVectorReallocation(root / "cow_realloc"); }},
         {"aggregate_extreme_range", [&] { TestAggregateExtremeRange(root / "aggregate_extreme"); }},
+        {"zigzag_boundaries", [&] { TestZigzagBoundaries(root / "zigzag"); }},
     };
     const std::string filter = argc > 1 ? argv[1] : std::string();
     size_t ran = 0;

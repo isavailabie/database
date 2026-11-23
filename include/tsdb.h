@@ -106,6 +106,26 @@ struct EngineStats {
     size_t memtable_bytes{};
 };
 
+class Engine;
+
+namespace testing {
+
+// Test-only introspection: reports the in-memory buffer of one series so the
+// suite can prove that a write outgrew (and therefore reallocated) it instead of
+// inferring that from a vector growth model. Not part of the storage contract;
+// the engine itself never calls it.
+struct SeriesBufferInfo {
+    size_t point_count{};
+    // Present when the memtable keeps the series in a contiguous buffer whose
+    // capacity is meaningful (the vector layout); empty for the ordered-map
+    // layout, which has no capacity to grow.
+    std::optional<size_t> capacity;
+};
+
+SeriesBufferInfo InspectSeriesBuffer(const Engine& engine, uint64_t series_id);
+
+}  // namespace testing
+
 class Engine {
 public:
     static std::unique_ptr<Engine> Open(const std::filesystem::path& path,
@@ -139,6 +159,10 @@ private:
     // Shared so that a Cursor created by Scan can keep the engine state alive
     // until the cursor is destroyed, even if the Engine object is gone.
     std::shared_ptr<Impl> impl_;
+
+    // The test hook above needs the impl to reach the memtable buffer.
+    friend testing::SeriesBufferInfo testing::InspectSeriesBuffer(
+        const Engine& engine, uint64_t series_id);
 };
 
 }  // namespace tsdb

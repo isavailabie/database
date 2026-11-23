@@ -8,7 +8,10 @@
 #include <stdexcept>
 #include <string>
 
-namespace testing {
+// Deliberately not named `testing`: the engine exposes tsdb::testing for its own
+// test hooks and `using namespace tsdb` in the suite would make the name
+// ambiguous.
+namespace test_support {
 
 class CheckFailure : public std::runtime_error {
 public:
@@ -16,12 +19,12 @@ public:
         : std::runtime_error(message) {}
 };
 
-}  // namespace testing
+}  // namespace test_support
 
 #define CHECK(condition)                                                \
     do {                                                                \
         if (!(condition)) {                                             \
-            throw ::testing::CheckFailure(                              \
+            throw ::test_support::CheckFailure(                         \
                 std::string("CHECK failed: ") + #condition + " at " +   \
                 __FILE__ + ":" + std::to_string(__LINE__));             \
         }                                                               \

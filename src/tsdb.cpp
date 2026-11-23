@@ -136,6 +136,13 @@ bool ReadUvarint(const std::string& input, size_t& offset, uint64_t* value) {
     return false;
 }
 
+// C++20 defines >> on a negative signed value as an arithmetic shift; before
+// that it was implementation-defined. ZigzagEncode depends on it (see below),
+// and the build sets CMAKE_CXX_STANDARD 20. If that ever drops to 17, use
+// static_cast<uint64_t>(-(value < 0)) instead of the sign fill.
+static_assert(__cplusplus >= 202002L,
+              "ZigzagEncode requires C++20 arithmetic right shift");
+
 uint64_t ZigzagEncode(int64_t value) {
     // Go through unsigned for the left shift, but the sign fill has to come from
     // an arithmetic right shift on the signed value: a logical shift yields 1
@@ -2836,5 +2843,21 @@ Status Engine::GetStats(EngineStats* stats) const {
     stats->memtable_bytes = impl_->memtable_bytes;
     return Status::Ok();
 }
+
+namespace testing {
+
+SeriesBufferInfo InspectSeriesBuffer(const Engine& engine, uint64_t series_id) {
+    const auto& impl = *engine.impl_;
+    std::lock_guard lock(impl.mutex);
+    const size_t shard_id = impl.ShardFor(series_id);
+    std::lock_guard shard_lock(*impl.shard_mutex[shard_id]);
+    const auto& series = impl.shards[shard_id]->series;
+    const auto it = series.find(series_id);
+    if (it == series.end() || !it->second) return {};
+    // Ordered-map layout: there is no capacity to grow.
+    return {it->second->size(), std::nullopt};
+}
+
+}  // namespace testing
 
 }  // namespace tsdb
