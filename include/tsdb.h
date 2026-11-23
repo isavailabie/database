@@ -98,6 +98,11 @@ struct EngineStats {
     uint64_t wal_bytes_written{};  // bytes appended to the WAL since open
     uint64_t flush_ns{};           // time inside FlushLocked (including publish)
     uint64_t compaction_ns{};      // time inside compaction rounds
+    // RSS composition: how many index entries the live SSTables hold. Each
+    // series entry carries its own page vector, so this is what makes the
+    // resident index grow with the number of live files.
+    uint64_t series_index_entries{};
+    uint64_t page_index_entries{};
     uint64_t compaction_count{};
     uint64_t flush_count{};
     size_t pending_batches{};

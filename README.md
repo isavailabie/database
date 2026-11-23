@@ -86,6 +86,14 @@ python3 benchmark/runner.py --source "$PWD" --output build/eval-quick --profile 
 
 验证结果（作者机器，NVMe SSD，WSL2；可用 `bash scripts/run_bench.sh full` 复现）：
 
+> **读数注意**：下面四条来自 **页级时间索引（11e2cd0）与写背压（75b758b）之前**
+> 的版本，其中“1 亿点 42 MiB”已不代表当前代码。
+> 当前代码在同类环境（4 vCPU WSL2、ext4 on vhdx、数据目录放真实磁盘而非 tmpfs）
+> 上实测 1 亿点导入：**320 s（约 312k 点/秒）、峰值 RSS 约 240 MB、
+> 恢复 12.3 s、磁盘 1.5 GB**，仍满足 512 MiB 预算。
+> RSS 上升来自常驻索引：56~80 个存活 SSTable 上约 20 万条 Series 索引项和
+> 91 万条页索引项（每个 Series 索引项自带一个页 vector）。
+
 - 1000 万点导入 smoke：约 109k 点/秒，峰值 RSS 约 32 MiB，恢复约 1.9 秒。
 - 1 亿点完整导入：约 103.6k 点/秒（16.1 分钟），峰值 RSS 约 42 MiB，
   恢复约 19.9 秒，WAL 重放 0 字节。

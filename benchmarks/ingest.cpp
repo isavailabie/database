@@ -255,6 +255,10 @@ int main(int argc, char** argv) {
               << " rss_bytes=" << bench::PeakRssBytes()
               << " disk_bytes=" << disk_bytes
               << " sstables=" << stats.sstable_count
+              << " series_index_entries=" << stats.series_index_entries
+              << " page_index_entries=" << stats.page_index_entries
+              << " obsolete_sstables=" << stats.obsolete_sstable_count
+              << " memtable_bytes=" << stats.memtable_bytes
               << " sstable_bytes=" << stats.sstable_bytes
               << " recovery_seconds=" << recovery_seconds
               << " flush_count=" << stats.flush_count
@@ -271,7 +275,8 @@ int main(int argc, char** argv) {
         args.csv,
         "scenario,points,series,hot_series,seconds,throughput,write_seconds,"
         "write_throughput,drain_seconds,rss_bytes,disk_bytes,sstables,"
-        "sstable_bytes,recovery_seconds,flush_count,flush_ms,compaction_count,"
+        "sstable_bytes,series_index_entries,page_index_entries,obsolete_sstables,"
+        "memtable_bytes,recovery_seconds,flush_count,flush_ms,compaction_count,"
         "compaction_ms,wal_syncs,wal_sync_ms,wal_bytes_written,"
         "wal_bytes_replayed,recovered_points",
         "ingest," + std::to_string(args.points) + "," +
@@ -285,6 +290,10 @@ int main(int argc, char** argv) {
             std::to_string(disk_bytes) + "," +
             std::to_string(stats.sstable_count) + "," +
             std::to_string(stats.sstable_bytes) + "," +
+            std::to_string(stats.series_index_entries) + "," +
+            std::to_string(stats.page_index_entries) + "," +
+            std::to_string(stats.obsolete_sstable_count) + "," +
+            std::to_string(stats.memtable_bytes) + "," +
             std::to_string(recovery_seconds) + "," +
             std::to_string(stats.flush_count) + "," +
             std::to_string(stats.flush_ns / 1000000.0) + "," +

@@ -2851,6 +2851,17 @@ Status Engine::GetStats(EngineStats* stats) const {
     stats->wal_bytes_written = impl_->wal_bytes_written;
     stats->flush_ns = impl_->flush_ns;
     stats->compaction_ns = impl_->compaction_ns;
+    uint64_t series_entries = 0;
+    uint64_t page_entries = 0;
+    for (const auto& sstable : impl_->sstable_metadata) {
+        series_entries += sstable->series.size();
+        for (const auto& [series_id, entry] : sstable->series) {
+            (void)series_id;
+            page_entries += entry.pages.size();
+        }
+    }
+    stats->series_index_entries = series_entries;
+    stats->page_index_entries = page_entries;
     stats->compaction_count = impl_->compaction_count;
     stats->flush_count = impl_->flush_count;
     stats->pending_batches = impl_->write_queue.size();
