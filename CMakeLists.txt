@@ -9,6 +9,17 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Sanitizer build for the test suite:
+#   cmake -S . -B build-asan -DTSDB_SANITIZE=ON
+#   ctest --test-dir build-asan --output-on-failure
+# AddressSanitizer catches the dangling iterators a missing copy-on-write would
+# leave behind, UBSan catches the timestamp arithmetic.
+option(TSDB_SANITIZE "Build with AddressSanitizer and UBSan" OFF)
+if(TSDB_SANITIZE)
+  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=address,undefined)
+endif()
+
 add_library(tsdb src/tsdb.cpp)
 target_include_directories(tsdb PUBLIC include)
 target_compile_options(tsdb PRIVATE -Wall -Wextra -Wpedantic)
