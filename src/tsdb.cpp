@@ -228,6 +228,15 @@ void PinCurrentThread(size_t cpu_budget, size_t index) {
 #endif
 }
 
+// Timestamp arithmetic needs a wider type than int64_t: [start, end) can span
+// more than INT64_MAX, so `timestamp - start` does not fit. __extension__ keeps
+// -Wpedantic quiet about the built-in type; GCC and Clang both provide it.
+#if defined(__SIZEOF_INT128__)
+__extension__ typedef __int128 Int128;
+#else
+#error "the engine requires 128-bit integer support"
+#endif
+
 struct VersionedPoint {
     DataPoint point;
     CommitVersion version{};
@@ -2377,12 +2386,22 @@ Status Engine::Aggregate(const std::vector<uint64_t>& series_ids, int64_t start,
     };
     std::map<std::pair<int64_t, uint64_t>, Bucket> buckets;
     while (auto point = scan->NextPoint()) {
-        const int64_t offset = point->timestamp_ms - start;
-        const int64_t quotient =
-            offset >= 0 ? offset / window_ms
-                        : -(((-offset) + window_ms - 1) / window_ms);
-        const int64_t bucket = start + quotient * window_ms;
-        auto& bucket_state = buckets[{bucket, point->series_id}];
+        // 128-bit intermediates: [start, end) can span more than INT64_MAX, so
+        // timestamp - start, quotient * window and the bucket start all leave the
+        // 64-bit range before being clamped back into it.
+        const Int128 offset = static_cast<Int128>(point->timestamp_ms) - start;
+        Int128 quotient = offset / window_ms;
+        if (offset < 0 && offset % window_ms != 0) --quotient;  // floor
+        const Int128 bucket_start =
+            static_cast<Int128>(start) + quotient * window_ms;
+        if (bucket_start < static_cast<Int128>(
+                               std::numeric_limits<int64_t>::min()) ||
+            bucket_start > static_cast<Int128>(
+                               std::numeric_limits<int64_t>::max())) {
+            return Status::Error("aggregate bucket range overflow");
+        }
+        auto& bucket_state = buckets[{static_cast<int64_t>(bucket_start),
+                                      point->series_id}];
         ++bucket_state.count;
         bucket_state.sum += point->value;
         bucket_state.min = std::min(bucket_state.min, point->value);
@@ -2401,8 +2420,14 @@ Status Engine::Aggregate(const std::vector<uint64_t>& series_ids, int64_t start,
         } else {
             result = bucket_state.max;
         }
-        results.push_back({key.second, key.first,
-                           std::min(end, key.first + window_ms), result,
+        // The last bucket is truncated at `end`, and key.first + window can
+        // overflow int64_t, so the clamp runs in 128 bits.
+        const Int128 bucket_end = static_cast<Int128>(key.first) + window_ms;
+        const int64_t clamped_end =
+            bucket_end > static_cast<Int128>(end)
+                ? end
+                : static_cast<int64_t>(bucket_end);
+        results.push_back({key.second, key.first, clamped_end, result,
                            bucket_state.count});
     }
     *cursor = std::make_unique<Cursor>(std::move(results));
