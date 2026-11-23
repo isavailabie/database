@@ -3,10 +3,14 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -733,6 +737,360 @@ void TestConcurrentCompactionStress(const std::filesystem::path& path) {
     AssertOk(engine->Close());
 }
 
+// --- synthesized WAL records -------------------------------------------------
+// The write path never emits descending timestamps or versions below the
+// covered range, so these helpers build the on-disk bytes directly and mirror
+// the framing in src/tsdb.cpp (WAL magic, FNV-1a checksum, varint payload).
+
+constexpr uint32_t kWalMagicBytes = 0x54534442;
+constexpr uint32_t kEncodedPayloadMagic = 0x57564c45;
+
+uint64_t Fnv1a(const std::string& payload) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (unsigned char byte : payload) {
+        hash ^= byte;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+template <typename T>
+void AppendRaw(std::string* out, T value) {
+    out->append(reinterpret_cast<const char*>(&value), sizeof(T));
+}
+
+std::string EncodeUvarint(uint64_t value) {
+    std::string out;
+    while (value >= 0x80) {
+        out.push_back(static_cast<char>((value & 0x7f) | 0x80));
+        value >>= 7;
+    }
+    out.push_back(static_cast<char>(value));
+    return out;
+}
+
+uint64_t EncodeZigzag(int64_t value) {
+    return (static_cast<uint64_t>(value) << 1) ^
+           (static_cast<uint64_t>(value) >> 63);
+}
+
+// One kTxnRecord holding a single point.
+std::string TxnRecordBytes(CommitVersion version, uint64_t series_id,
+                           int64_t timestamp, double value) {
+    std::string payload;
+    AppendRaw(&payload, kEncodedPayloadMagic);
+    AppendRaw(&payload, version);
+    AppendRaw(&payload, static_cast<uint32_t>(1));
+    payload += EncodeUvarint(series_id);
+    payload += EncodeUvarint(EncodeZigzag(timestamp));
+    AppendRaw(&payload, value);
+
+    std::string record;
+    AppendRaw(&record, kWalMagicBytes);
+    record.push_back(static_cast<char>(1));  // kTxnRecord
+    AppendRaw(&record, static_cast<uint64_t>(payload.size()));
+    AppendRaw(&record, Fnv1a(payload));
+    record += payload;
+    return record;
+}
+
+// Drops a segment into wal/; the engine must be closed while this runs.
+void WriteWalSegment(const std::filesystem::path& db_path, uint64_t number,
+                     const std::string& bytes) {
+    char name[32];
+    std::snprintf(name, sizeof(name), "%06llu.log",
+                  static_cast<unsigned long long>(number));
+    std::filesystem::create_directories(db_path / "wal");
+    std::ofstream out(db_path / "wal" / name,
+                      std::ios::binary | std::ios::trunc);
+    assert(out);
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+
+// Normal append keeps the per-series buffer time-ordered, including across the
+// vector growth boundary and with two series interleaved in one batch.
+void TestVectorAppendOrder(const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(path, Options{4, 100000}, &status);
+    AssertOk(status);
+    std::vector<DataPoint> batch;
+    batch.reserve(600);
+    for (int i = 0; i < 300; ++i) {
+        batch.push_back({1, 1000 + i, static_cast<double>(i)});
+        batch.push_back({2, 1000 + i, static_cast<double>(i) * 2.0});
+    }
+    AssertOk(engine->WriteBatch(batch));
+    std::vector<DataPoint> more;
+    more.reserve(800);
+    for (int i = 300; i < 700; ++i) {
+        more.push_back({1, 1000 + i, static_cast<double>(i)});
+        more.push_back({2, 1000 + i, static_cast<double>(i) * 2.0});
+    }
+    AssertOk(engine->WriteBatch(more));
+
+    for (const uint64_t series_id : {uint64_t{1}, uint64_t{2}}) {
+        std::unique_ptr<Cursor> cursor;
+        AssertOk(engine->Scan({series_id}, 0, 5000, &cursor));
+        const auto points = Read(cursor.get());
+        assert(points.size() == 700);
+        for (size_t i = 0; i < points.size(); ++i) {
+            assert(points[i].series_id == series_id);
+            assert(points[i].timestamp_ms == 1000 + static_cast<int64_t>(i));
+            const double expected = series_id == 1
+                                        ? static_cast<double>(i)
+                                        : static_cast<double>(i) * 2.0;
+            assert(points[i].value == expected);
+        }
+    }
+    AssertOk(engine->Close());
+}
+
+// WAL replay can hand the buffer timestamps that are not ascending; the append
+// must fall back to an ordered insert and stay sorted through the flush.
+void TestVectorReplayOrder(const std::filesystem::path& path) {
+    {
+        Status status;
+        auto engine = Engine::Open(path, Options{4, 100000}, &status);
+        AssertOk(status);
+        AssertOk(engine->Put({7, 300, 3.0}));  // flushed by Close, version 1
+        AssertOk(engine->Close());
+    }
+    // Two records for the same series in descending order: 200 is appended
+    // before 100, so the buffer has to insert in the middle.
+    WriteWalSegment(path, 1, TxnRecordBytes(2, 7, 200, 2.0) +
+                                 TxnRecordBytes(3, 7, 100, 1.0));
+
+    Status status;
+    auto engine = Engine::Open(path, Options{4, 100000}, &status);
+    AssertOk(status);
+    // The crafted segment must actually have been replayed; otherwise this test
+    // would pass even if the replay path ignored it entirely.
+    EngineStats replayed;
+    AssertOk(engine->GetStats(&replayed));
+    assert(replayed.wal_bytes_replayed > 0);
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({7}, 0, 1000, &cursor));
+    const auto points = Read(cursor.get());
+    assert(points.size() == 3);
+    assert(points[0].timestamp_ms == 100 && points[0].value == 1.0);
+    assert(points[1].timestamp_ms == 200 && points[1].value == 2.0);
+    assert(points[2].timestamp_ms == 300 && points[2].value == 3.0);
+
+    // The order must survive the flush: the SSTable writer requires ascending
+    // timestamps inside a series chunk.
+    AssertOk(engine->Flush());
+    std::unique_ptr<Cursor> flushed;
+    AssertOk(engine->Scan({7}, 0, 1000, &flushed));
+    const auto flushed_points = Read(flushed.get());
+    assert(flushed_points.size() == 3);
+    for (size_t i = 0; i < flushed_points.size(); ++i) {
+        assert(flushed_points[i].timestamp_ms ==
+               100 + static_cast<int64_t>(i) * 100);
+    }
+    AssertOk(engine->Close());
+}
+
+// A replayed record for a key that already exists in an SSTable must not
+// produce a duplicate point, and the higher commit version wins.
+void TestDuplicateVersionDedup(const std::filesystem::path& path) {
+    {
+        Status status;
+        auto engine = Engine::Open(path, Options{4, 100000}, &status);
+        AssertOk(status);
+        AssertOk(engine->Put({9, 500, 5.0}));
+        AssertOk(engine->Flush());  // (9,500) now lives in an SSTable at version 1
+        AssertOk(engine->Close());
+    }
+    // Stale record for the same key: version 0 is below the covered version, so
+    // the SSTable copy must win and the key must be returned exactly once.
+    WriteWalSegment(path, 1, TxnRecordBytes(0, 9, 500, 9.0));
+
+    Status status;
+    auto engine = Engine::Open(path, Options{4, 100000}, &status);
+    AssertOk(status);
+    EngineStats replayed;
+    AssertOk(engine->GetStats(&replayed));
+    assert(replayed.wal_bytes_replayed > 0);
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({9}, 0, 1000, &cursor));
+    const auto points = Read(cursor.get());
+    assert(points.size() == 1);
+    assert(points[0].timestamp_ms == 500);
+    assert(points[0].value == 5.0);
+
+    // The stale record is below the covered version, so the flush must skip it
+    // rather than writing it into a second SSTable.
+    AssertOk(engine->Flush());
+    std::unique_ptr<Cursor> flushed;
+    AssertOk(engine->Scan({9}, 0, 1000, &flushed));
+    const auto flushed_points = Read(flushed.get());
+    assert(flushed_points.size() == 1);
+    assert(flushed_points[0].value == 5.0);
+    AssertOk(engine->Close());
+}
+
+// A cursor opened before later writes keeps its own read view: the commit has to
+// copy the series buffer (COW) instead of appending to the snapshot's vector.
+void TestCowReadViewIsolation(const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(path, Options{4, 100000}, &status);
+    AssertOk(status);
+    std::vector<DataPoint> first;
+    first.reserve(100);
+    for (int i = 0; i < 100; ++i) {
+        first.push_back({42, i, static_cast<double>(i)});
+    }
+    AssertOk(engine->WriteBatch(first));
+
+    std::unique_ptr<Cursor> old_view;
+    AssertOk(engine->Scan({42}, 0, 1000, &old_view));
+
+    std::vector<DataPoint> second;
+    second.reserve(100);
+    for (int i = 100; i < 200; ++i) {
+        second.push_back({42, i, static_cast<double>(i)});
+    }
+    AssertOk(engine->WriteBatch(second));
+
+    // The old cursor must still see exactly the first 100 points.
+    const auto old_points = Read(old_view.get());
+    assert(old_points.size() == 100);
+    for (size_t i = 0; i < old_points.size(); ++i) {
+        assert(old_points[i].timestamp_ms == static_cast<int64_t>(i));
+        assert(old_points[i].value == static_cast<double>(i));
+    }
+
+    std::unique_ptr<Cursor> fresh;
+    AssertOk(engine->Scan({42}, 0, 1000, &fresh));
+    const auto fresh_points = Read(fresh.get());
+    assert(fresh_points.size() == 200);
+    assert(fresh_points.back().timestamp_ms == 199);
+
+    // Same rule across a flush: a snapshot taken after the flush ignores the
+    // write that follows it.
+    AssertOk(engine->Flush());
+    std::unique_ptr<Cursor> after_flush;
+    AssertOk(engine->Scan({42}, 0, 1000, &after_flush));
+    AssertOk(engine->Put({42, 200, 200.0}));
+    const auto after_flush_points = Read(after_flush.get());
+    assert(after_flush_points.size() == 200);
+    assert(after_flush_points.back().timestamp_ms == 199);
+    AssertOk(engine->Close());
+}
+
+// Empty scans and aggregates, including a series that was never written.
+void TestEmptyDataset(const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(path, Options{4, 100000}, &status);
+    AssertOk(status);
+    std::unique_ptr<Cursor> cursor;
+
+    AssertOk(engine->Scan({}, 0, 1000, &cursor));
+    assert(Read(cursor.get()).empty());
+
+    AssertOk(engine->Scan({123}, 0, 1000, &cursor));
+    assert(Read(cursor.get()).empty());
+
+    AssertOk(engine->Scan({123}, 500, 500, &cursor));
+    assert(Read(cursor.get()).empty());
+
+    AssertOk(engine->Aggregate({123}, 0, 1000, 10, AggregateOp::Sum, &cursor));
+    assert(!cursor->NextAggregate().has_value());
+
+    AssertOk(engine->Aggregate({}, 0, 1000, 10, AggregateOp::Count, &cursor));
+    assert(!cursor->NextAggregate().has_value());
+
+    // An engine that has only ever been flushed is still empty.
+    AssertOk(engine->Flush());
+    AssertOk(engine->Scan({123}, 0, 1000, &cursor));
+    assert(Read(cursor.get()).empty());
+    AssertOk(engine->Close());
+}
+
+// Window boundaries with negative timestamps, and empty buckets must not be
+// reported.
+void TestAggregateBuckets(const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(path, Options{4, 100000}, &status);
+    AssertOk(status);
+    AssertOk(engine->WriteBatch({{1, -250, 2.0},
+                                 {1, -240, 3.0},
+                                 {1, -100, 7.0},
+                                 {1, 100, 11.0}}));
+    // window 100 starting at -300: buckets -300 (two points), -100 and 100;
+    // -200 and 0 are empty and must be skipped.
+    const auto run = [&](AggregateOp op) {
+        std::unique_ptr<Cursor> cursor;
+        AssertOk(engine->Aggregate({1}, -300, 200, 100, op, &cursor));
+        std::vector<AggregateResult> out;
+        while (auto bucket = cursor->NextAggregate()) out.push_back(*bucket);
+        return out;
+    };
+
+    const auto sums = run(AggregateOp::Sum);
+    assert(sums.size() == 3);
+    assert(sums[0].bucket_start == -300 && sums[0].bucket_end == -200);
+    assert(sums[0].result == 5.0 && sums[0].count == 2);
+    assert(sums[1].bucket_start == -100 && sums[1].result == 7.0);
+    assert(sums[2].bucket_start == 100 && sums[2].bucket_end == 200);
+    assert(sums[2].result == 11.0);
+
+    const auto counts = run(AggregateOp::Count);
+    assert(counts.size() == 3);
+    assert(counts[0].count == 2 && counts[0].result == 2.0);
+    assert(counts[1].count == 1 && counts[2].count == 1);
+
+    const auto averages = run(AggregateOp::Avg);
+    assert(averages.size() == 3 && averages[0].result == 2.5);
+
+    const auto minimums = run(AggregateOp::Min);
+    assert(minimums.size() == 3 && minimums[0].result == 2.0);
+    assert(minimums[1].result == 7.0 && minimums[2].result == 11.0);
+
+    const auto maximums = run(AggregateOp::Max);
+    assert(maximums.size() == 3 && maximums[0].result == 3.0);
+    assert(maximums[2].result == 11.0);
+    AssertOk(engine->Close());
+}
+
+// Timestamps at the edges of int64 must round-trip through WAL and SSTable.
+void TestExtremeTimestamps(const std::filesystem::path& path) {
+    constexpr int64_t kMin = std::numeric_limits<int64_t>::min();
+    constexpr int64_t kMax = std::numeric_limits<int64_t>::max();
+    Status status;
+    auto engine = Engine::Open(path, Options{4, 100000}, &status);
+    AssertOk(status);
+    AssertOk(engine->Put({1, kMin, 1.0}));
+    AssertOk(engine->Put({1, kMin + 1, 3.0}));
+    AssertOk(engine->Put({2, kMax, 2.0}));
+
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({1}, kMin, kMax, &cursor));
+    const auto points = Read(cursor.get());
+    assert(points.size() == 2);
+    assert(points[0].timestamp_ms == kMin);
+    assert(points[1].timestamp_ms == kMin + 1);
+
+    // [start, end) is half-open, so the largest timestamp cannot be reached by
+    // a range query; writing it is legal and it stays in the database.
+    std::unique_ptr<Cursor> max_cursor;
+    AssertOk(engine->Scan({2}, kMin, kMax, &max_cursor));
+    assert(Read(max_cursor.get()).empty());
+
+    AssertOk(engine->Flush());
+    AssertOk(engine->Close());
+    auto reopened = Engine::Open(path, Options{4, 100000}, &status);
+    AssertOk(status);
+    std::unique_ptr<Cursor> again;
+    AssertOk(reopened->Scan({1}, kMin, kMax, &again));
+    const auto again_points = Read(again.get());
+    assert(again_points.size() == 2);
+    assert(again_points[0].timestamp_ms == kMin && again_points[0].value == 1.0);
+    assert(again_points[1].timestamp_ms == kMin + 1 &&
+           again_points[1].value == 3.0);
+    AssertOk(reopened->Close());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -767,6 +1125,13 @@ int main(int argc, char** argv) {
         {"cursor_outlives_engine", [&] { TestCursorOutlivesEngine(root / "cursor_lifetime"); }},
         {"sharded_wal", [&] { TestShardedWal(root / "sharded_wal"); }},
         {"wal_separate_dir", [&] { TestWalOnSeparateDir(root / "wal_separate"); }},
+        {"vector_append_order", [&] { TestVectorAppendOrder(root / "vector_append"); }},
+        {"vector_replay_order", [&] { TestVectorReplayOrder(root / "vector_replay"); }},
+        {"duplicate_version_dedup", [&] { TestDuplicateVersionDedup(root / "version_dedup"); }},
+        {"cow_read_view_isolation", [&] { TestCowReadViewIsolation(root / "cow_view"); }},
+        {"empty_dataset", [&] { TestEmptyDataset(root / "empty_dataset"); }},
+        {"aggregate_buckets", [&] { TestAggregateBuckets(root / "aggregate_buckets"); }},
+        {"extreme_timestamps", [&] { TestExtremeTimestamps(root / "extreme_ts"); }},
     };
     const std::string filter = argc > 1 ? argv[1] : std::string();
     size_t ran = 0;
