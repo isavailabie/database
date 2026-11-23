@@ -137,9 +137,13 @@ bool ReadUvarint(const std::string& input, size_t& offset, uint64_t* value) {
 }
 
 uint64_t ZigzagEncode(int64_t value) {
-    // Go through unsigned: left shifting a negative int64_t is undefined.
+    // Go through unsigned for the left shift, but the sign fill has to come from
+    // an arithmetic right shift on the signed value: a logical shift yields 1
+    // instead of all ones and encodes every negative timestamp as ~2^64, which
+    // then decodes to garbage and becomes unreadable once it hits the WAL or an
+    // SSTable.
     return (static_cast<uint64_t>(value) << 1) ^
-           (static_cast<uint64_t>(value) >> 63);
+           static_cast<uint64_t>(value >> 63);
 }
 
 int64_t ZigzagDecode(uint64_t value) {
