@@ -1,6 +1,7 @@
 #include "tsdb.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -243,6 +244,23 @@ __extension__ typedef __int128 Int128;
 #else
 #error "the engine requires 128-bit integer support"
 #endif
+
+// Adds the lifetime of the enclosing scope to a nanosecond counter. Used to
+// report where the import time goes; it also covers early returns.
+struct NsTimer {
+    std::chrono::steady_clock::time_point started{
+        std::chrono::steady_clock::now()};
+    uint64_t* total;
+    explicit NsTimer(uint64_t* counter) : total(counter) {}
+    ~NsTimer() {
+        *total += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - started)
+                .count());
+    }
+    NsTimer(const NsTimer&) = delete;
+    NsTimer& operator=(const NsTimer&) = delete;
+};
 
 struct VersionedPoint {
     DataPoint point;
@@ -709,6 +727,14 @@ struct Engine::Impl {
     uint64_t wal_bytes_replayed{0};
     uint64_t wal_valid_bytes{0};
     uint64_t wal_syncs{0};
+    // Instrumentation for the performance report: time spent inside the WAL
+    // fsync, inside a whole flush and inside a whole compaction round, plus the
+    // bytes actually appended to the WAL (wal_bytes above only reflects the
+    // segments still on disk, which is 0 after a clean close).
+    uint64_t wal_sync_ns{0};
+    uint64_t flush_ns{0};
+    uint64_t compaction_ns{0};
+    uint64_t wal_bytes_written{0};
     size_t active_writers{0};
     uint64_t next_file_number{1};
     int wal_fd{-1};
@@ -1846,8 +1872,22 @@ Engine::Engine(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {
                     }
                     request->wal_end = ::lseek(impl_->wal_fd, 0, SEEK_END);
                 }
-                if (ok) ok = ::fsync(impl_->wal_fd) == 0;
+                if (ok) {
+                    const auto sync_started =
+                        std::chrono::steady_clock::now();
+                    ok = ::fsync(impl_->wal_fd) == 0;
+                    impl_->wal_sync_ns += static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - sync_started)
+                            .count());
+                }
                 if (ok) ++impl_->wal_syncs;
+                if (ok) {
+                    for (const auto& request : group) {
+                        impl_->wal_bytes_written += static_cast<uint64_t>(
+                            request->wal_end - request->wal_start);
+                    }
+                }
                 if (!ok && wal_record_start >= 0) {
                     TruncateWalBestEffort(impl_->wal_fd, wal_record_start);
                 }
@@ -2543,6 +2583,7 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
 }
 
 Status Engine::FlushLocked(bool incremental) {
+    const NsTimer flush_timer(&impl_->flush_ns);
     (void)incremental;
     if (impl_->closed) return Status::Error("engine is closed");
 
@@ -2665,6 +2706,7 @@ Status Engine::FlushLocked(bool incremental) {
 }
 Status Engine::CompactRoundLocked(std::unique_lock<std::mutex>& lock,
                                   size_t threshold) {
+    const NsTimer compaction_timer(&impl_->compaction_ns);
     auto jobs = impl_->PlanCompactionLocked(threshold);
     if (jobs.empty()) return Status::Ok();
     lock.unlock();
@@ -2805,6 +2847,10 @@ Status Engine::GetStats(EngineStats* stats) const {
     stats->wal_bytes = wal_bytes;
     stats->wal_bytes_replayed = impl_->wal_bytes_replayed;
     stats->wal_syncs = impl_->wal_syncs;
+    stats->wal_sync_ns = impl_->wal_sync_ns;
+    stats->wal_bytes_written = impl_->wal_bytes_written;
+    stats->flush_ns = impl_->flush_ns;
+    stats->compaction_ns = impl_->compaction_ns;
     stats->compaction_count = impl_->compaction_count;
     stats->flush_count = impl_->flush_count;
     stats->pending_batches = impl_->write_queue.size();

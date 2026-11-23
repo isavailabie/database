@@ -14,6 +14,8 @@
 #include "bench_util.h"
 
 #include <algorithm>
+#include <chrono>
+#include <thread>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -162,7 +164,18 @@ int main(int argc, char** argv) {
         _exit(0);
     }
 
-    double compaction_seconds = 0.0;
+    // The acceptance number has to include the final flush and the compaction
+    // the import produced, so drain explicitly and time that separately from the
+    // write loop. By default we wait for the background compaction to settle
+    // (no change in its counter or in the live file count for ~1s) instead of
+    // forcing Compact(), which would rewrite the whole database.
+    const auto drain_started = bench::Clock::now();
+    status = engine->Flush();
+    if (!status.ok) {
+        std::cerr << "flush failed: " << status.message << '\n';
+        return 3;
+    }
+    double drain_compact_seconds = 0.0;
     if (args.compact) {
         const auto compact_started = bench::Clock::now();
         status = engine->Compact();
@@ -170,29 +183,39 @@ int main(int argc, char** argv) {
             std::cerr << "compact failed: " << status.message << '\n';
             return 3;
         }
-        compaction_seconds = bench::Seconds(bench::Clock::now() - compact_started);
+        drain_compact_seconds =
+            bench::Seconds(bench::Clock::now() - compact_started);
+    } else {
+        int stable_rounds = 0;
+        uint64_t last_compactions = ~0ULL;
+        uint64_t last_files = ~0ULL;
+        while (stable_rounds < 5) {
+            tsdb::EngineStats snapshot;
+            if (!engine->GetStats(&snapshot).ok) break;
+            if (snapshot.compaction_count == last_compactions &&
+                snapshot.sstable_count == last_files) {
+                ++stable_rounds;
+            } else {
+                stable_rounds = 0;
+                last_compactions = snapshot.compaction_count;
+                last_files = snapshot.sstable_count;
+            }
+            if (bench::Seconds(bench::Clock::now() - drain_started) > 900.0) {
+                std::cerr << "compaction did not settle in 900 s\n";
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
     }
-    // Capture the write-phase counters before Close(), which flushes and would
-    // otherwise attribute the final flush to the reopened engine instead.
-    tsdb::EngineStats write_stats;
-    (void)engine->GetStats(&write_stats);
     if (!engine->Close().ok) {
         std::cerr << "close failed\n";
         return 4;
     }
+    const double drain_seconds = bench::Seconds(bench::Clock::now() - drain_started);
+    const double total_seconds = write_seconds + drain_seconds;
 
-    uint64_t wal_bytes = 0;
-    {
-        std::error_code ec;
-        for (const auto& entry :
-             std::filesystem::directory_iterator(args.path / "wal", ec)) {
-            if (!entry.is_regular_file()) continue;
-            std::error_code size_ec;
-            const auto size =
-                std::filesystem::file_size(entry.path(), size_ec);
-            if (!size_ec) wal_bytes += static_cast<uint64_t>(size);
-        }
-    }
+    tsdb::EngineStats stats;
+    if (!engine->GetStats(&stats).ok) return 4;
 
     const auto recovery_started = bench::Clock::now();
     status = tsdb::Status::Ok();
@@ -214,44 +237,63 @@ int main(int argc, char** argv) {
         }
         while (cursor->NextPoint()) ++recovered;
     }
-    tsdb::EngineStats stats;
-    if (!reopened->GetStats(&stats).ok) return 7;
     const double recovery_seconds =
         bench::Seconds(bench::Clock::now() - recovery_started);
     const uint64_t disk_bytes = bench::DirectoryBytes(args.path);
     reopened->Close();
 
-    const double throughput = static_cast<double>(args.points) / write_seconds;
+    const double throughput = static_cast<double>(args.points) / total_seconds;
+    const double write_throughput =
+        static_cast<double>(args.points) / write_seconds;
     std::cout << "points=" << args.points << " series=" << args.series
               << " hot_series=" << args.hot_series
-              << " seconds=" << write_seconds << " throughput=" << throughput
-              << " compact_seconds=" << compaction_seconds
+              << " seconds=" << total_seconds << " throughput=" << throughput
+              << " write_seconds=" << write_seconds
+              << " write_throughput=" << write_throughput
+              << " drain_seconds=" << drain_seconds
+              << " drain_compact_seconds=" << drain_compact_seconds
               << " rss_bytes=" << bench::PeakRssBytes()
               << " disk_bytes=" << disk_bytes
               << " sstables=" << stats.sstable_count
               << " sstable_bytes=" << stats.sstable_bytes
               << " recovery_seconds=" << recovery_seconds
-              << " flush_count=" << write_stats.flush_count
-              << " wal_bytes=" << wal_bytes
+              << " flush_count=" << stats.flush_count
+              << " flush_ms=" << stats.flush_ns / 1000000.0
+              << " compaction_count=" << stats.compaction_count
+              << " compaction_ms=" << stats.compaction_ns / 1000000.0
+              << " wal_syncs=" << stats.wal_syncs
+              << " wal_sync_ms=" << stats.wal_sync_ns / 1000000.0
+              << " wal_bytes_written=" << stats.wal_bytes_written
               << " wal_bytes_replayed=" << stats.wal_bytes_replayed
               << " recovered_points=" << recovered << '\n';
 
     bench::AppendCsvRow(
         args.csv,
-        "scenario,points,series,hot_series,seconds,throughput,compact_seconds,"
-        "rss_bytes,disk_bytes,sstables,sstable_bytes,recovery_seconds,wal_bytes,"
+        "scenario,points,series,hot_series,seconds,throughput,write_seconds,"
+        "write_throughput,drain_seconds,rss_bytes,disk_bytes,sstables,"
+        "sstable_bytes,recovery_seconds,flush_count,flush_ms,compaction_count,"
+        "compaction_ms,wal_syncs,wal_sync_ms,wal_bytes_written,"
         "wal_bytes_replayed,recovered_points",
         "ingest," + std::to_string(args.points) + "," +
             std::to_string(args.series) + "," +
             std::to_string(args.hot_series) + "," +
-            std::to_string(write_seconds) + "," + std::to_string(throughput) +
-            "," + std::to_string(compaction_seconds) + "," +
+            std::to_string(total_seconds) + "," + std::to_string(throughput) +
+            "," + std::to_string(write_seconds) + "," +
+            std::to_string(write_throughput) + "," +
+            std::to_string(drain_seconds) + "," +
             std::to_string(bench::PeakRssBytes()) + "," +
             std::to_string(disk_bytes) + "," +
             std::to_string(stats.sstable_count) + "," +
             std::to_string(stats.sstable_bytes) + "," +
-            std::to_string(recovery_seconds) + "," + std::to_string(wal_bytes) +
-            "," + std::to_string(stats.wal_bytes_replayed) + "," +
+            std::to_string(recovery_seconds) + "," +
+            std::to_string(stats.flush_count) + "," +
+            std::to_string(stats.flush_ns / 1000000.0) + "," +
+            std::to_string(stats.compaction_count) + "," +
+            std::to_string(stats.compaction_ns / 1000000.0) + "," +
+            std::to_string(stats.wal_syncs) + "," +
+            std::to_string(stats.wal_sync_ns / 1000000.0) + "," +
+            std::to_string(stats.wal_bytes_written) + "," +
+            std::to_string(stats.wal_bytes_replayed) + "," +
             std::to_string(recovered));
     return 0;
 }

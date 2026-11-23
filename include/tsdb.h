@@ -93,6 +93,11 @@ struct EngineStats {
     uint64_t wal_bytes{};
     uint64_t wal_bytes_replayed{};
     uint64_t wal_syncs{};
+    // Where the import time went, for the performance report.
+    uint64_t wal_sync_ns{};        // time inside the WAL fsync
+    uint64_t wal_bytes_written{};  // bytes appended to the WAL since open
+    uint64_t flush_ns{};           // time inside FlushLocked (including publish)
+    uint64_t compaction_ns{};      // time inside compaction rounds
     uint64_t compaction_count{};
     uint64_t flush_count{};
     size_t pending_batches{};
