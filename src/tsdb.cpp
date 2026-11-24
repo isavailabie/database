@@ -25,6 +25,10 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
+
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
@@ -32,6 +36,27 @@
 
 namespace tsdb {
 namespace {
+
+std::mutex fault_hook_mutex;
+std::function<void(const char*)> fault_hook;
+
+void FaultPoint(const char* stage) {
+    std::function<void(const char*)> hook;
+    {
+        std::lock_guard lock(fault_hook_mutex);
+        hook = fault_hook;
+    }
+    if (hook) hook(stage);
+}
+
+bool SyncData(int fd) {
+#if defined(__APPLE__)
+    // fsync alone may leave acknowledged data in the drive's volatile cache.
+    return ::fcntl(fd, F_FULLFSYNC) == 0;
+#else
+    return ::fsync(fd) == 0;
+#endif
+}
 
 // One 128-point page inside a series chunk. Records are time-sorted within a
 // chunk, so a page's [min,max] lets a selective scan seek past pages that do
@@ -163,7 +188,7 @@ int64_t ZigzagDecode(uint64_t value) {
 bool SyncFile(const std::filesystem::path& path) {
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) return false;
-    const bool ok = ::fsync(fd) == 0;
+    const bool ok = SyncData(fd);
     ::close(fd);
     return ok;
 }
@@ -175,6 +200,18 @@ std::filesystem::path NormalizePath(const std::filesystem::path& path) {
     const auto absolute = std::filesystem::absolute(path, ec);
     if (ec) return path.lexically_normal();
     return absolute.lexically_normal();
+}
+
+// Sync the whole ancestor chain: create_directories may have introduced more
+// than one directory, and an external WAL root need not share the DB parent.
+bool SyncDirectoryChain(const std::filesystem::path& path) {
+    auto directory = NormalizePath(path);
+    while (true) {
+        if (!SyncDirectory(directory)) return false;
+        const auto parent = directory.parent_path();
+        if (parent.empty() || parent == directory) return true;
+        directory = parent;
+    }
 }
 
 // WAL segments live in db/wal/000001.log, 000002.log, ... and are replayed in
@@ -334,7 +371,11 @@ bool AppendWalRecord(int fd, uint8_t type,
         }
         written += static_cast<size_t>(result);
     }
-    if (::fsync(fd) == 0) return true;
+    FaultPoint("wal_before_sync");
+    if (SyncData(fd)) {
+        FaultPoint("wal_after_sync");
+        return true;
+    }
     TruncateWalBestEffort(fd, record_start);
     return false;
 }
@@ -668,6 +709,11 @@ struct ShardFragment {
 struct Engine::Impl {
     explicit Impl(std::filesystem::path root, Options opts)
         : root(std::move(root)), options(opts) {}
+    ~Impl() {
+        if (wal_fd >= 0) ::close(wal_fd);
+        if (commit_wal_fd >= 0) ::close(commit_wal_fd);
+        for (const int fd : shard_wal_fd) if (fd >= 0) ::close(fd);
+    }
 
     std::filesystem::path root;
     Options options;
@@ -700,6 +746,7 @@ struct Engine::Impl {
     bool flush_requested{false};
     bool stopping_flush{false};
     bool compaction_requested{false};
+    bool compacting{false};
     bool stopping_compaction{false};
     std::condition_variable close_cv;
     Engine* owner{nullptr};
@@ -741,6 +788,14 @@ struct Engine::Impl {
     uint64_t compaction_count{0};
     uint64_t flush_count{0};
     size_t memtable_bytes{0};
+    Status storage_error{Status::Ok()};
+    // Persistence failure may happen after rename: the durable file set is then
+    // ambiguous. Never continue writes or unlink files; reopen to reconcile.
+    void RecordStorageError(Status status) {
+        if (storage_error.ok) storage_error = std::move(status);
+        write_cv.notify_all();
+        compaction_done_cv.notify_all();
+    }
     std::unordered_map<uint64_t, uint64_t> hot_series_points;
     std::vector<CommitVersion> covered_commit_versions;
     CommitVersion metadata_covered_commit_version{0};
@@ -921,7 +976,7 @@ struct Engine::Impl {
 
     Status WriteMergedShard(
         const std::vector<std::shared_ptr<SstableMetadata>>& sources,
-        SstableWriter* writer) {
+        SstableWriter* writer, int64_t merge_cutoff, CommitVersion merge_version) {
         std::set<uint64_t> series_ids;
         for (const auto& sstable : sources) {
             for (const auto& [series_id, _] : sstable->series) {
@@ -932,7 +987,7 @@ struct Engine::Impl {
             std::map<int64_t, VersionedPoint> merged;
             const auto insert = [&](int64_t timestamp,
                                     const VersionedPoint& point) {
-                if (timestamp < cutoff) return;
+                if (timestamp < merge_cutoff) return;
                 auto [it, ok] = merged.emplace(timestamp, point);
                 if (!ok && point.version > it->second.version) {
                     it->second = point;
@@ -952,7 +1007,7 @@ struct Engine::Impl {
                 }
             }
             for (const auto& [timestamp, point] : merged) {
-                if (point.version > next_version - 1) continue;
+                if (point.version > merge_version) continue;
                 writer->Append(series_id, timestamp, point.point.value,
                                point.version);
             }
@@ -978,6 +1033,8 @@ struct Engine::Impl {
     struct CompactionJob {
         size_t shard_id{};
         size_t level{};
+        int64_t cutoff{};
+        CommitVersion version{};
         std::vector<std::shared_ptr<SstableMetadata>> sources;
         std::filesystem::path file;
         std::filesystem::path temp;
@@ -1004,6 +1061,8 @@ struct Engine::Impl {
             CompactionJob job;
             job.shard_id = shard_id;
             job.level = compact_level[shard_id];
+            job.cutoff = cutoff;
+            job.version = visible_version;
             for (const auto& sstable : sstable_metadata) {
                 if (sstable->shard_id == shard_id &&
                     sstable->level == job.level) {
@@ -1027,7 +1086,7 @@ struct Engine::Impl {
                               std::shared_ptr<SstableMetadata>* out) {
         SstableWriter writer;
         if (!writer.Open(job.temp)) return Status::Error("cannot create SSTable");
-        auto status = WriteMergedShard(job.sources, &writer);
+        auto status = WriteMergedShard(job.sources, &writer, job.cutoff, job.version);
         if (!status.ok) {
             writer.Discard();
             std::error_code ec;
@@ -1093,21 +1152,35 @@ struct Engine::Impl {
         for (const auto& sstable : sstable_metadata) {
             current_files.push_back(sstable->path);
         }
+        FaultPoint("compaction_before_manifest");
         auto status = PublishManifestLocked(current_files);
-        if (!status.ok) return status;
+        if (!status.ok) {
+            RecordStorageError(status);
+            return status;
+        }
+        FaultPoint("compaction_after_manifest");
         ++compaction_count;
         return Status::Ok();
     }
 
     Status GarbageCollectLocked() {
+        if (!storage_error.ok) return storage_error;
         bool deleted = false;
+        Status result = Status::Ok();
         std::vector<std::shared_ptr<SstableMetadata>> retained;
         retained.reserve(obsolete_sstables.size());
         for (const auto& obsolete : obsolete_sstables) {
             if (obsolete->refs == 0) {
                 std::error_code ec;
-                std::filesystem::remove(obsolete->path, ec);
-                deleted = true;
+                FaultPoint("gc_before_delete");
+                const bool removed = std::filesystem::remove(obsolete->path, ec);
+                if (ec) {
+                    retained.push_back(obsolete);
+                    result = Status::Error("GC file removal failed: " + ec.message());
+                } else {
+                    deleted = deleted || removed;
+                    FaultPoint("gc_after_delete");
+                }
             } else {
                 retained.push_back(obsolete);
             }
@@ -1116,7 +1189,7 @@ struct Engine::Impl {
         if (deleted && !SyncDirectory(root / "sst")) {
             return Status::Error("GC directory sync failed");
         }
-        return Status::Ok();
+        return result;
     }
 
     Status PublishManifestLocked(
@@ -1524,7 +1597,7 @@ struct Engine::Impl {
         const int fd =
             ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
         if (fd < 0) return false;
-        if (::fsync(fd) != 0) {
+        if (!SyncData(fd) || !SyncDirectory(wal_dir)) {
             ::close(fd);
             return false;
         }
@@ -1592,7 +1665,7 @@ struct Engine::Impl {
                         return;
                     }
                 }
-                if (::fsync(shard_wal_fd[shard_id]) != 0) shard_ok[shard_id] = 0;
+                if (!SyncData(shard_wal_fd[shard_id])) shard_ok[shard_id] = 0;
             });
         }
         for (auto& writer : writers) writer.join();
@@ -1611,7 +1684,9 @@ struct Engine::Impl {
         if (!AppendWalRecordNoSync(commit_wal_fd, kCommitRangeRecord, payload)) {
             return false;
         }
-        if (::fsync(commit_wal_fd) != 0) return false;
+        FaultPoint("wal_before_sync");
+        if (!SyncData(commit_wal_fd)) return false;
+        FaultPoint("wal_after_sync");
         ++wal_syncs;
         return true;
     }
@@ -1669,7 +1744,9 @@ struct Engine::Impl {
                 std::error_code ec;
                 const auto size = std::filesystem::file_size(path, ec);
                 if (!ec && size > valid) {
-                    (void)::truncate(path.c_str(), static_cast<off_t>(valid));
+                    if (::truncate(path.c_str(), static_cast<off_t>(valid)) != 0) {
+                        return Status::Error("cannot truncate WAL tail");
+                    }
                 }
                 commit_wal_segment = segments[i];
             } else if (valid != data.size()) {
@@ -1732,7 +1809,9 @@ struct Engine::Impl {
                 std::error_code ec;
                 const auto size = std::filesystem::file_size(path, ec);
                 if (!ec && size > valid) {
-                    (void)::truncate(path.c_str(), static_cast<off_t>(valid));
+                    if (::truncate(path.c_str(), static_cast<off_t>(valid)) != 0) {
+                        return Status::Error("cannot truncate WAL tail");
+                    }
                 }
             } else if (valid != data.size()) {
                 return Status::Error("corrupt shard WAL segment");
@@ -1767,7 +1846,12 @@ struct Engine::Impl {
         if (ec) return false;
         const auto path = WalSegmentPath(commit_wal_dir, commit_wal_segment);
         commit_wal_fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
-        return commit_wal_fd >= 0;
+        if (commit_wal_fd < 0) return false;
+        for (size_t i = 0; i < shards.size(); ++i) {
+            if (!SyncData(shard_wal_fd[i]) || !SyncDirectory(ShardWalDir(i))) return false;
+        }
+        return SyncData(commit_wal_fd) && SyncDirectory(commit_wal_dir) &&
+               SyncDirectoryChain(wal_dir) && SyncDirectoryChain(root);
     }
 
     // Called by a flush while holding the lock and after the manifest covered
@@ -1780,7 +1864,7 @@ struct Engine::Impl {
             const int new_fd =
                 ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
             if (new_fd < 0) return false;
-            if (::fsync(new_fd) != 0) {
+            if (!SyncData(new_fd) || !SyncDirectory(dir)) {
                 ::close(new_fd);
                 return false;
             }
@@ -1814,6 +1898,15 @@ Engine::Engine(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {
             });
             if (impl_->stopping_write && impl_->write_queue.empty()) return;
             if (impl_->write_queue.empty()) continue;
+            if (!impl_->storage_error.ok) {
+                for (const auto& request : impl_->write_queue) {
+                    request->status = impl_->storage_error;
+                    request->done = true;
+                }
+                impl_->write_queue.clear();
+                impl_->write_cv.notify_all();
+                continue;
+            }
 
             // Collect a group before committing. When several writers are
             // already waiting, block until they have all queued their batch so
@@ -1836,12 +1929,20 @@ Engine::Engine(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {
                 while (impl_->sstable_metadata.size() >
                            impl_->options.max_live_sstables &&
                        !impl_->stopping_write &&
-                       !impl_->stopping_compaction) {
+                       !impl_->stopping_compaction && impl_->storage_error.ok) {
+                    // The normal size-tier threshold may never be reached.
+                    // Force a two-file round under pressure. A file set with
+                    // one file per shard/level cannot shrink; treat the limit as
+                    // soft in that irreducible state instead of deadlocking.
+                    if (!impl_->compacting && !impl_->ShouldCompactLocked(2)) break;
+                    impl_->compaction_requested = true;
+                    impl_->compaction_cv.notify_one();
                     impl_->compaction_done_cv.wait_for(
                         lock, std::chrono::milliseconds(5));
                 }
             }
 
+            if (!impl_->storage_error.ok) continue;
             std::vector<std::shared_ptr<PendingWrite>> group;
             size_t queued_bytes = 0;
             while (!impl_->write_queue.empty() &&
@@ -1875,7 +1976,9 @@ Engine::Engine(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {
                 if (ok) {
                     const auto sync_started =
                         std::chrono::steady_clock::now();
-                    ok = ::fsync(impl_->wal_fd) == 0;
+                    FaultPoint("wal_before_sync");
+                    ok = SyncData(impl_->wal_fd);
+                    if (ok) FaultPoint("wal_after_sync");
                     impl_->wal_sync_ns += static_cast<uint64_t>(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - sync_started)
@@ -1903,7 +2006,9 @@ Engine::Engine(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {
                     request->done = true;
                 }
             } else {
-                impl_->next_version -= group.size();
+                // Failed fsync is indeterminate, especially for shard fragments:
+                // reusing these versions can resurrect an old failed batch.
+                impl_->RecordStorageError(Status::Error("WAL sync failed; reopen required"));
                 for (const auto& request : group) {
                     request->status = Status::Error("WAL sync failed");
                     request->done = true;
@@ -1921,9 +2026,13 @@ Engine::Engine(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {
             });
             if (impl_->stopping_flush) return;
             impl_->flush_requested = false;
-            const bool flushed = FlushLocked(true).ok;
+            const auto flush_status = FlushLocked(true);
+            const bool flushed = flush_status.ok;
+            if (!flushed) impl_->RecordStorageError(flush_status);
+            impl_->write_cv.notify_all();
             if (flushed && impl_->options.enable_background_gc) {
-                (void)impl_->GarbageCollectLocked();
+                const auto gc_status = impl_->GarbageCollectLocked();
+                if (!gc_status.ok) impl_->RecordStorageError(gc_status);
             }
             if (flushed && impl_->options.enable_background_compaction &&
                 impl_->ShouldCompactLocked(
@@ -1946,15 +2055,15 @@ Engine::Engine(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {
                 impl_->compaction_requested = false;
                 // Bounded per wakeup: foreground flushing must not be starved by
                 // a merge loop that is refilled as fast as it drains.
-                for (size_t round = 0;
-                     round < 32 &&
-                     impl_->ShouldCompactLocked(
-                         impl_->options.compaction_sstable_threshold);
-                     ++round) {
-                    if (!CompactRoundLocked(
-                             lock,
-                             impl_->options.compaction_sstable_threshold)
-                             .ok) {
+                for (size_t round = 0; round < 32; ++round) {
+                    const bool pressure = impl_->options.max_live_sstables > 0 &&
+                        impl_->sstable_metadata.size() > impl_->options.max_live_sstables;
+                    const size_t threshold = pressure ? 2 :
+                        impl_->options.compaction_sstable_threshold;
+                    if (impl_->stopping_compaction || !impl_->ShouldCompactLocked(threshold)) break;
+                    const auto compact_status = CompactRoundLocked(lock, threshold);
+                    if (!compact_status.ok) {
+                        impl_->RecordStorageError(compact_status);
                         break;
                     }
                 }
@@ -2003,7 +2112,14 @@ std::unique_ptr<Engine> Engine::Open(const std::filesystem::path& path,
         if (status) *status = std::move(value);
         return nullptr;
     };
-    if (options.shard_count == 0) return fail(Status::Error("shard_count must be positive"));
+    if (options.shard_count == 0 || options.shard_count > 99) {
+        return fail(Status::Error("shard_count must be between 1 and 99"));
+    }
+    if (options.max_pending_batches == 0 || options.memtable_max_points == 0 ||
+        options.hot_series_point_limit == 0 ||
+        options.max_memtable_bytes < sizeof(DataPoint) + sizeof(CommitVersion)) {
+        return fail(Status::Error("write capacity limits must be positive"));
+    }
     if (options.cpu_budget == 0 || options.cpu_budget > 4) {
         return fail(Status::Error("cpu_budget must be between 1 and 4"));
     }
@@ -2079,6 +2195,10 @@ std::unique_ptr<Engine> Engine::Open(const std::filesystem::path& path,
     }
     impl->wal_fd = ::open(active_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (impl->wal_fd < 0) return fail(Status::Error("cannot open WAL"));
+    if (!SyncData(impl->wal_fd) || !SyncDirectoryChain(impl->wal_dir) ||
+        !SyncDirectoryChain(path)) {
+        return fail(Status::Error("cannot persist WAL directory"));
+    }
     if (status) *status = Status::Ok();
     return std::unique_ptr<Engine>(new Engine(std::move(impl)));
 }
@@ -2095,28 +2215,51 @@ Status Engine::WriteBatch(const std::vector<DataPoint>& points,
                           CommitVersion* version) {
     std::unique_lock lock(impl_->mutex);
     if (impl_->closed || impl_->closing) return Status::Error("engine is closed");
-    if (impl_->write_queue.size() >= impl_->options.max_pending_batches) {
-        return Status::Error("write queue pressure");
+    if (!impl_->storage_error.ok) return impl_->storage_error;
+    constexpr size_t kPointBytes = sizeof(DataPoint) + sizeof(CommitVersion);
+    if (points.size() > impl_->options.max_memtable_bytes / kPointBytes) {
+        return Status::Error("batch exceeds memtable capacity");
     }
-    const size_t batch_bytes =
-        points.size() * (sizeof(DataPoint) + sizeof(CommitVersion));
+    const size_t batch_bytes = points.size() * kPointBytes;
+    std::unordered_map<uint64_t, uint64_t> counts;
     for (const auto& point : points) {
-        const uint64_t projected =
-            impl_->hot_series_points[point.series_id] + 1;
-        if (projected > impl_->options.hot_series_point_limit) {
-            impl_->flush_requested = true;
-            impl_->flush_cv.notify_one();
-            return Status::Error("hot series pressure");
+        if (++counts[point.series_id] > impl_->options.hot_series_point_limit) {
+            return Status::Error("batch exceeds hot series capacity");
         }
     }
-    if (impl_->memtable_bytes + batch_bytes >
-        impl_->options.max_memtable_bytes) {
+    while (true) {
+        if (impl_->closed || impl_->closing) return Status::Error("engine is closed");
+        if (!impl_->storage_error.ok) return impl_->storage_error;
+        // Waits release the mutex: another writer or ExpireBefore can invalidate
+        // this batch. Validate again before reserving capacity, not just once.
+        auto status = impl_->ValidateBatch(points);
+        if (!status.ok) return status;
+        if (impl_->write_queue.size() >= impl_->options.max_pending_batches) {
+            FaultPoint("write_queue_wait");
+            impl_->write_cv.wait(lock);
+            continue;
+        }
+        size_t reserved_bytes = 0;
+        auto projected = impl_->hot_series_points;
+        for (const auto& pending : impl_->write_queue) {
+            reserved_bytes += pending->points.size() * kPointBytes;
+            for (const auto& point : pending->points) ++projected[point.series_id];
+        }
+        bool pressure = impl_->memtable_bytes >
+                            impl_->options.max_memtable_bytes - batch_bytes ||
+                        reserved_bytes > impl_->options.max_memtable_bytes -
+                            batch_bytes - impl_->memtable_bytes;
+        for (const auto& [series, count] : counts) {
+            if (projected[series] > impl_->options.hot_series_point_limit - count) {
+                pressure = true;
+            }
+        }
+        if (!pressure) break;
         impl_->flush_requested = true;
         impl_->flush_cv.notify_one();
-        return Status::Error("memtable pressure");
+        FaultPoint("write_pressure_wait");
+        impl_->write_cv.wait(lock);
     }
-    auto status = impl_->ValidateBatch(points);
-    if (!status.ok) return status;
     if (impl_->points_since_flush + points.size() > impl_->options.memtable_max_points) {
         impl_->flush_requested = true;
         impl_->flush_cv.notify_one();
@@ -2140,6 +2283,7 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
     if (start > end) return Status::Error("start must not exceed end");
     std::unique_lock lock(impl_->mutex);
     if (impl_->closed || impl_->closing) return Status::Error("engine is closed");
+    if (!impl_->storage_error.ok) return impl_->storage_error;
     const auto view = impl_->ViewLocked();
     ++impl_->active_read_views;
     // The view (shard snapshots + referenced SSTables) is immutable, so the
@@ -2420,6 +2564,10 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
 Status Engine::Aggregate(const std::vector<uint64_t>& series_ids, int64_t start,
                          int64_t end, int64_t window_ms, AggregateOp operation,
                          std::unique_ptr<Cursor>* cursor) const {
+    if (!cursor) return Status::Error("cursor output is null");
+    if (operation != AggregateOp::Count && operation != AggregateOp::Sum &&
+        operation != AggregateOp::Min && operation != AggregateOp::Max &&
+        operation != AggregateOp::Avg) return Status::Error("invalid aggregate operation");
     if (window_ms <= 0) return Status::Error("window_ms must be positive");
     if (start > end) return Status::Error("start must not exceed end");
     std::unique_ptr<Cursor> scan;
@@ -2484,21 +2632,30 @@ Status Engine::Aggregate(const std::vector<uint64_t>& series_ids, int64_t start,
 Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
     std::unique_lock lock(impl_->mutex);
     if (impl_->closed || impl_->closing) return Status::Error("engine is closed");
+    if (!impl_->storage_error.ok) return impl_->storage_error;
     if (cutoff < impl_->cutoff) return Status::Error("cutoff must not move backwards");
     if (cutoff == impl_->cutoff) {
         if (version) *version = impl_->next_version - 1;
         return Status::Ok();
     }
     impl_->write_cv.wait(lock, [&] {
-        return impl_->write_queue.empty();
+        return impl_->write_queue.empty() || impl_->closing || !impl_->storage_error.ok;
     });
+    if (impl_->closed || impl_->closing) return Status::Error("engine is closed");
+    if (!impl_->storage_error.ok) return impl_->storage_error;
+    // Another expiration may have advanced cutoff while this wait released lock.
+    if (cutoff < impl_->cutoff) return Status::Error("cutoff must not move backwards");
+    if (cutoff == impl_->cutoff) {
+        if (version) *version = impl_->visible_version;
+        return Status::Ok();
+    }
     const CommitVersion commit = impl_->next_version++;
     const int expire_fd =
         impl_->sharded_wal ? impl_->commit_wal_fd : impl_->wal_fd;
     if (!AppendWalRecord(expire_fd, kExpireRecord,
                          WalPayloadExpire(commit, cutoff))) {
-        --impl_->next_version;
-        return Status::Error("WAL sync failed");
+        impl_->RecordStorageError(Status::Error("WAL sync failed; reopen required"));
+        return impl_->storage_error;
     }
     ++impl_->wal_syncs;
     impl_->cutoff = cutoff;
@@ -2528,7 +2685,10 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
         // The expire itself is already durable in the WAL, so reporting the
         // error is enough - a retry with the same cutoff is a no-op.
         auto publish_status = impl_->PublishManifestLocked(impl_->current_files);
-        if (!publish_status.ok) return publish_status;
+        if (!publish_status.ok) {
+            impl_->RecordStorageError(publish_status);
+            return publish_status;
+        }
     }
     if (impl_->options.enable_background_compaction) {
         impl_->compaction_requested = true;
@@ -2570,6 +2730,8 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
             }
             if (removed > 0) {
                 impl_->memtable_bytes -= removed * kRecordBytes;
+                impl_->hot_series_points[series_it->first] -= removed;
+                impl_->points_since_flush -= std::min(impl_->points_since_flush, removed);
             }
             if (points.empty()) {
                 series_it = points_by_series.erase(series_it);
@@ -2578,6 +2740,8 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
             }
         }
     }
+    impl_->visible_version = commit;
+    impl_->write_cv.notify_all();
     if (version) *version = commit;
     return Status::Ok();
 }
@@ -2586,6 +2750,7 @@ Status Engine::FlushLocked(bool incremental) {
     const NsTimer flush_timer(&impl_->flush_ns);
     (void)incremental;
     if (impl_->closed) return Status::Error("engine is closed");
+    if (!impl_->storage_error.ok) return impl_->storage_error;
 
     struct Job {
         size_t shard_id{};
@@ -2650,6 +2815,7 @@ Status Engine::FlushLocked(bool incremental) {
                 return;
             }
             std::error_code ec;
+            FaultPoint("sstable_before_rename");
             std::filesystem::rename(job->temp, job->file, ec);
             if (ec) {
                 job->status = Status::Error("SSTable publish failed");
@@ -2659,6 +2825,7 @@ Status Engine::FlushLocked(bool incremental) {
                 job->status = Status::Error("SSTable directory sync failed");
                 return;
             }
+            FaultPoint("sstable_after_rename");
             auto metadata =
                 std::make_shared<SstableMetadata>(std::move(writer.metadata));
             metadata->path = job->file;
@@ -2685,7 +2852,11 @@ Status Engine::FlushLocked(bool incremental) {
     impl_->current_files.insert(impl_->current_files.end(),
                                 new_files.begin(), new_files.end());
     auto status = impl_->PublishManifestLocked(impl_->current_files);
-    if (!status.ok) return status;
+    if (!status.ok) {
+        impl_->RecordStorageError(status);
+        return status;
+    }
+    FaultPoint("flush_after_manifest");
     impl_->sstable_metadata.insert(impl_->sstable_metadata.end(),
                                    published_metadata.begin(),
                                    published_metadata.end());
@@ -2694,22 +2865,31 @@ Status Engine::FlushLocked(bool incremental) {
     impl_->hot_series_points.clear();
     impl_->ClearMemtableLocked();
     ++impl_->flush_count;
-    // Best effort, and only after the in-memory state above is committed: the
-    // manifest already covers every record written so far, so a failed rotation
-    // just leaves a stale segment to be replayed (and dropped by the next one).
-    if (impl_->sharded_wal) {
-        (void)impl_->RotateShardedWalLocked();
-    } else {
-        (void)impl_->RotateWalLocked();
+    impl_->write_cv.notify_all();
+    // A failed directory sync can leave the next WAL name non-durable. Do not
+    // acknowledge further writes to that fd even though this flush is durable.
+    const bool rotated = impl_->sharded_wal ? impl_->RotateShardedWalLocked()
+                                            : impl_->RotateWalLocked();
+    if (!rotated) {
+        auto error = Status::Error("WAL rotation failed; reopen required");
+        impl_->RecordStorageError(error);
+        return error;
     }
     return Status::Ok();
 }
 Status Engine::CompactRoundLocked(std::unique_lock<std::mutex>& lock,
                                   size_t threshold) {
     const NsTimer compaction_timer(&impl_->compaction_ns);
+    if (!impl_->storage_error.ok) return impl_->storage_error;
+    impl_->compaction_done_cv.wait(lock, [&] {
+        return !impl_->compacting || !impl_->storage_error.ok;
+    });
+    if (!impl_->storage_error.ok) return impl_->storage_error;
     auto jobs = impl_->PlanCompactionLocked(threshold);
     if (jobs.empty()) return Status::Ok();
+    impl_->compacting = true;
     lock.unlock();
+    FaultPoint("compaction_merge_begin");
     std::vector<std::shared_ptr<SstableMetadata>> published;
     std::vector<std::filesystem::path> written_files;
     Status merge_status = Status::Ok();
@@ -2726,6 +2906,9 @@ Status Engine::CompactRoundLocked(std::unique_lock<std::mutex>& lock,
         }
     }
     lock.lock();
+    impl_->compacting = false;
+    impl_->compaction_done_cv.notify_all();
+    if (!impl_->storage_error.ok) merge_status = impl_->storage_error;
     if (!merge_status.ok) {
         for (const auto& file : written_files) {
             std::error_code ec;
@@ -2743,17 +2926,24 @@ Status Engine::CompactRoundLocked(std::unique_lock<std::mutex>& lock,
 
 Status Engine::Flush() {
     std::lock_guard lock(impl_->mutex);
-    return FlushLocked(true);
+    const auto status = FlushLocked(true);
+    if (!status.ok) impl_->RecordStorageError(status);
+    impl_->write_cv.notify_all();
+    return status;
 }
 
 Status Engine::Compact() {
     std::unique_lock lock(impl_->mutex);
-    if (impl_->closed) return Status::Error("engine is closed");
+    if (impl_->closed || impl_->closing) return Status::Error("engine is closed");
+    if (!impl_->storage_error.ok) return impl_->storage_error;
     // Bounded: with writers flushing continuously a shard can refill its level
     // as fast as it is merged, which would keep this loop spinning forever.
     for (size_t round = 0; round < 64 && impl_->ShouldCompactLocked(2); ++round) {
         auto status = CompactRoundLocked(lock, 2);
-        if (!status.ok) return status;
+        if (!status.ok) {
+            impl_->RecordStorageError(status);
+            return status;
+        }
     }
     return Status::Ok();
 }
@@ -2761,6 +2951,7 @@ Status Engine::Compact() {
 
 Status Engine::GarbageCollect() {
     std::lock_guard lock(impl_->mutex);
+    if (impl_->closed || impl_->closing) return Status::Error("engine is closed");
     return impl_->GarbageCollectLocked();
 }
 
@@ -2770,6 +2961,7 @@ Status Engine::Close() {
         if (impl_->closed) return Status::Ok();
         if (impl_->closing) return Status::Error("close already in progress");
         impl_->closing = true;
+        FaultPoint("close_begin");
         impl_->stopping_write = true;
         impl_->write_cv.notify_all();
         impl_->stopping_flush = true;
@@ -2795,7 +2987,8 @@ Status Engine::Close() {
     if (impl_->compaction_worker.joinable()) impl_->compaction_worker.join();
     std::lock_guard lock(impl_->mutex);
     auto status = FlushLocked(true);
-    if (!status.ok) return status;
+    // Always release descriptors and mark closed, even if the final flush fails.
+    // Otherwise destruction leaves a permanently closing, half-stopped engine.
     impl_->closed = true;
     if (impl_->wal_fd >= 0) {
         ::close(impl_->wal_fd);
@@ -2813,7 +3006,7 @@ Status Engine::Close() {
     }
     impl_->closing = false;
     impl_->close_cv.notify_all();
-    return Status::Ok();
+    return status;
 }
 
 Status Engine::GetStats(EngineStats* stats) const {
@@ -2867,6 +3060,7 @@ Status Engine::GetStats(EngineStats* stats) const {
     stats->pending_batches = impl_->write_queue.size();
     stats->active_read_views = impl_->active_read_views;
     stats->obsolete_sstable_count = impl_->obsolete_sstables.size();
+    stats->live_sstable_count = impl_->sstable_metadata.size();
     stats->sstable_count = 0;
     stats->sstable_bytes = 0;
     std::error_code dir_error;
@@ -2893,7 +3087,23 @@ Status Engine::GetStats(EngineStats* stats) const {
             static_cast<uint64_t>(usage.ru_maxrss) * 1024ULL;
 #endif
     }
-    stats->rss_bytes = stats->peak_rss_bytes;
+    stats->rss_bytes = 0;
+#if defined(__linux__)
+    // statm reports current resident pages, not the lifetime ru_maxrss peak.
+    std::ifstream statm("/proc/self/statm");
+    uint64_t virtual_pages = 0, resident_pages = 0;
+    const long page_size = ::sysconf(_SC_PAGESIZE);
+    if (page_size > 0 && (statm >> virtual_pages >> resident_pages)) {
+        stats->rss_bytes = resident_pages * static_cast<uint64_t>(page_size);
+    }
+#elif defined(__APPLE__)
+    mach_task_basic_info_data_t info{};
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (::task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                    reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS) {
+        stats->rss_bytes = info.resident_size;
+    }
+#endif
     stats->engine_threads = 2 +
                             (impl_->options.enable_background_compaction ? 1 : 0) +
                             impl_->shards.size();
@@ -2902,6 +3112,11 @@ Status Engine::GetStats(EngineStats* stats) const {
 }
 
 namespace testing {
+
+void SetFaultHook(std::function<void(const char*)> hook) {
+    std::lock_guard lock(fault_hook_mutex);
+    fault_hook = std::move(hook);
+}
 
 SeriesBufferInfo InspectSeriesBuffer(const Engine& engine, uint64_t series_id) {
     const auto& impl = *engine.impl_;

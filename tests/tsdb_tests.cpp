@@ -1,17 +1,23 @@
 #include "tsdb.h"
+#include "../benchmarks/bench_util.h"
 
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <condition_variable>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "check.h"
@@ -23,9 +29,49 @@ using namespace tsdb;
 
 namespace {
 
+static_assert(std::is_same_v<decltype(AggregateResult::count), uint64_t>);
+static_assert(std::is_same_v<decltype(AggregateResult::result), double>);
+
+// 子进程兜底限制死锁回归的执行时间，不让整个测试集永久挂起。
+void RunWithTimeout(const std::function<void()>& run) {
+    const pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        try {
+            run();
+            _exit(0);
+        } catch (const std::exception& error) {
+            std::cerr << '\n' << error.what() << std::endl;
+            _exit(1);
+        }
+    }
+    int child_status = 0;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(15);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto result = waitpid(pid, &child_status, WNOHANG);
+        if (result == pid) {
+            CHECK(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
+            return;
+        }
+        if (result < 0) {
+            ::kill(pid, SIGKILL);
+            waitpid(pid, &child_status, 0);
+            CHECK(result >= 0);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ::kill(pid, SIGKILL);
+    waitpid(pid, &child_status, 0);
+    throw test_support::CheckFailure("并发测试超过有界超时");
+}
+
 std::filesystem::path TestPath() {
-    const auto path = std::filesystem::temp_directory_path() / "tsdb-course-test";
-    std::filesystem::remove_all(path);
+    auto pattern = (std::filesystem::temp_directory_path() / "tsdb-course-test-XXXXXX").string();
+    std::vector<char> buffer(pattern.begin(), pattern.end());
+    buffer.push_back('\0');
+    const auto path = ::mkdtemp(buffer.data());
+    if (!path) throw std::runtime_error("cannot create isolated test directory");
     return path;
 }
 
@@ -170,12 +216,588 @@ void TestQueueBackpressure(const std::filesystem::path& path) {
                       .max_pending_batches = 1},
         &status);
     AssertOk(status);
-    CommitVersion version = 0;
-    AssertOk(engine->Put({300, 100, 1.0}, &version));
-    AssertOk(engine->Put({300, 200, 2.0}, &version));
-    auto out_of_order = engine->Put({300, 150, 3.0});
-    CHECK(!out_of_order.ok);
+    std::mutex start_mutex;
+    std::condition_variable start_cv;
+    bool start = false;
+    std::vector<Status> outcomes(4);
+    std::vector<CommitVersion> versions(4);
+    std::vector<std::thread> writers;
+    for (uint64_t writer_id = 0; writer_id < 4; ++writer_id) {
+        writers.emplace_back([&, writer_id] {
+            {
+                std::unique_lock lock(start_mutex);
+                start_cv.wait(lock, [&] { return start; });
+            }
+            for (int i = 0; i < 64; ++i) {
+                outcomes[writer_id] = engine->WriteBatch(
+                    {{300 + writer_id, i, static_cast<double>(i)}},
+                    &versions[writer_id]);
+                if (!outcomes[writer_id].ok) break;
+            }
+        });
+    }
+    {
+        std::lock_guard lock(start_mutex);
+        start = true;
+    }
+    start_cv.notify_all();
+    for (auto& writer : writers) writer.join();
+    for (size_t i = 0; i < outcomes.size(); ++i) {
+        CHECK(outcomes[i].ok);
+        CHECK(versions[i] > 0);
+    }
+    EngineStats stats;
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.pending_batches == 0);
+    CHECK(stats.visible_version == 4 * 64);
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({300, 301, 302, 303}, 0, 64, &cursor));
+    CHECK(Read(cursor.get()).size() == 4 * 64);
+    CHECK(!engine->Put({300, 62, 0.0}).ok);
     AssertOk(engine->Close());
+}
+
+void TestZeroQueueCapacityRejected(const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(
+        path, Options{.max_pending_batches = 0}, &status);
+    CHECK(!status.ok);
+    CHECK(engine == nullptr);
+}
+
+void TestMemtableBackpressureAutoFlush(const std::filesystem::path& path) {
+    const Options options{.shard_count = 4,
+                          .memtable_max_points = 1000000,
+                          .enable_background_compaction = false,
+                          .max_memtable_bytes = 2 * 32};
+    Status status;
+    auto engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    AssertOk(engine->Put({310, 100, 1.0}));
+    // 下一批自身能容纳，但必须先刷掉现存的一个点才能提交完整批次。
+    AssertOk(engine->WriteBatch({{310, 200, 2.0}, {311, 200, 3.0}}));
+    EngineStats stats;
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.flush_count >= 1);
+    CHECK(stats.mutable_points <= 2);
+    CHECK(stats.memtable_bytes == stats.mutable_points * 32);
+    CHECK(stats.memtable_bytes <= options.max_memtable_bytes);
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({310, 311}, 0, 300, &cursor));
+    CHECK(Read(cursor.get()).size() == 3);
+    cursor->Close();
+    AssertOk(engine->Close());
+    engine.reset();
+    auto reopened = Engine::Open(path, options, &status);
+    AssertOk(status);
+    AssertOk(reopened->Scan({310, 311}, 0, 300, &cursor));
+    CHECK(Read(cursor.get()).size() == 3);
+    AssertOk(reopened->Close());
+}
+
+void TestHotSeriesBackpressureAutoFlush(const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(
+        path, Options{.shard_count = 4, .memtable_max_points = 1000000,
+                      .enable_background_compaction = false,
+                      .hot_series_point_limit = 2}, &status);
+    AssertOk(status);
+    for (int batch = 0; batch < 3; ++batch) {
+        AssertOk(engine->WriteBatch({{320, batch * 2, 1.0},
+                                    {320, batch * 2 + 1, 2.0}}));
+    }
+    EngineStats stats;
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.flush_count >= 2);
+    CHECK(stats.mutable_points <= 2);
+    CHECK(stats.memtable_bytes == stats.mutable_points * 32);
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({320}, 0, 6, &cursor));
+    const auto points = Read(cursor.get());
+    CHECK(points.size() == 6);
+    for (size_t i = 0; i < points.size(); ++i) {
+        CHECK(points[i].timestamp_ms == static_cast<int64_t>(i));
+    }
+    AssertOk(engine->Close());
+}
+
+void TestOversizedHotSeriesBatchAtomic(const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(
+        path, Options{.memtable_max_points = 1000000,
+                      .enable_background_compaction = false,
+                      .hot_series_point_limit = 2}, &status);
+    AssertOk(status);
+    CommitVersion version = 99;
+    const auto started = std::chrono::steady_clock::now();
+    const auto rejected = engine->WriteBatch(
+        {{331, 100, 1.0}, {330, 100, 1.0}, {330, 200, 2.0},
+         {330, 300, 3.0}}, &version);
+    CHECK(!rejected.ok);
+    CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(2));
+    CHECK(version == 99);
+    EngineStats stats;
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.visible_version == 0);
+    CHECK(stats.mutable_points == 0 && stats.memtable_bytes == 0);
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({330, 331}, 0, 400, &cursor));
+    CHECK(Read(cursor.get()).empty());
+    AssertOk(engine->WriteBatch({{330, 100, 4.0}, {331, 100, 5.0}}, &version));
+    CHECK(version == 1);
+    AssertOk(engine->Close());
+}
+
+void TestOversizedMemoryBatchRejected(const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(
+        path, Options{.memtable_max_points = 1000000,
+                      .enable_background_compaction = false,
+                      .max_memtable_bytes = 2 * 32}, &status);
+    AssertOk(status);
+    AssertOk(engine->Put({340, 100, 1.0}));
+    CommitVersion version = 99;
+    const auto started = std::chrono::steady_clock::now();
+    CHECK(!engine->WriteBatch({{340, 200, 2.0}, {341, 200, 3.0},
+                              {342, 200, 4.0}}, &version).ok);
+    CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(2));
+    CHECK(version == 99);
+    EngineStats stats;
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.visible_version == 1);
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({340, 341, 342}, 0, 300, &cursor));
+    const auto points = Read(cursor.get());
+    CHECK(points.size() == 1 && points[0].timestamp_ms == 100);
+    AssertOk(engine->Put({341, 200, 5.0}, &version));
+    CHECK(version == 2);
+    AssertOk(engine->Close());
+}
+
+void TestCurrentRssStats(const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(path, {}, &status);
+    AssertOk(status);
+    AssertOk(engine->Put({350, 100, 1.0}));
+    EngineStats stats;
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.rss_bytes > 0);
+    CHECK(stats.rss_bytes < (uint64_t{1} << 40));
+#if defined(__linux__)
+    uint64_t virtual_pages = 0;
+    uint64_t resident_pages = 0;
+    std::ifstream statm("/proc/self/statm");
+    CHECK(static_cast<bool>(statm >> virtual_pages >> resident_pages));
+    const long page_size = ::sysconf(_SC_PAGESIZE);
+    CHECK(page_size > 0 && resident_pages > 0);
+    const auto current_rss = resident_pages * static_cast<uint64_t>(page_size);
+    // /proc 与 rusage 不是同一种采样，不要求 peak >= current 或精确相等。
+    CHECK(stats.rss_bytes >= current_rss / 4);
+    CHECK(stats.rss_bytes <= current_rss * 4);
+#endif
+    AssertOk(engine->Close());
+}
+
+void TestAggregateCountExactType(const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(path, Options{4, 100000}, &status);
+    AssertOk(status);
+    AssertOk(engine->WriteBatch({{360, 100, 1.0}, {360, 101, 2.0},
+                                 {361, 100, 4.0}}));
+    AssertOk(engine->Flush());
+    AssertOk(engine->Put({360, 102, 3.0}));
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Aggregate({360, 360, 361}, 0, 200, 200,
+                               AggregateOp::Count, &cursor));
+    uint64_t total = 0;
+    size_t buckets = 0;
+    while (auto result = cursor->NextAggregate()) {
+        CHECK(result->count == (result->series_id == 360 ? 3 : 1));
+        CHECK(result->result == static_cast<double>(result->count));
+        total += result->count;
+        ++buckets;
+    }
+    CHECK(buckets == 2 && total == 4);
+    // 无需构造数千万亿个点，也能检查现有结果游标不把 count 经 double 转换。
+    constexpr uint64_t exact_count = (uint64_t{1} << 53) + 1;
+    Cursor exact(std::vector<AggregateResult>{
+        {360, 0, 200, static_cast<double>(exact_count), exact_count}});
+    const auto result = exact.NextAggregate();
+    CHECK(result && result->count == exact_count);
+    CHECK(result->result == static_cast<double>(exact_count));
+    AssertOk(engine->Close());
+}
+
+void TestExpirationVersionIdempotencyAndAccounting(
+    const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(
+        path, Options{.memtable_max_points = 1000000,
+                      .enable_background_compaction = false,
+                      .hot_series_point_limit = 2}, &status);
+    AssertOk(status);
+    CommitVersion written = 0;
+    AssertOk(engine->WriteBatch({{370, 100, 1.0}, {370, 200, 2.0}}, &written));
+    EngineStats before;
+    AssertOk(engine->GetStats(&before));
+    CHECK(before.mutable_points == 2 && before.memtable_bytes == 2 * 32);
+    std::unique_ptr<Cursor> old_view;
+    AssertOk(engine->Scan({370}, 0, 500, &old_view));
+    CommitVersion expired = 0;
+    AssertOk(engine->ExpireBefore(200, &expired));
+    EngineStats after;
+    AssertOk(engine->GetStats(&after));
+    CHECK(expired > written);
+    CHECK(after.visible_version == expired);
+    CHECK(after.expiration_cutoff == 200);
+    CHECK(after.mutable_points == 1 && after.memtable_bytes == 32);
+    CommitVersion duplicate = 0;
+    AssertOk(engine->ExpireBefore(200, &duplicate));
+    EngineStats repeated;
+    AssertOk(engine->GetStats(&repeated));
+    CHECK(duplicate == expired && repeated.visible_version == expired);
+    CHECK(repeated.wal_syncs == after.wal_syncs);
+    CHECK(repeated.wal_bytes == after.wal_bytes);
+    CHECK(repeated.mutable_points == after.mutable_points);
+    CHECK(repeated.memtable_bytes == after.memtable_bytes);
+    AssertOk(engine->Put({370, 300, 3.0}));
+    EngineStats appended;
+    AssertOk(engine->GetStats(&appended));
+    CHECK(appended.mutable_points == 2 && appended.memtable_bytes == 2 * 32);
+    CHECK(appended.flush_count == 0);
+    CHECK(Read(old_view.get()).size() == 2);
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({370}, 0, 500, &cursor));
+    const auto points = Read(cursor.get());
+    CHECK(points.size() == 2 && points.front().timestamp_ms == 200 &&
+          points.back().timestamp_ms == 300);
+    AssertOk(engine->ExpireBefore(400));
+    EngineStats empty;
+    AssertOk(engine->GetStats(&empty));
+    CHECK(empty.mutable_points == 0 && empty.memtable_bytes == 0);
+    AssertOk(engine->Put({370, 400, 4.0}));
+    AssertOk(engine->GetStats(&appended));
+    CHECK(appended.mutable_points == 1 && appended.memtable_bytes == 32);
+    CHECK(appended.flush_count == 0);
+    CHECK(!engine->ExpireBefore(399).ok);
+    AssertOk(engine->Close());
+}
+
+void TestManifestFailureStickyAndRecoverable(const std::filesystem::path& path) {
+    const Options options{.memtable_max_points = 1000000,
+                          .enable_background_compaction = false,
+                          .enable_background_gc = false};
+    Status status;
+    auto engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    AssertOk(engine->Put({380, 100, 1.0}));
+    AssertOk(engine->Flush());
+    AssertOk(engine->WriteBatch({{380, 200, 2.0}, {381, 200, 3.0}}));
+    CHECK(std::filesystem::create_directory(path / "MANIFEST.tmp"));
+    CHECK(!engine->Flush().ok);
+    EngineStats failed;
+    AssertOk(engine->GetStats(&failed));
+    // 移除故障源仍然必须保持 storage_error，不能在下一次操作中重试 IO。
+    CHECK(std::filesystem::remove(path / "MANIFEST.tmp"));
+    CommitVersion rejected_version = 99;
+    CHECK(!engine->WriteBatch({{382, 300, 4.0}}, &rejected_version).ok);
+    CHECK(rejected_version == 99);
+    CHECK(!engine->GarbageCollect().ok);
+    CHECK(!engine->ExpireBefore(failed.expiration_cutoff).ok);
+    CHECK(!engine->ExpireBefore(500).ok);
+    CHECK(!engine->Flush().ok);
+    CHECK(!engine->Compact().ok);
+    EngineStats rejected;
+    AssertOk(engine->GetStats(&rejected));
+    CHECK(rejected.visible_version == failed.visible_version);
+    CHECK(rejected.expiration_cutoff == failed.expiration_cutoff);
+    CHECK(rejected.wal_syncs == failed.wal_syncs);
+    CHECK(rejected.wal_bytes == failed.wal_bytes);
+    CHECK(!engine->Close().ok);
+    // 重复关闭和析构均须完成，不能保留处于 closing 状态的线程。
+    (void)engine->Close();
+    engine.reset();
+    auto reopened = Engine::Open(path, options, &status);
+    AssertOk(status);
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(reopened->Scan({380, 381, 382}, 0, 1000, &cursor));
+    const auto points = Read(cursor.get());
+    CHECK(points.size() == 3);
+    CHECK(points[0].series_id == 380 && points[0].timestamp_ms == 100);
+    CHECK(points[1].series_id == 380 && points[1].timestamp_ms == 200);
+    CHECK(points[2].series_id == 381 && points[2].timestamp_ms == 200);
+    AssertOk(reopened->Put({382, 300, 4.0}));
+    AssertOk(reopened->Close());
+}
+
+void TestBackgroundFlushFailureWakesWriter(const std::filesystem::path& path) {
+    const Options options{.memtable_max_points = 1000000,
+                          .enable_background_compaction = false,
+                          .max_memtable_bytes = 2 * 32,
+                          .enable_background_gc = false};
+    Status status;
+    auto engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    AssertOk(engine->Put({390, 100, 1.0}));
+    CHECK(std::filesystem::create_directory(path / "MANIFEST.tmp"));
+    CommitVersion version = 99;
+    const auto started = std::chrono::steady_clock::now();
+    CHECK(!engine->WriteBatch({{390, 200, 2.0}, {391, 200, 3.0}}, &version).ok);
+    CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(5));
+    CHECK(version == 99);
+    CHECK(std::filesystem::remove(path / "MANIFEST.tmp"));
+    CHECK(!engine->Put({391, 300, 4.0}).ok);
+    CHECK(!engine->GarbageCollect().ok);
+    CHECK(!engine->Close().ok);
+    engine.reset();
+    auto reopened = Engine::Open(path, options, &status);
+    AssertOk(status);
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(reopened->Scan({390, 391}, 0, 1000, &cursor));
+    const auto points = Read(cursor.get());
+    CHECK(points.size() == 1 && points[0].timestamp_ms == 100);
+    AssertOk(reopened->Close());
+}
+
+void TestCloseWakesQueueBackpressureWriter(const std::filesystem::path& path) {
+    const Options options{.shard_count = 4,
+                          .memtable_max_points = 1000000,
+                          .max_pending_batches = 1,
+                          .compaction_sstable_threshold = 1000000,
+                          .max_live_sstables = 1,
+                          .enable_background_gc = false};
+    Status status;
+    auto engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    AssertOk(engine->Put({4000, 100, 1.0}));
+    AssertOk(engine->Flush());
+    AssertOk(engine->Put({4000, 200, 2.0}));
+    AssertOk(engine->Flush());
+    EngineStats stats;
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.live_sstable_count == 2 && stats.compaction_count == 0);
+
+    std::mutex hook_mutex;
+    std::condition_variable hook_cv;
+    bool entered_merge = false;
+    bool release_merge = false;
+    bool entered_wait = false;
+    bool entered_close = false;
+    bool waiting_done = false;
+    testing::SetFaultHook([&](const char* stage) {
+        if (std::strcmp(stage, "compaction_merge_begin") == 0) {
+            // 合并 hook 不持引擎全局锁，coordinator 可以进入 SST 背压等待。
+            std::unique_lock lock(hook_mutex);
+            entered_merge = true;
+            hook_cv.notify_all();
+            hook_cv.wait(lock, [&] { return release_merge; });
+        } else if (std::strcmp(stage, "write_queue_wait") == 0) {
+            std::lock_guard lock(hook_mutex);
+            entered_wait = true;
+            hook_cv.notify_all();
+        } else if (std::strcmp(stage, "close_begin") == 0) {
+            std::lock_guard lock(hook_mutex);
+            entered_close = true;
+            hook_cv.notify_all();
+        }
+    });
+    Status compact_status;
+    std::thread compactor([&] { compact_status = engine->Compact(); });
+    bool merge_reached = false;
+    {
+        std::unique_lock lock(hook_mutex);
+        merge_reached = hook_cv.wait_for(lock, std::chrono::seconds(2), [&] {
+            return entered_merge;
+        });
+    }
+    if (!merge_reached) {
+        {
+            std::lock_guard lock(hook_mutex);
+            release_merge = true;
+        }
+        hook_cv.notify_all();
+        compactor.join();
+        testing::SetFaultHook({});
+        (void)engine->Close();
+        CHECK(merge_reached);
+    }
+
+    Status queued_status;
+    std::thread queued([&] { queued_status = engine->Put({4002, 300, 3.0}); });
+    bool queue_full = false;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        status = engine->GetStats(&stats);
+        if (!status.ok) break;
+        if (stats.pending_batches == 1) {
+            queue_full = true;
+            break;
+        }
+        std::this_thread::yield();
+    }
+    if (!queue_full) {
+        {
+            std::lock_guard lock(hook_mutex);
+            release_merge = true;
+        }
+        hook_cv.notify_all();
+        compactor.join();
+        (void)engine->Close();
+        queued.join();
+        testing::SetFaultHook({});
+        CHECK(queue_full);
+    }
+
+    Status waiting_status;
+    CommitVersion waiting_version = 99;
+    std::thread waiting([&] {
+        waiting_status = engine->Put({4003, 300, 4.0}, &waiting_version);
+        std::lock_guard lock(hook_mutex);
+        waiting_done = true;
+        hook_cv.notify_all();
+    });
+    bool wait_reached = false;
+    {
+        std::unique_lock lock(hook_mutex);
+        wait_reached = hook_cv.wait_for(lock, std::chrono::seconds(2), [&] {
+            return entered_wait;
+        });
+    }
+    const auto close_started = std::chrono::steady_clock::now();
+    Status close_status;
+    std::thread closer([&] { close_status = engine->Close(); });
+    bool close_reached = false;
+    bool waiting_woke = false;
+    {
+        std::unique_lock lock(hook_mutex);
+        close_reached = hook_cv.wait_for(lock, std::chrono::seconds(2), [&] {
+            return entered_close;
+        });
+        // 未入队写者必须由 Close 唤醒，而不是靠释放合并 gate 腾出队列。
+        waiting_woke = hook_cv.wait_for(lock, std::chrono::seconds(2), [&] {
+            return waiting_done;
+        });
+        release_merge = true;
+    }
+    hook_cv.notify_all();
+    // 所有线程释放并 join 后再断言，普通失败不会留下悬挂的 hook 或线程。
+    compactor.join();
+    queued.join();
+    waiting.join();
+    closer.join();
+    testing::SetFaultHook({});
+    CHECK(wait_reached && close_reached && waiting_woke);
+    CHECK(std::chrono::steady_clock::now() - close_started <
+          std::chrono::seconds(5));
+    CHECK(compact_status.ok && close_status.ok && queued_status.ok);
+    CHECK(!waiting_status.ok);
+    CHECK(waiting_version == 99);
+    engine.reset();
+    auto reopened = Engine::Open(path, options, &status);
+    AssertOk(status);
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(reopened->Scan({4000, 4002, 4003}, 0, 1000, &cursor));
+    const auto points = Read(cursor.get());
+    CHECK(points.size() == 3);
+    CHECK(points[0].series_id == 4000 && points[0].timestamp_ms == 100);
+    CHECK(points[1].series_id == 4000 && points[1].timestamp_ms == 200);
+    CHECK(points[2].series_id == 4002 && points[2].timestamp_ms == 300);
+    for (const auto& point : points) CHECK(point.series_id != 4003);
+    AssertOk(reopened->Close());
+}
+
+void TestIrreducibleSstablePressureMakesProgress(const std::filesystem::path& path) {
+    const Options options{.shard_count = 4,
+                          .memtable_max_points = 1000000,
+                          .max_pending_batches = 1,
+                          .compaction_sstable_threshold = 1000000,
+                          .max_live_sstables = 1,
+                          .enable_background_gc = false};
+    Status status;
+    auto engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    AssertOk(engine->WriteBatch({{4010, 100, 1.0}, {4012, 100, 2.0}}));
+    AssertOk(engine->Flush());
+    EngineStats stats;
+    AssertOk(engine->GetStats(&stats));
+    // 每个分片只有一个文件，合法软上限不能要求这个文件集合继续缩小。
+    CHECK(stats.live_sstable_count == 2 && stats.compaction_count == 0);
+    const auto started = std::chrono::steady_clock::now();
+    CommitVersion version = 99;
+    AssertOk(engine->WriteBatch({{4010, 200, 3.0}, {4012, 200, 4.0}}, &version));
+    CHECK(version == 2);
+    AssertOk(engine->Put({4010, 300, 5.0}, &version));
+    CHECK(version == 3);
+    CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(5));
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.pending_batches == 0 && stats.visible_version == 3);
+    CHECK(stats.live_sstable_count == 2 && stats.compaction_count == 0);
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({4010, 4012}, 0, 1000, &cursor));
+    CHECK(Read(cursor.get()).size() == 5);
+    AssertOk(engine->Close());
+    engine.reset();
+    auto reopened = Engine::Open(path, options, &status);
+    AssertOk(status);
+    AssertOk(reopened->Scan({4010, 4012}, 0, 1000, &cursor));
+    CHECK(Read(cursor.get()).size() == 5);
+    AssertOk(reopened->Put({4012, 300, 6.0}, &version));
+    CHECK(version == 4);
+    AssertOk(reopened->Close());
+}
+
+void TestSstablePressureForcesHighThresholdCompaction(
+    const std::filesystem::path& path) {
+    const Options options{.shard_count = 1,
+                          .memtable_max_points = 1000000,
+                          .max_pending_batches = 1,
+                          .compaction_sstable_threshold = 1000000,
+                          .max_live_sstables = 1,
+                          .enable_background_gc = false};
+    Status status;
+    auto engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    AssertOk(engine->Put({4020, 100, 1.0}));
+    AssertOk(engine->Flush());
+    AssertOk(engine->Put({4020, 200, 2.0}));
+    AssertOk(engine->Flush());
+    EngineStats stats;
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.live_sstable_count == 2 && stats.compaction_count == 0);
+    std::atomic<bool> entered_merge{false};
+    testing::SetFaultHook([&](const char* stage) {
+        if (std::strcmp(stage, "compaction_merge_begin") == 0) {
+            entered_merge.store(true);
+        }
+    });
+    const auto started = std::chrono::steady_clock::now();
+    CommitVersion version = 99;
+    const auto write_status = engine->Put({4020, 300, 3.0}, &version);
+    testing::SetFaultHook({});
+    AssertOk(write_status);
+    CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(5));
+    CHECK(entered_merge.load());
+    CHECK(version == 3);
+    AssertOk(engine->GetStats(&stats));
+    // 没有调用 Compact；coordinator 压力请求必须越过正常的百万文件阈值。
+    CHECK(stats.compaction_count == 1 && stats.live_sstable_count == 1);
+    CHECK(stats.pending_batches == 0 && stats.visible_version == 3);
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({4020}, 0, 1000, &cursor));
+    const auto points = Read(cursor.get());
+    CHECK(points.size() == 3);
+    for (size_t i = 0; i < points.size(); ++i) {
+        CHECK(points[i].timestamp_ms == static_cast<int64_t>((i + 1) * 100));
+        CHECK(points[i].value == static_cast<double>(i + 1));
+    }
+    AssertOk(engine->Close());
+    engine.reset();
+    auto reopened = Engine::Open(path, options, &status);
+    AssertOk(status);
+    AssertOk(reopened->Scan({4020}, 0, 1000, &cursor));
+    CHECK(Read(cursor.get()).size() == 3);
+    AssertOk(reopened->Close());
 }
 
 void TestPhysicalExpirationAndGC(const std::filesystem::path& path) {
@@ -1273,6 +1895,30 @@ void TestZigzagBoundaries(const std::filesystem::path& path) {
     AssertOk(reopened->Close());
 }
 
+void TestAggregateInvalidOutput(const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(path, {}, &status);
+    AssertOk(status);
+    CHECK(!engine->Aggregate({1}, 0, 10, 1, AggregateOp::Count, nullptr).ok);
+    std::unique_ptr<Cursor> cursor;
+    CHECK(!engine->Aggregate({1}, 0, 10, 1, static_cast<AggregateOp>(99), &cursor).ok);
+    AssertOk(engine->Close());
+}
+
+void TestLatencySampling() {
+    std::vector<double> values{1, 2, 3, 4};
+    CHECK(bench::Percentile(&values, 0.50) == 2);
+    CHECK(bench::Percentile(&values, 0.95) == 4);
+    std::vector<double> samples;
+    bench::LatencyReservoir reservoir;
+    for (int i = 0; i < 100000; ++i) reservoir.Add(samples, i < 50000 ? 1.0 : 100.0);
+    CHECK(samples.size() == 50000);
+    CHECK(reservoir.seen == 100000);
+    const auto late = std::count(samples.begin(), samples.end(), 100.0);
+    CHECK(late > 20000 && late < 30000);
+    CHECK(bench::Percentile(&samples, 0.95) == 100.0);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1282,12 +1928,27 @@ int main(int argc, char** argv) {
         std::function<void()> run;
     };
     const std::vector<Case> cases = {
+        {"latency_sampling", [&] { TestLatencySampling(); }},
+        {"aggregate_invalid_output", [&] { TestAggregateInvalidOutput(root / "aggregate_invalid"); }},
         {"timestamp_encoding", [&] { TestTimestampEncodingRoundTrip(); }},
         {"write_scan_atomic", [&] { TestWriteScanAndAtomicValidation(root / "atomic"); }},
         {"readview_expiration", [&] { TestReadViewAndExpiration(root / "views"); }},
         {"recovery", [&] { TestRecovery(root / "recovery"); }},
         {"concurrent_group_commit", [&] { TestConcurrentGroupCommit(root / "group_commit"); }},
-        {"queue_backpressure", [&] { TestQueueBackpressure(root / "queue"); }},
+        {"queue_backpressure", [&] { RunWithTimeout([&] { TestQueueBackpressure(root / "queue"); }); }},
+        {"zero_queue_capacity", [&] { TestZeroQueueCapacityRejected(root / "zero_queue_capacity"); }},
+        {"memtable_backpressure", [&] { RunWithTimeout([&] { TestMemtableBackpressureAutoFlush(root / "memtable_backpressure"); }); }},
+        {"hot_series_backpressure", [&] { RunWithTimeout([&] { TestHotSeriesBackpressureAutoFlush(root / "hot_series_backpressure"); }); }},
+        {"oversized_hot_series_batch", [&] { RunWithTimeout([&] { TestOversizedHotSeriesBatchAtomic(root / "oversized_hot_series_batch"); }); }},
+        {"oversized_memory_batch", [&] { RunWithTimeout([&] { TestOversizedMemoryBatchRejected(root / "oversized_memory_batch"); }); }},
+        {"current_rss_stats", [&] { TestCurrentRssStats(root / "current_rss_stats"); }},
+        {"aggregate_count_exact_type", [&] { TestAggregateCountExactType(root / "aggregate_count_exact_type"); }},
+        {"expiration_version_accounting", [&] { RunWithTimeout([&] { TestExpirationVersionIdempotencyAndAccounting(root / "expiration_version_accounting"); }); }},
+        {"manifest_failure_sticky", [&] { RunWithTimeout([&] { TestManifestFailureStickyAndRecoverable(root / "manifest_failure_sticky"); }); }},
+        {"background_flush_failure_wakeup", [&] { RunWithTimeout([&] { TestBackgroundFlushFailureWakesWriter(root / "background_flush_failure_wakeup"); }); }},
+        {"close_queue_backpressure_wakeup", [&] { RunWithTimeout([&] { TestCloseWakesQueueBackpressureWriter(root / "close_queue_backpressure_wakeup"); }); }},
+        {"irreducible_sstable_pressure", [&] { RunWithTimeout([&] { TestIrreducibleSstablePressureMakesProgress(root / "irreducible_sstable_pressure"); }); }},
+        {"sstable_pressure_high_threshold", [&] { RunWithTimeout([&] { TestSstablePressureForcesHighThresholdCompaction(root / "sstable_pressure_high_threshold"); }); }},
         {"negative_windows", [&] { TestNegativeWindowsAndDuplicateSeries(root / "negative"); }},
         {"incremental_flush", [&] { TestMultipleIncrementalFlushes(root / "incremental"); }},
         {"physical_expiration_gc", [&] { TestPhysicalExpirationAndGC(root / "physical_expiration"); }},
@@ -1352,6 +2013,7 @@ int main(int argc, char** argv) {
         std::cerr << failed << " of " << ran << " tests failed\n";
         return 1;
     }
+    std::filesystem::remove_all(root);
     std::cout << "all tests passed\n";
     return 0;
 }

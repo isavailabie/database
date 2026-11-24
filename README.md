@@ -14,7 +14,10 @@ ctest --test-dir build --output-on-failure
 ## 测试
 
 `ctest` 运行两组用例：`tsdb_tests`（功能、崩溃恢复、并发压缩与 GC）和
-`tsdb_fault_test`（50 次文件级故障注入）。
+`tsdb_fault_test`（9 个运行阶段 × 两种 WAL × 10 轮，共 180 次真实进程崩溃，
+另加 50 次文件损坏注入）。安装 Python 3 时还会运行 `benchmark_runner_tests`。
+真实崩溃测试必须命中指定挂点并退出，恢复后校验已确认提交、整批原子性、
+过期状态以及继续写入后二次恢复，不能以未注入的轮次计数。
 
 ```bash
 ./build/tsdb_tests              # 全部用例，逐条打印名称与耗时
@@ -22,10 +25,26 @@ ctest --test-dir build --output-on-failure
 ./build/tsdb_tests 13           # 只跑第 13 个
 ```
 
+## 本轮功能修复验证（2026-11-25）
+
+验收目标为 Linux。本轮使用独立 Ubuntu 22.04 ARM64 Docker 容器、GCC 11.4、
+4 CPU 配额验证；最终再以 cpuset 0–3 和 512 MiB 内存上限运行功能与混合负载。
+不是直接复用本机旧 `build/` 二进制。
+Release、Debug、ASan/UBSan 均通过：51 个功能用例、180 次真实进程崩溃、
+50 次文件损坏注入与 10 个运行器用例；Release 功能套件另连续通过 10 轮。
+新增覆盖容量背压、不可合并 SST 的前进性、关闭唤醒、持久化失败和统计接口。
+百万点 quick 流程已验证同库均匀/热点各 60 秒混合读写及异常恢复，未报读写错误。
+过程统计和原始输出保留在本地 `build/linux-validation-20261125/`（不提交）。
+
+**边界**：本轮是功能回归，并未重新完成 1 亿点 + 60 分钟完整验收；
+下方历史性能不是本轮结果。真实进程退出测试不等同于硬件掉电实验。
+尚未实施 vector MemTable、锁外 WAL/Flush、严格有界流式 Compaction 等性能改造。
+
 ## 基准
 
 可复现的评测由 `benchmark/runner.py` 驱动，目录结构与课程 benchmark 一致：
-复制源码快照、Release 构建、每个场景在独立进程与独立数据库中运行，结果写入
+复制源码快照、Release 构建，各轮次在独立进程中运行；混合场景通过 `--keep`
+复用对应均匀/热点导入的数据库，单独选 mixed 时自动预载。结果写入
 `metrics.csv`、`aggregate.json` 和 `summary.json`。
 
 ```bash
@@ -72,16 +91,21 @@ python3 benchmark/runner.py --source "$PWD" --output build/eval-quick --profile 
 - 增量 Flush、SSTable、Manifest 和尾部 WAL 重放
 - 无损 timestamp/value 编码（zigzag varint + 原始 float64 位）
 - SSTable SeriesIndex（含字节长度）和按需磁盘分页读取
-- 有界流式 Compaction：磁盘多 SSTable 归并 + 过期过滤
+- Compaction：按 Series 归并磁盘多 SSTable，并过滤过期点；当前仍物化单条 Series，
+  尚未完成热点 Series 的严格有界流式归并
 - Size-tiered Compaction：按层级归并，避免 O(N²) 写放大
 - Compaction 归并 I/O 期间释放全局锁，不阻塞前台写入
 - 后台 Flush、阈值触发 Compaction 和后台 GC
 - 引用计数 GC：读取并发下也能回收过期 SSTable 文件
 - ReadView、过期视图和物理过期清理
-- 热点 Series 每 Flush 窗口限流
-- 工作线程绑定到 `cpu_budget` CPU 配额
+- 队列、MemTable 和热点容量触发阻塞背压；等待后重新校验批次，单批超限直接拒绝
+- SST 压力下强制低阈值合并；不可再归并的文件集合采用软上限，避免永久等待
+- Linux 协调/刷盘/合并线程进行亲和绑定；验收用容器 `--cpus=4` 限制全部线程
 - Covered Commit Version 写入 Manifest
-- 50 次文件级故障注入；WAL 残缺尾部、Expire+GC 后崩溃的恢复用例
+- 180 次阶段级真实崩溃 + 50 次文件损坏；WAL 残缺尾部、Expire+GC 的恢复用例
+- 持久化失败进入故障状态：拒绝新读写/维护/GC，既有游标保持视图，关闭仍释放资源；须重开修复
+- COUNT 的精确整型结果位于 `AggregateResult::count`，`result` 保留浮点兼容投影
+- 当前 RSS 与峰值 RSS 分开统计，混合基准记录写入延迟分位和周期 `samples.csv`
 - 导入、混合、恢复三类工作负载程序，以及 `benchmark/runner.py` 评测运行器
 
 验证结果（作者机器，NVMe SSD，WSL2；可用 `bash scripts/run_bench.sh full` 复现）：

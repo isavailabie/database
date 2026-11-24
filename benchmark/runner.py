@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a source snapshot and run every TSDB workload in a fresh process/db.
+"""构建源码快照，以独立进程运行 TSDB 基准；mixed 复用对应导入库。
 
 Layout of an output directory (never reused):
 
@@ -13,6 +13,7 @@ Layout of an output directory (never reused):
 import argparse
 import csv
 import json
+import math
 import os
 import shutil
 import statistics
@@ -40,7 +41,7 @@ CASES = {
     "perf_recover": dict(kind="recover"),
 }
 
-IGNORED = {".git", "build", "bench-results", "__pycache__", ".venv", "out"}
+IGNORED = {".git", ".workbuddy", "build", "bench-results", "__pycache__", ".venv", "out"}
 
 METRIC_FIELDS = [
     "case", "phase", "points", "threads", "seconds", "repeat", "ops",
@@ -117,7 +118,9 @@ def metrics_for(case, data):
         rows.append(dict(phase="write", ops=number(data, "points"),
                          seconds=number(data, "seconds"),
                          ops_per_second=number(data, "throughput"),
-                         p50_us=0.0, p95_us=0.0, p99_us=0.0, **common))
+                         p50_us=number(data, "write_p50_us"),
+                         p95_us=number(data, "write_p95_us"),
+                         p99_us=number(data, "write_p99_us"), **common))
         ops = number(data, "recovered_points")
         seconds = number(data, "recovery_seconds")
         rows.append(dict(phase="recovery", ops=ops, seconds=seconds,
@@ -127,7 +130,9 @@ def metrics_for(case, data):
     rows.append(dict(phase="write", ops=number(data, "written"),
                      seconds=number(data, "seconds"),
                      ops_per_second=number(data, "write_throughput"),
-                     p50_us=0.0, p95_us=0.0, p99_us=0.0, **common))
+                     p50_us=number(data, "write_p50_us"),
+                     p95_us=number(data, "write_p95_us"),
+                     p99_us=number(data, "write_p99_us"), **common))
     rows.append(dict(phase="scan", ops=number(data, "scans"),
                      seconds=number(data, "seconds"),
                      ops_per_second=number(data, "scan_throughput"),
@@ -144,8 +149,9 @@ def variants(case, cfg, matrix, threads):
     return [(size, count) for size in sizes for count in thread_counts]
 
 
-def command_for(case, spec, binary, work, size, threads, seconds):
-    db = work / "db"
+def command_for(case, spec, binary, work, size, threads, seconds,
+                db=None, sample_interval=10.0):
+    db = db if db is not None else work / "db"
     if spec["kind"] == "ingest":
         cmd = [binary["bench"], size, "--series", 10000, "--path", db]
         if spec["hot"]:
@@ -153,7 +159,9 @@ def command_for(case, spec, binary, work, size, threads, seconds):
         return cmd, 3600
     if spec["kind"] == "mixed":
         cmd = [binary["mixed"], seconds, "--writers", threads, "--readers", 16,
-               "--path", db]
+               "--path", db, "--keep", "--series", 10000,
+               "--expected-points", size, "--sample-csv", work / "samples.csv",
+               "--sample-interval", sample_interval]
         if spec["hot"]:
             cmd += ["--hot"]
         return cmd, seconds + 600
@@ -161,17 +169,91 @@ def command_for(case, spec, binary, work, size, threads, seconds):
     return [binary["bench"], size, "--crash", "--path", db], 3600
 
 
-def execute(case, spec, binary, work, log, size, threads, seconds, timeout):
+def read_payload(log):
+    lines = Path(log).read_text(errors="replace").splitlines()
+    return parse_kv(lines[-1]) if lines else {}
+
+
+def protocol_error(case, data, size):
+    """退出码为零也必须验证有效工作量、恢复完整性及错误计数。"""
+    if case == "perf_recover":
+        required = ("open_seconds", "recovered_points", "wal_bytes", "rss_bytes", "disk_bytes")
+        positive = ("open_seconds", "recovered_points")
+    elif case.startswith("perf_ingest"):
+        required = ("points", "seconds", "throughput", "recovered_points", "recovery_seconds",
+                    "rss_bytes", "disk_bytes", "write_p50_us", "write_p95_us", "write_p99_us")
+        positive = ("points", "seconds", "throughput", "recovery_seconds")
+    else:
+        required = ("written", "seconds", "write_throughput", "scans", "scan_throughput",
+                    "scan_errors", "write_errors", "initial_points", "historical_read_points",
+                    "rss_bytes", "disk_bytes", "write_p50_us", "write_p95_us", "write_p99_us",
+                    "scan_p50_us", "scan_p95_us", "scan_p99_us")
+        positive = ("written", "seconds", "write_throughput", "scans", "scan_throughput",
+                    "historical_read_points")
+    for key in required:
+        try:
+            value = float(data[key])
+        except (KeyError, TypeError, ValueError):
+            return f"缺少或无效指标 {key}"
+        if not math.isfinite(value) or value < 0 or (key in positive and value <= 0):
+            return f"无效指标 {key}={data[key]}"
+    if case.startswith("perf_ingest"):
+        if number(data, "points") != size or number(data, "recovered_points") != size:
+            return "导入或恢复点数不等于请求规模"
+    elif case == "perf_recover":
+        if number(data, "recovered_points") != size:
+            return "恢复点数不等于异常退出前的请求规模"
+    elif (number(data, "initial_points") < size or number(data, "scan_errors") or
+          number(data, "write_errors")):
+        return "混合负载缺少历史数据或存在读写错误"
+    for prefix in ("write", "scan"):
+        keys = [f"{prefix}_p{p}_us" for p in (50, 95, 99)]
+        if all(key in data for key in keys):
+            values = [number(data, key) for key in keys]
+            if values != sorted(values):
+                return f"{prefix} 延迟百分位顺序错误"
+    return None
+
+
+def validate_result(case, result, size):
+    if result["status"] == "pass":
+        payload = read_payload(result["log"])
+        error = protocol_error(case, payload, size)
+        if error:
+            result.update(status="protocol_failure", error=error)
+        else:
+            result["metrics"] = metrics_for(case, payload)
+    return result
+
+
+def execute(case, spec, binary, work, log, size, threads, seconds, timeout,
+            ingest_db=None, sample_interval=10.0):
+    preload = None
+    db = ingest_db if ingest_db is not None else work / "db"
+    if spec["kind"] == "mixed" and ingest_db is None:
+        ingest_case = "perf_ingest_hot" if spec["hot"] else "perf_ingest"
+        cmd, limit = command_for(ingest_case, CASES[ingest_case], binary, work,
+                                 size, threads, seconds)
+        preload = validate_result(ingest_case, run(cmd, work / "ingest.log",
+                                  min(timeout, limit), cwd=work), size)
+        if preload["status"] != "pass":
+            return dict(preload, stage="preload")
     if spec["kind"] != "recover":
-        cmd, limit = command_for(case, spec, binary, work, size, threads, seconds)
-        return run(cmd, log, min(timeout, limit), cwd=work)
-    # Write without Close, then measure how long the reopen takes.
+        cmd, limit = command_for(case, spec, binary, work, size, threads, seconds,
+                                 db=db, sample_interval=sample_interval)
+        result = run(cmd, log, min(timeout, limit), cwd=work)
+        if spec["kind"] == "mixed":
+            result.update(ingest_db=str(db), samples=str(work / "samples.csv"))
+            if preload is not None:
+                result["preload"] = preload
+        return result
+    # 先异常退出，再校验全部恢复数据，不能以空探针扫描冒充成功。
     crash_log = log.with_name("crash.log")
-    failure = run([binary["bench"], size, "--crash", "--path", work / "db"],
+    failure = run([binary["bench"], size, "--crash", "--path", db],
                   crash_log, timeout, work)
     if failure["status"] != "pass":
         return failure
-    return run([binary["recover"], work / "db"], log, timeout, work)
+    return run([binary["recover"], db, "--expected-points", size], log, timeout, work)
 
 
 def summarize(records, out):
@@ -228,6 +310,8 @@ def main():
     parser.add_argument("--timeout", type=int, default=3600,
                         help="per-process seconds")
     parser.add_argument("--jobs", type=int, default=4)
+    parser.add_argument("--sample-interval", type=float, default=10.0,
+                        help="混合负载 CSV 采样间隔，秒，默认 10")
     parser.add_argument("--skip-build", action="store_true")
     args = parser.parse_args()
 
@@ -235,6 +319,21 @@ def main():
     for key in ("points", "seconds", "repeat"):
         if getattr(args, key) is not None:
             cfg[key] = getattr(args, key)
+
+    for key in ("points", "seconds", "repeat"):
+        if cfg[key] <= 0:
+            parser.error(f"--{key} 必须为正整数")
+    for key in ("threads", "timeout", "jobs"):
+        if getattr(args, key) <= 0:
+            parser.error(f"--{key} 必须为正整数")
+    if not math.isfinite(args.sample_interval) or not 0.001 <= args.sample_interval <= 86400:
+        parser.error("--sample-interval 必须在 0.001 到 86400 秒之间")
+    names = args.cases.split(",") if args.cases is not None else list(CASES)
+    unknown = [name for name in names if name not in CASES]
+    if unknown:
+        parser.error(f"unknown cases: {', '.join(unknown)}")
+    if len(names) != len(set(names)):
+        parser.error("--cases 不允许重复场景")
 
     source = args.source.resolve()
     out = args.output.resolve()
@@ -246,7 +345,8 @@ def main():
 
     summary = dict(schema_version=1, profile=args.profile, config=cfg,
                    source=str(source), status="running", records=[],
-                   matrix=args.matrix, threads=args.threads)
+                   matrix=args.matrix, threads=args.threads,
+                   sample_interval=args.sample_interval)
     dump(out / "summary.json", summary)
     records = summary["records"]
     try:
@@ -279,15 +379,14 @@ def main():
             if not path.is_file():
                 parser.error(f"missing binary {path}")
 
-        names = args.cases.split(",") if args.cases else list(CASES)
-        unknown = [name for name in names if name not in CASES]
-        if unknown:
-            parser.error(f"unknown cases: {', '.join(unknown)}")
         summary["executed_cases"] = names
         summary["full_suite"] = set(names) == set(CASES)
         dump(out / "summary.json", summary)
 
-        for name in names:
+        # 对应导入先执行，显式选中它时 mixed 直接复用该库；单选 mixed 则自动预载。
+        ingest_runs = {}
+        ordered_names = sorted(names, key=lambda name: CASES[name]["kind"] != "ingest")
+        for name in ordered_names:
             spec = CASES[name]
             for size, threads in variants(name, cfg, args.matrix, args.threads):
                 for repeat in range(cfg["repeat"]):
@@ -295,16 +394,23 @@ def main():
                     work = out / label
                     work.mkdir()
                     print(label, flush=True)
-                    result = execute(name, spec, binary, work, work / "run.log",
-                                     size, threads, cfg["seconds"], args.timeout)
+                    key = (spec.get("hot", False), size, threads, repeat)
+                    prior = ingest_runs.get(key) if spec["kind"] == "mixed" else None
+                    if prior is not None and prior["status"] != "pass":
+                        result = dict(status="dependency_failure", returncode=None,
+                                      seconds=0, log=prior["log"],
+                                      error="对应 ingest 失败，未运行 mixed")
+                    else:
+                        result = execute(name, spec, binary, work, work / "run.log",
+                                         size, threads, cfg["seconds"], args.timeout,
+                                         ingest_db=Path(prior["db"]) if prior else None,
+                                         sample_interval=args.sample_interval)
+                        validate_result(name, result, size)
                     result.update(case=name, points=size, threads=threads,
                                   repeat=repeat + 1)
-                    text = (work / "run.log").read_text(errors="replace")
-                    payload = parse_kv(text.splitlines()[-1] if text.splitlines() else "")
-                    if result["status"] == "pass":
-                        result["metrics"] = metrics_for(name, payload)
-                        if not payload:
-                            result["status"] = "protocol_failure"
+                    if spec["kind"] == "ingest":
+                        result["db"] = str(work / "db")
+                        ingest_runs[key] = result
                     records.append(result)
                     dump(out / "summary.json", summary)
         summary["status"] = ("pass" if all(r["status"] == "pass" for r in records)

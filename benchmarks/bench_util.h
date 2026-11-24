@@ -1,12 +1,13 @@
 #pragma once
 
-// Small helpers shared by the benchmark drivers. Everything here runs in the
-// driver process, never inside the engine, so it does not count against the
-// engine's RSS budget.
+// Helpers shared by the benchmark drivers. Drivers currently link the engine
+// in-process: their buffers are included in process RSS and must stay bounded.
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cmath>
+#include <random>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -48,13 +49,30 @@ inline uint64_t DirectoryBytes(const std::filesystem::path& dir) {
     return total;
 }
 
+// Bounded Algorithm R samples span the complete run, rather than just the
+// first 50000 operations. One instance is owned by each workload thread.
+struct LatencyReservoir {
+    uint64_t seen{0};
+    std::mt19937_64 random;
+    explicit LatencyReservoir(uint64_t seed = 1) : random(seed) {}
+    void Add(std::vector<double>& samples, double latency) {
+        ++seen;
+        constexpr size_t kLimit = 50000;
+        if (samples.size() < kLimit) {
+            samples.push_back(latency);
+        } else {
+            const auto index = std::uniform_int_distribution<uint64_t>(0, seen - 1)(random);
+            if (index < kLimit) samples[static_cast<size_t>(index)] = latency;
+        }
+    }
+};
+
 // Nearest-rank percentile over an unsorted sample; 0.0 for an empty sample.
 inline double Percentile(std::vector<double>* values, double fraction) {
     if (values->empty()) return 0.0;
     std::sort(values->begin(), values->end());
-    const double scaled = fraction * static_cast<double>(values->size() - 1);
-    size_t index = static_cast<size_t>(scaled);
-    if (index >= values->size()) index = values->size() - 1;
+    const double rank = std::ceil(std::clamp(fraction, 0.0, 1.0) * values->size());
+    const size_t index = rank > 0 ? static_cast<size_t>(rank) - 1 : 0;
     return (*values)[index];
 }
 

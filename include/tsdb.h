@@ -25,6 +25,8 @@ struct AggregateResult {
     uint64_t series_id{};
     int64_t bucket_start{};
     int64_t bucket_end{};
+    // Numeric projection retained for compatibility. For Count, read count:
+    // unlike double it remains exact above 2^53. All operations populate count.
     double result{};
     uint64_t count{};
 };
@@ -74,7 +76,8 @@ struct Options {
     size_t compaction_sstable_threshold{8};
     // Backpressure: pause writers when more than this many SSTables are live,
     // so the per-series index of a burst of flushes cannot blow the RSS budget.
-    // 0 disables the limit.
+    // Soft when no two same-shard/level files can be merged, to avoid an
+    // irreducible file set blocking writes forever. 0 disables the limit.
     size_t max_live_sstables{256};
     bool enable_background_gc{true};
     // Directory for WAL segments; empty means <db>/wal. Pointing it at a
@@ -106,7 +109,8 @@ struct EngineStats {
     uint64_t compaction_count{};
     uint64_t flush_count{};
     size_t pending_batches{};
-    uint64_t sstable_count{};
+    uint64_t sstable_count{};       // all physical SSTables, including orphans
+    uint64_t live_sstable_count{};  // current Manifest file set
     uint64_t sstable_bytes{};
     size_t active_read_views{};
     uint64_t obsolete_sstable_count{};
@@ -133,6 +137,11 @@ struct SeriesBufferInfo {
 };
 
 SeriesBufferInfo InspectSeriesBuffer(const Engine& engine, uint64_t series_id);
+
+// Process-local, test-only stage hook. Empty by default. Install before an
+// operation; callbacks may run on worker threads and must not throw or reenter
+// the engine. Used to prove a crash occurs inside a persistence operation.
+void SetFaultHook(std::function<void(const char*)> hook);
 
 }  // namespace testing
 

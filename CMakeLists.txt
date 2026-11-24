@@ -42,3 +42,10 @@ target_link_libraries(tsdb_fault_test PRIVATE tsdb)
 enable_testing()
 add_test(NAME tsdb_tests COMMAND tsdb_tests)
 add_test(NAME tsdb_fault_test COMMAND tsdb_fault_test)
+set_tests_properties(tsdb_tests tsdb_fault_test PROPERTIES TIMEOUT 180)
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME benchmark_runner_tests
+    COMMAND ${Python3_EXECUTABLE} -m unittest discover
+      -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_benchmark_runner.py -v)
+endif()
