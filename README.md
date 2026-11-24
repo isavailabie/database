@@ -38,7 +38,33 @@ Release、Debug、ASan/UBSan 均通过：51 个功能用例、180 次真实进�
 
 **边界**：本轮是功能回归，并未重新完成 1 亿点 + 60 分钟完整验收；
 下方历史性能不是本轮结果。真实进程退出测试不等同于硬件掉电实验。
-尚未实施 vector MemTable、锁外 WAL/Flush、严格有界流式 Compaction 等性能改造。
+以上为功能修复阶段的验证；随后实施的性能改造及独立对照结果见下一节。
+
+## 性能优化验证（2026-11-25）
+
+相对已推送功能基线 `a2cb1e0`，保留写入准入投影、vector MemTable、流式多路
+Compaction 和 8 KiB 查询解码；WAL 锁外流水线因混合吞吐退化未合入。
+在 Linux 4 CPU、512 MiB、无交换空间下，六场景各三轮 AB/BA 交替，中位结果：
+
+| 场景 | 基线 → 优化 | 收益 |
+| --- | --- | --- |
+| 千万点均匀导入，含 drain | 10.119 → 7.817 s | 耗时 -22.75% |
+| 千万点热点导入，含 drain | 9.154 → 7.471 s | 耗时 -18.39% |
+| 300 万点单热点合并 | 0.824 → 0.180 s | 4.58 倍；进程峰值 RSS 244.10 → 16.13 MiB |
+| 100 万点单热点驻留追加 | 0.494 → 0.316 s | 耗时 -35.99%；RSS -54.22% |
+| 300 万点磁盘扫描三遍 | 0.525 → 0.253 s | 2.08 倍；RSS +0.64% |
+| 已有千万点库，4 写 16 读 | 写 68.8k → 159.6k 点/s；读 31.8k → 63.9k 次/s | 写 2.32 倍、读 2.01 倍；零读写错误 |
+
+最终 Release、Debug、ASan/UBSan 均通过 63 个功能用例、180 次真实崩溃、50 次文件
+损坏、38 个 Python 协议用例及 5 个设计烟测；Release 全功能另连续通过 10 轮。
+详细环境、逐轮数据、尾延迟、设计取舍、容量验证和未完成的 60 分钟验收边界见
+[`doc/性能优化-2026-11-25.md`](doc/性能优化-2026-11-25.md)，
+[三轮原始指标 JSON](doc/performance-results-2026-11-25.json) 随仓库保存。
+最终版本另在相同限额下验证 1 亿点均匀/热点导入：71.24 / 76.70 秒，峰值 RSS
+152.08 / 168.11 MiB；同库各 60 秒混合零读写错误，峰值最高 184.36 MiB。
+异常退出后 WAL 重放与全库校验均少于 8 秒，精确恢复全部已确认点。
+**尚未完成亿点库上的 60 分钟持续混合**；热点一次扫描最大延迟约 1.968 秒，详见报告。
+以上为 Docker Linux overlayfs 数据层测量，不是历史 WSL2 或裸机 SSD 数据。
 
 ## 基准
 
@@ -86,13 +112,15 @@ python3 benchmark/runner.py --source "$PWD" --output build/eval-quick --profile 
 已实现：
 
 - `Put`、`WriteBatch`、`Scan`、窗口 `Aggregate`、`ExpireBefore`
-- Series 分片和 Shard MemTable（有界内存，Flush 后清空）
+- Series 分片和连续 vector MemTable（递增追加摊销 O(1)，逻辑容量背压，Flush 后清空；
+  逻辑点数额度不等同于实际 vector capacity 或 RSS 硬上限）
 - WAL 校验、持久 fd 和小批量 Group Commit
 - 增量 Flush、SSTable、Manifest 和尾部 WAL 重放
 - 无损 timestamp/value 编码（zigzag varint + 原始 float64 位）
-- SSTable SeriesIndex（含字节长度）和按需磁盘分页读取
-- Compaction：按 Series 归并磁盘多 SSTable，并过滤过期点；当前仍物化单条 Series，
-  尚未完成热点 Series 的严格有界流式归并
+- SSTable SeriesIndex（含字节长度）和按需磁盘分页读取；每查询源固定 8 KiB pread 缓冲，
+  Open 校验保留，游标 Close/EOF/异常即时释放快照与 fd，聚合读取错误通过 Status 返回
+- Compaction：按 Series 索引堆与时间戳点堆流式归并、过滤过期点；每输入 SST 使用
+  64 KiB 缓冲，点归并临时空间为 O(fan-in)，不物化整条热点 Series；输出索引仍随规模增长
 - Size-tiered Compaction：按层级归并，避免 O(N²) 写放大
 - Compaction 归并 I/O 期间释放全局锁，不阻塞前台写入
 - 后台 Flush、阈值触发 Compaction 和后台 GC

@@ -1,7 +1,9 @@
 #include "tsdb.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cerrno>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -15,6 +17,8 @@
 #include <queue>
 #include <set>
 #include <sstream>
+#include <stdexcept>
+#include <system_error>
 #include <sys/stat.h>
 #include <tuple>
 #include <unistd.h>
@@ -304,12 +308,53 @@ struct VersionedPoint {
     CommitVersion version{};
 };
 
-using SeriesPoints = std::map<int64_t, VersionedPoint>;
+class SeriesPoints {
+public:
+    size_t size() const { return points_.size(); }
+    size_t capacity() const { return points_.capacity(); }
+    bool empty() const { return points_.empty(); }
+    const VersionedPoint& front() const { return points_.front(); }
+    const VersionedPoint& operator[](size_t index) const { return points_[index]; }
+    auto begin() const { return points_.begin(); }
+    auto end() const { return points_.end(); }
+
+    size_t LowerBoundIndex(int64_t timestamp) const {
+        return static_cast<size_t>(std::lower_bound(
+            points_.begin(), points_.end(), timestamp,
+            [](const VersionedPoint& point, int64_t value) {
+                return point.point.timestamp_ms < value;
+            }) - points_.begin());
+    }
+
+    bool Upsert(const VersionedPoint& point) {
+        const int64_t timestamp = point.point.timestamp_ms;
+        // 正常写入严格递增，追加为摊销 O(1)，仅恢复乱序记录时二分插入。
+        if (points_.empty() || points_.back().point.timestamp_ms < timestamp) {
+            points_.push_back(point);
+            return true;
+        }
+        const size_t index = LowerBoundIndex(timestamp);
+        if (points_[index].point.timestamp_ms == timestamp) {
+            if (point.version > points_[index].version) points_[index] = point;
+            return false;
+        }
+        points_.insert(points_.begin() + index, point);
+        return true;
+    }
+
+    size_t ExpireBefore(int64_t cutoff) {
+        const size_t removed = LowerBoundIndex(cutoff);
+        points_.erase(points_.begin(), points_.begin() + removed);
+        return removed;
+    }
+
+private:
+    std::vector<VersionedPoint> points_;
+};
 
 struct ShardData {
-    // Snapshots share the per-series maps: a commit clones only the series it
-    // actually writes, never the whole shard. Copying the outer map stays cheap
-    // (a few thousand shared_ptr) regardless of how many points are resident.
+    // 快照共享每条 series 的 buffer；提交只复制实际写入且仍被共享的 series。
+    // 外层 map 仅保存 shared_ptr，复制成本不随驻留点数增长。
     std::map<uint64_t, std::shared_ptr<SeriesPoints>> series;
     size_t point_count() const {
         size_t count = 0;
@@ -560,88 +605,206 @@ struct StreamingReader {
     }
 };
 
-constexpr size_t kInlineReadBytes = 1 * 1024 * 1024;
-
-bool ReadSeriesPoints(const SstableMetadata& sstable, uint64_t series_id,
-                      std::vector<VersionedPoint>* out) {
-    const auto it = sstable.series.find(series_id);
-    if (it == sstable.series.end()) return true;
-    const auto& entry = it->second;
-    out->reserve(entry.point_count);
-    if (sstable.encoding == kEncodedSstableMagic) {
-        if (entry.byte_length <= kInlineReadBytes) {
-            const int fd = ::open(sstable.path.c_str(), O_RDONLY);
-            if (fd < 0) return false;
-            std::vector<char> buffer(entry.byte_length);
-            const ssize_t bytes =
-                ::pread(fd, buffer.data(), buffer.size(), entry.offset);
-            ::close(fd);
-            if (bytes <= 0) return false;
-            std::string payload(buffer.data(), static_cast<size_t>(bytes));
-            size_t offset = 0;
-            for (uint64_t i = 0; i < entry.point_count; ++i) {
-                uint64_t sid = 0;
-                uint64_t zigzag_timestamp = 0;
-                double value = 0.0;
-                uint64_t version = 0;
-                if (!ReadUvarint(payload, offset, &sid) ||
-                    !ReadUvarint(payload, offset, &zigzag_timestamp) ||
-                    !Read(payload, offset, &value) ||
-                    !ReadUvarint(payload, offset, &version)) {
-                    return false;
-                }
-                out->push_back({{sid, ZigzagDecode(zigzag_timestamp), value},
-                                static_cast<CommitVersion>(version)});
-            }
-            return true;
+// 查询只解码已在 Open 时校验过的 SST；每源固定 8 KiB，不再逐字节计算 hash。
+class QueryReader {
+public:
+    QueryReader(const std::filesystem::path& path, uint64_t offset, uint64_t end)
+        : offset_(offset), end_(end) {
+        fd_ = ::open(path.c_str(), O_RDONLY);
+        if (fd_ < 0) {
+            throw std::system_error(errno, std::generic_category(), "open SST query");
         }
-        StreamingReader reader(sstable.path);
-        reader.in.seekg(entry.offset, std::ios::beg);
-        if (!reader.in) return false;
-        for (uint64_t i = 0; i < entry.point_count; ++i) {
-            uint64_t sid = 0;
-            uint64_t zigzag_timestamp = 0;
-            double value = 0.0;
-            uint64_t version = 0;
-            if (!reader.ReadUvarint(&sid) ||
-                !reader.ReadUvarint(&zigzag_timestamp) ||
-                !reader.ReadDouble(&value) ||
-                !reader.ReadUvarint(&version)) {
-                return false;
-            }
-            out->push_back({{sid, ZigzagDecode(zigzag_timestamp), value},
-                            static_cast<CommitVersion>(version)});
-        }
-        return true;
     }
-    const int fd = ::open(sstable.path.c_str(), O_RDONLY);
-    if (fd < 0) return false;
-    const size_t record_size = sizeof(uint64_t) + sizeof(int64_t) +
-                               sizeof(double) + sizeof(CommitVersion);
-    std::vector<char> buffer(entry.point_count * record_size);
-    const ssize_t bytes =
-        ::pread(fd, buffer.data(), buffer.size(), entry.offset);
-    const size_t complete = static_cast<size_t>(bytes) / record_size;
-    for (size_t j = 0; j < complete; ++j) {
-        const char* record = buffer.data() + j * record_size;
-        uint64_t sid = 0;
+
+    ~QueryReader() { ::close(fd_); }
+    QueryReader(const QueryReader&) = delete;
+    QueryReader& operator=(const QueryReader&) = delete;
+
+    void Seek(uint64_t offset, uint64_t end) {
+        end_ = end;
+        if (offset >= offset_ && offset - offset_ <= size_) {
+            position_ = static_cast<size_t>(offset - offset_);
+        } else {
+            offset_ = offset;
+            position_ = size_ = 0;
+        }
+    }
+
+    uint64_t ReadUvarint() {
+        uint64_t value = 0;
+        for (unsigned shift = 0; shift < 64; shift += 7) {
+            if (position_ == size_) Refill();
+            const uint8_t byte = static_cast<uint8_t>(buffer_[position_++]);
+            if (shift == 63 && byte > 1) {
+                throw std::runtime_error("invalid SST query varint");
+            }
+            value |= static_cast<uint64_t>(byte & 0x7f) << shift;
+            if ((byte & 0x80) == 0) return value;
+        }
+        throw std::runtime_error("invalid SST query varint");
+    }
+
+    double ReadDouble() {
+        double value;
+        ReadBytes(&value, sizeof(value));
+        return value;
+    }
+
+    void ReadBytes(void* output, size_t length) {
+        auto* target = static_cast<char*>(output);
+        while (length != 0) {
+            if (position_ == size_) Refill();
+            const size_t count = std::min(length, size_ - position_);
+            std::memcpy(target, buffer_.data() + position_, count);
+            position_ += count;
+            target += count;
+            length -= count;
+        }
+    }
+
+private:
+    void Refill() {
+        offset_ += position_;
+        position_ = size_ = 0;
+        if (offset_ >= end_) {
+            throw std::runtime_error("truncated SST query record");
+        }
+        const size_t length = static_cast<size_t>(
+            std::min<uint64_t>(buffer_.size(), end_ - offset_));
+        ssize_t count;
+        do {
+            count = ::pread(fd_, buffer_.data(), length,
+                            static_cast<off_t>(offset_));
+        } while (count < 0 && errno == EINTR);
+        if (count < 0) {
+            throw std::system_error(errno, std::generic_category(), "pread SST query");
+        }
+        if (count == 0) {
+            throw std::runtime_error("truncated SST query record");
+        }
+        // 正数短读仍可继续从实际读取的末尾 refill，只有 0 才表示截断。
+        size_ = static_cast<size_t>(count);
+    }
+
+    int fd_{-1};
+    uint64_t offset_;
+    uint64_t end_;
+    size_t position_{0};
+    size_t size_{0};
+    std::array<char, 8 * 1024> buffer_;
+};
+
+// 每个输入 SST 只持有固定缓冲和当前点；跨 series 复用文件描述符。
+class SeriesReader {
+public:
+    explicit SeriesReader(const SstableMetadata& sstable)
+        : fd_(::open(sstable.path.c_str(), O_RDONLY)),
+          raw_(sstable.encoding == kWalMagic) {}
+    ~SeriesReader() {
+        if (fd_ >= 0) ::close(fd_);
+    }
+    SeriesReader(const SeriesReader&) = delete;
+    SeriesReader& operator=(const SeriesReader&) = delete;
+
+    bool IsOpen() const { return fd_ >= 0; }
+    void Start(const SstableIndexEntry& entry) {
+        series_id_ = entry.series_id;
+        offset_ = entry.offset;
+        unread_bytes_ = entry.byte_length;
+        remaining = entry.point_count;
+        position_ = size_ = 0;
+        have_timestamp_ = false;
+    }
+
+    bool Next(VersionedPoint* point) {
+        uint64_t series_id = 0;
         int64_t timestamp = 0;
         double value = 0.0;
         CommitVersion version = 0;
-        std::memcpy(&sid, record, sizeof(uint64_t));
-        std::memcpy(&timestamp, record + sizeof(uint64_t), sizeof(int64_t));
-        std::memcpy(&value,
-                    record + sizeof(uint64_t) + sizeof(int64_t),
-                    sizeof(double));
-        std::memcpy(&version,
-                    record + sizeof(uint64_t) + sizeof(int64_t) +
-                        sizeof(double),
-                    sizeof(CommitVersion));
-        out->push_back({{sid, timestamp, value}, version});
+        if (raw_) {
+            if (!ReadBytes(&series_id, sizeof(series_id)) ||
+                !ReadBytes(&timestamp, sizeof(timestamp)) ||
+                !ReadBytes(&value, sizeof(value)) ||
+                !ReadBytes(&version, sizeof(version))) return false;
+        } else {
+            uint64_t zigzag_timestamp = 0;
+            if (!ReadVarint(&series_id) || !ReadVarint(&zigzag_timestamp) ||
+                !ReadBytes(&value, sizeof(value)) || !ReadVarint(&version)) {
+                return false;
+            }
+            timestamp = ZigzagDecode(zigzag_timestamp);
+        }
+        if (series_id != series_id_ ||
+            (have_timestamp_ && timestamp < last_timestamp_)) return false;
+        last_timestamp_ = timestamp;
+        have_timestamp_ = true;
+        --remaining;
+        // 必须恰好消费索引中的整个 chunk，截断/错误长度不能当作 EOF。
+        if (remaining == 0 && (unread_bytes_ != 0 || position_ != size_)) {
+            return false;
+        }
+        *point = {{series_id, timestamp, value}, version};
+        return true;
     }
-    ::close(fd);
-    return complete == entry.point_count;
-}
+
+    uint64_t remaining{0};
+
+private:
+    bool Refill() {
+        const size_t length = static_cast<size_t>(
+            std::min<uint64_t>(unread_bytes_, sizeof(buffer_)));
+        if (length == 0) return false;
+        ssize_t bytes;
+        do {
+            bytes = ::pread(fd_, buffer_, length, static_cast<off_t>(offset_));
+        } while (bytes < 0 && errno == EINTR);
+        if (bytes <= 0) return false;
+        size_ = static_cast<size_t>(bytes);
+        position_ = 0;
+        offset_ += size_;
+        unread_bytes_ -= size_;
+        return true;
+    }
+
+    bool ReadBytes(void* output, size_t length) {
+        auto* bytes = static_cast<char*>(output);
+        while (length != 0) {
+            if (position_ == size_ && !Refill()) return false;
+            const size_t count = std::min(length, size_ - position_);
+            std::memcpy(bytes, buffer_ + position_, count);
+            bytes += count;
+            length -= count;
+            position_ += count;
+        }
+        return true;
+    }
+
+    bool ReadVarint(uint64_t* value) {
+        uint64_t result = 0;
+        for (unsigned shift = 0; shift < 64; shift += 7) {
+            if (position_ == size_ && !Refill()) return false;
+            const auto byte = static_cast<uint8_t>(buffer_[position_++]);
+            if (shift == 63 && byte > 1) return false;
+            result |= static_cast<uint64_t>(byte & 0x7f) << shift;
+            if ((byte & 0x80) == 0) {
+                *value = result;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    int fd_;
+    bool raw_;
+    char buffer_[64 * 1024];
+    uint64_t series_id_{0};
+    uint64_t offset_{0};
+    uint64_t unread_bytes_{0};
+    size_t position_{0};
+    size_t size_{0};
+    int64_t last_timestamp_{0};
+    bool have_timestamp_{false};
+};
 
 }  // namespace
 
@@ -661,12 +824,14 @@ Cursor::Cursor(std::vector<AggregateResult> results)
 std::optional<DataPoint> Cursor::NextPoint() {
     if (closed_ || aggregate_) return std::nullopt;
     if (point_generator_) {
-        auto point = point_generator_();
-        if (!point && !close_callback_called_) {
-            close_callback_called_=true;
-            if (close_callback_) close_callback_();
+        try {
+            auto point = point_generator_();
+            if (!point) Close();
+            return point;
+        } catch (...) {
+            Close();
+            throw;
         }
-        return point;
     }
     if (index_ >= points_.size()) return std::nullopt;
     return points_[index_++];
@@ -678,14 +843,16 @@ std::optional<AggregateResult> Cursor::NextAggregate() {
 }
 
 void Cursor::Close() {
-    if (!close_callback_called_) {
-        close_callback_called_=true;
-        if (close_callback_) close_callback_();
-    }
     closed_ = true;
+    auto callback = std::move(close_callback_);
+    close_callback_ = {};
     points_.clear();
     aggregates_.clear();
     point_generator_ = {};
+    if (!close_callback_called_) {
+        close_callback_called_ = true;
+        if (callback) callback();
+    }
 }
 
 Cursor::~Cursor() {
@@ -841,7 +1008,8 @@ struct Engine::Impl {
 
     Status ValidateBatch(const std::vector<DataPoint>& points) const {
         if (points.empty()) return Status::Error("empty batch");
-        std::map<uint64_t, int64_t> last;
+        std::unordered_map<uint64_t, int64_t> last;
+        last.reserve(points.size());
         for (const auto& pending : write_queue) {
             for (const auto& point : pending->points) {
                 auto it = last.find(point.series_id);
@@ -872,9 +1040,7 @@ struct Engine::Impl {
         return Status::Ok();
     }
 
-    // Appends one point to the (already copy-on-write cloned) shard. The series
-    // map is cloned lazily on first write, so a 10-point batch touching three
-    // series copies three series maps instead of the whole shard.
+    // 恢复时按需复制 series，乱序插入或重复版本只在新增 timestamp 时计数。
     void AppendToMemtable(uint64_t series_id, int64_t timestamp,
                           const DataPoint& point, CommitVersion version) {
         auto& slot = shards[ShardFor(series_id)]->series[series_id];
@@ -883,17 +1049,23 @@ struct Engine::Impl {
         } else if (slot.use_count() != 1) {
             slot = std::make_shared<SeriesPoints>(*slot);
         }
-        (*slot)[timestamp] = VersionedPoint{point, version};
-        last_timestamps[series_id] = timestamp;
-        memtable_bytes += sizeof(DataPoint) + sizeof(CommitVersion);
-        ++hot_series_points[series_id];
+        const bool inserted = slot->Upsert(VersionedPoint{point, version});
+        auto [last, first] = last_timestamps.emplace(series_id, timestamp);
+        if (!first) last->second = std::max(last->second, timestamp);
+        if (inserted) {
+            memtable_bytes += sizeof(DataPoint) + sizeof(CommitVersion);
+            ++hot_series_points[series_id];
+            ++points_since_flush;
+        }
     }
 
     void ApplyPoints(const std::vector<DataPoint>& points, CommitVersion version) {
         std::set<size_t> touched;
         for (const auto& point : points) touched.insert(ShardFor(point.series_id));
         for (const auto shard_id : touched) {
-            shards[shard_id] = std::make_shared<ShardData>(*shards[shard_id]);
+            if (shards[shard_id].use_count() != 1) {
+                shards[shard_id] = std::make_shared<ShardData>(*shards[shard_id]);
+            }
         }
         for (const auto& point : points) {
             AppendToMemtable(point.series_id, point.timestamp_ms, point, version);
@@ -949,67 +1121,98 @@ struct Engine::Impl {
 
     void ApplyFragment(size_t shard_id, const ShardFragment& fragment) {
         std::lock_guard lock(*shard_mutex[shard_id]);
-        // No read view or flush holds this shard: mutate in place. This is the
-        // steady state for write-only paths (bulk import), where copying the
-        // series maps on every commit is pure overhead.
-        if (shards[shard_id].use_count() == 1) {
-            auto& shard = *shards[shard_id];
-            for (const auto& point : fragment.points) {
-                auto& slot = shard.series[point.point.series_id];
-                if (!slot) slot = std::make_shared<SeriesPoints>();
-                (*slot)[point.point.timestamp_ms] = point;
-            }
-            return;
+        if (shards[shard_id].use_count() != 1) {
+            shards[shard_id] = std::make_shared<ShardData>(*shards[shard_id]);
         }
-        auto next = std::make_shared<ShardData>(*shards[shard_id]);
         for (const auto& point : fragment.points) {
-            auto& slot = next->series[point.point.series_id];
+            auto& slot = shards[shard_id]->series[point.point.series_id];
             if (!slot) {
                 slot = std::make_shared<SeriesPoints>();
             } else if (slot.use_count() != 1) {
+                // shard 已独占时，未修改过的 series 仍可能被更早的快照共享。
                 slot = std::make_shared<SeriesPoints>(*slot);
             }
-            (*slot)[point.point.timestamp_ms] = point;
+            slot->Upsert(point);
         }
-        shards[shard_id] = next;
     }
 
     Status WriteMergedShard(
         const std::vector<std::shared_ptr<SstableMetadata>>& sources,
         SstableWriter* writer, int64_t merge_cutoff, CommitVersion merge_version) {
-        std::set<uint64_t> series_ids;
-        for (const auto& sstable : sources) {
-            for (const auto& [series_id, _] : sstable->series) {
-                series_ids.insert(series_id);
+        using SeriesIterator = decltype(SstableMetadata::series)::const_iterator;
+        using SeriesItem = std::pair<uint64_t, size_t>;
+        std::vector<SeriesIterator> positions;
+        std::vector<std::unique_ptr<SeriesReader>> readers(sources.size());
+        std::priority_queue<SeriesItem, std::vector<SeriesItem>,
+                            std::greater<SeriesItem>> series_heap;
+        positions.reserve(sources.size());
+        for (size_t i = 0; i < sources.size(); ++i) {
+            positions.push_back(sources[i]->series.begin());
+            if (positions[i] == sources[i]->series.end()) continue;
+            readers[i] = std::make_unique<SeriesReader>(*sources[i]);
+            if (!readers[i]->IsOpen()) {
+                return Status::Error("compaction open failed: " +
+                                     sources[i]->path.string());
             }
+            series_heap.emplace(positions[i]->first, i);
         }
-        for (const uint64_t series_id : series_ids) {
-            std::map<int64_t, VersionedPoint> merged;
-            const auto insert = [&](int64_t timestamp,
-                                    const VersionedPoint& point) {
-                if (timestamp < merge_cutoff) return;
-                auto [it, ok] = merged.emplace(timestamp, point);
-                if (!ok && point.version > it->second.version) {
-                    it->second = point;
-                }
-            };
-            for (const auto& sstable : sources) {
-                if (sstable->series.find(series_id) ==
-                    sstable->series.end()) {
-                    continue;
-                }
-                std::vector<VersionedPoint> points;
-                if (!ReadSeriesPoints(*sstable, series_id, &points)) {
-                    return Status::Error("compaction read failed");
-                }
-                for (const auto& point : points) {
-                    insert(point.point.timestamp_ms, point);
-                }
+        struct Item {
+            VersionedPoint point;
+            size_t source;
+        };
+        struct ItemGreater {
+            bool operator()(const Item& left, const Item& right) const {
+                return std::tie(left.point.point.timestamp_ms, left.source) >
+                       std::tie(right.point.point.timestamp_ms, right.source);
             }
-            for (const auto& [timestamp, point] : merged) {
-                if (point.version > merge_version) continue;
-                writer->Append(series_id, timestamp, point.point.value,
-                               point.version);
+        };
+        std::priority_queue<Item, std::vector<Item>, ItemGreater> point_heap;
+        const auto advance = [&](size_t i) {
+            if (readers[i]->remaining == 0) return true;
+            VersionedPoint point;
+            if (!readers[i]->Next(&point)) return false;
+            point_heap.push({point, i});
+            return true;
+        };
+        const auto read_error = [&](size_t i) {
+            return Status::Error("compaction read failed: " +
+                                 sources[i]->path.string());
+        };
+        // 两个堆均至多 k 项，不复制完整 series 集合或热点的所有点。
+        while (!series_heap.empty()) {
+            const uint64_t series_id = series_heap.top().first;
+            do {
+                const size_t i = series_heap.top().second;
+                series_heap.pop();
+                readers[i]->Start(positions[i]->second);
+                if (!advance(i)) return read_error(i);
+                if (++positions[i] != sources[i]->series.end()) {
+                    series_heap.emplace(positions[i]->first, i);
+                }
+            } while (!series_heap.empty() &&
+                     series_heap.top().first == series_id);
+            while (!point_heap.empty()) {
+                Item best = point_heap.top();
+                point_heap.pop();
+                if (!advance(best.source)) return read_error(best.source);
+                while (!point_heap.empty() &&
+                       point_heap.top().point.point.timestamp_ms ==
+                           best.point.point.timestamp_ms) {
+                    const Item duplicate = point_heap.top();
+                    point_heap.pop();
+                    if (duplicate.point.version > best.point.version) {
+                        best = duplicate;
+                    }
+                    if (!advance(duplicate.source)) {
+                        return read_error(duplicate.source);
+                    }
+                }
+                // 与原实现一致：先取最大版本，再应用合并视图的版本上界。
+                if (best.point.point.timestamp_ms < merge_cutoff ||
+                    best.point.version > merge_version) continue;
+                writer->Append(series_id, best.point.point.timestamp_ms,
+                               best.point.point.value, best.point.version);
+                if (!writer->out) return Status::Error("SSTable write failed");
             }
         }
         return Status::Ok();
@@ -2240,10 +2443,23 @@ Status Engine::WriteBatch(const std::vector<DataPoint>& points,
             continue;
         }
         size_t reserved_bytes = 0;
-        auto projected = impl_->hot_series_points;
+        // Only the candidate's series can violate its hot-series reservation.
+        // Copying the entire live-series map here costs O(series_count) per
+        // batch (10000 allocations in the normal uniform workload).
+        std::unordered_map<uint64_t, uint64_t> projected;
+        projected.reserve(counts.size());
+        for (const auto& [series, count] : counts) {
+            (void)count;
+            const auto current = impl_->hot_series_points.find(series);
+            projected.emplace(series, current == impl_->hot_series_points.end()
+                                      ? 0 : current->second);
+        }
         for (const auto& pending : impl_->write_queue) {
             reserved_bytes += pending->points.size() * kPointBytes;
-            for (const auto& point : pending->points) ++projected[point.series_id];
+            for (const auto& point : pending->points) {
+                const auto found = projected.find(point.series_id);
+                if (found != projected.end()) ++found->second;
+            }
         }
         bool pressure = impl_->memtable_bytes >
                             impl_->options.max_memtable_bytes - batch_bytes ||
@@ -2278,14 +2494,41 @@ Status Engine::WriteBatch(const std::vector<DataPoint>& points,
 }
 
 Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
-                    int64_t end, std::unique_ptr<Cursor>* cursor) const {
+                    int64_t end, std::unique_ptr<Cursor>* cursor) const try {
     if (!cursor) return Status::Error("cursor output is null");
     if (start > end) return Status::Error("start must not exceed end");
+    // 查询打开/首条解码失败也必须归还 view 和 gate；获取顺序保持不变。
+    struct ScanLease {
+        std::shared_ptr<Impl> impl;
+        ReadView view;
+        bool active_view{false};
+        bool active_scan{false};
+
+        ~ScanLease() {
+            if (active_view) {
+                std::lock_guard lock(impl->mutex);
+                --impl->active_read_views;
+                for (const auto& sstable : view.sstables) --sstable->refs;
+            }
+            view = {};
+            if (active_scan) {
+                {
+                    std::lock_guard gate(impl->scan_mu);
+                    --impl->active_scans;
+                }
+                impl->scan_cv.notify_one();
+            }
+        }
+    };
+    auto lease = std::make_shared<ScanLease>();
+    lease->impl = impl_;
     std::unique_lock lock(impl_->mutex);
     if (impl_->closed || impl_->closing) return Status::Error("engine is closed");
     if (!impl_->storage_error.ok) return impl_->storage_error;
-    const auto view = impl_->ViewLocked();
+    lease->view = impl_->ViewLocked();
+    const auto& view = lease->view;
     ++impl_->active_read_views;
+    lease->active_view = true;
     // The view (shard snapshots + referenced SSTables) is immutable, so the
     // cursor decodes and merges without the global lock: a long scan no longer
     // blocks writers, and its memory does not grow with the result size.
@@ -2298,6 +2541,7 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
             return impl_->active_scans < Impl::kMaxConcurrentScans;
         });
         ++impl_->active_scans;
+        lease->active_scan = true;
     }
 
     // Streaming scan: one source per (series, SSTable) plus one per series for
@@ -2307,22 +2551,17 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
     struct Source {
         uint64_t series_id{};
         std::shared_ptr<const SeriesPoints> memtable;
-        SeriesPoints::const_iterator mem_it;
-        SeriesPoints::const_iterator mem_end;
-        std::unique_ptr<StreamingReader> file;
+        size_t mem_index{0};
+        size_t mem_end{0};
+        std::unique_ptr<QueryReader> file;
         uint64_t remaining{0};
         // Page index of the series chunk (encoded SSTables only). Drives
         // seeking past pages whose time range misses the query.
         const std::vector<SstablePageIndexEntry>* pages{nullptr};
         size_t page_index{0};
-        // File offset of the next record to decode; lets page advancement skip
-        // the seek when pages are contiguous (the common full-scan case).
-        uint64_t current_offset{0};
+        uint64_t file_end{0};
         // Legacy raw (fixed record) SSTables are still readable.
         bool raw{false};
-        std::unique_ptr<std::ifstream> raw_file;
-        std::streamoff raw_offset{0};
-        uint64_t raw_index{0};
     };
     struct Item {
         int64_t timestamp{};
@@ -2359,8 +2598,9 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
             auto source = std::make_shared<Source>();
             source->series_id = series_id;
             source->memtable = series_it->second;
-            source->mem_it = series_it->second->begin();
-            source->mem_end = series_it->second->end();
+            source->mem_index = source->memtable->LowerBoundIndex(
+                std::max(start, view.cutoff));
+            source->mem_end = source->memtable->LowerBoundIndex(end);
             state->sources.push_back(std::move(source));
         }
         for (const auto& sstable : view.sstables) {
@@ -2371,11 +2611,10 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
             if (entry.max_timestamp < start || entry.min_timestamp >= end) continue;
             auto source = std::make_shared<Source>();
             source->series_id = series_id;
+            source->file_end = entry.offset + entry.byte_length;
+            source->file = std::make_unique<QueryReader>(
+                sstable->path, entry.offset, source->file_end);
             if (sstable->encoding == kEncodedSstableMagic) {
-                source->file = std::make_unique<StreamingReader>(sstable->path);
-                if (!source->file->in) continue;
-                source->file->in.seekg(entry.offset, std::ios::beg);
-                if (!source->file->in) continue;
                 // A range that covers the whole chunk decodes sequentially; only
                 // selective ranges pay for page traversal/seeking.
                 const bool full_range =
@@ -2387,14 +2626,9 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
                     source->remaining = 0;
                     source->pages = &entry.pages;
                     source->page_index = 0;
-                    source->current_offset = entry.offset;
                 }
             } else {
                 source->raw = true;
-                source->raw_file = std::make_unique<std::ifstream>(
-                    sstable->path, std::ios::binary);
-                if (!*source->raw_file) continue;
-                source->raw_offset = static_cast<std::streamoff>(entry.offset);
                 source->remaining = entry.point_count;
             }
             state->sources.push_back(std::move(source));
@@ -2410,18 +2644,15 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
             item.source = index;
             item.series_id = source.series_id;
             if (source.memtable) {
-                while (source.mem_it != source.mem_end &&
-                       (source.mem_it->first < state->start ||
-                        source.mem_it->first >= state->end ||
-                        source.mem_it->first < cutoff ||
-                        source.mem_it->second.version > visible)) {
-                    ++source.mem_it;
+                while (source.mem_index < source.mem_end &&
+                       (*source.memtable)[source.mem_index].version > visible) {
+                    ++source.mem_index;
                 }
-                if (source.mem_it == source.mem_end) return;
-                item.timestamp = source.mem_it->first;
-                item.value = source.mem_it->second.point.value;
-                item.version = source.mem_it->second.version;
-                ++source.mem_it;
+                if (source.mem_index >= source.mem_end) return;
+                const auto& point = (*source.memtable)[source.mem_index++];
+                item.timestamp = point.point.timestamp_ms;
+                item.value = point.point.value;
+                item.version = point.version;
                 state->heap.push(item);
                 return;
             }
@@ -2438,13 +2669,12 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
                         page.max_timestamp < cutoff) {
                         continue;
                     }
-                    if (page.offset != source.current_offset) {
-                        source.file->in.seekg(
-                            static_cast<std::streamoff>(page.offset),
-                            std::ios::beg);
-                        if (!source.file->in) return;
-                        source.current_offset = page.offset;
-                    }
+                    // 窄查询预读截止于选中页，不把后续未命中页带入缓冲。
+                    const uint64_t page_end =
+                        source.page_index < source.pages->size()
+                            ? (*source.pages)[source.page_index].offset
+                            : source.file_end;
+                    source.file->Seek(page.offset, page_end);
                     source.remaining = page.point_count;
                     found = true;
                     break;
@@ -2455,16 +2685,7 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
                 constexpr size_t kRecord = sizeof(uint64_t) + sizeof(int64_t) +
                                            sizeof(double) + sizeof(CommitVersion);
                 char record[kRecord];
-                source.raw_file->seekg(
-                    source.raw_offset +
-                        static_cast<std::streamoff>(source.raw_index * kRecord),
-                    std::ios::beg);
-                source.raw_file->read(record, kRecord);
-                if (!*source.raw_file) {
-                    source.remaining = 0;
-                    return;
-                }
-                ++source.raw_index;
+                source.file->ReadBytes(record, kRecord);
                 --source.remaining;
                 uint64_t sid = 0;
                 int64_t timestamp = 0;
@@ -2494,19 +2715,10 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
                 state->heap.push(item);
                 return;
             }
-            uint64_t disk_series = 0;
-            uint64_t zigzag_timestamp = 0;
-            double disk_value = 0.0;
-            uint64_t disk_version = 0;
-            const uint64_t bytes_before = source.file->bytes;
-            if (!source.file->ReadUvarint(&disk_series) ||
-                !source.file->ReadUvarint(&zigzag_timestamp) ||
-                !source.file->ReadDouble(&disk_value) ||
-                !source.file->ReadUvarint(&disk_version)) {
-                source.remaining = 0;
-                return;
-            }
-            source.current_offset += source.file->bytes - bytes_before;
+            source.file->ReadUvarint();  // series_id 由已校验的索引确定。
+            const uint64_t zigzag_timestamp = source.file->ReadUvarint();
+            const double disk_value = source.file->ReadDouble();
+            const uint64_t disk_version = source.file->ReadUvarint();
             --source.remaining;
             const int64_t timestamp = ZigzagDecode(zigzag_timestamp);
             if (timestamp >= state->end) {
@@ -2544,26 +2756,21 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
             }
             return DataPoint{best.series_id, best.timestamp, best.value};
         },
-        [impl = impl_, state] {
-            {
-                std::lock_guard lock(impl->mutex);
-                if (impl->active_read_views > 0) --impl->active_read_views;
-                for (const auto& sstable : state->view.sstables) {
-                    if (sstable->refs > 0) --sstable->refs;
-                }
-            }
-            {
-                std::lock_guard gate(impl->scan_mu);
-                if (impl->active_scans > 0) --impl->active_scans;
-            }
-            impl->scan_cv.notify_one();
+        [lease = std::move(lease), state]() mutable {
+            // Cursor 先销毁 generator，再释放 decoder/view，最后归还 gate。
+            state.reset();
+            lease.reset();
         });
     return Status::Ok();
+} catch (const std::system_error& error) {
+    return Status::Error(error.what());
+} catch (const std::runtime_error& error) {
+    return Status::Error(error.what());
 }
 
 Status Engine::Aggregate(const std::vector<uint64_t>& series_ids, int64_t start,
                          int64_t end, int64_t window_ms, AggregateOp operation,
-                         std::unique_ptr<Cursor>* cursor) const {
+                         std::unique_ptr<Cursor>* cursor) const try {
     if (!cursor) return Status::Error("cursor output is null");
     if (operation != AggregateOp::Count && operation != AggregateOp::Sum &&
         operation != AggregateOp::Min && operation != AggregateOp::Max &&
@@ -2627,6 +2834,10 @@ Status Engine::Aggregate(const std::vector<uint64_t>& series_ids, int64_t start,
     }
     *cursor = std::make_unique<Cursor>(std::move(results));
     return Status::Ok();
+} catch (const std::system_error& error) {
+    return Status::Error(error.what());
+} catch (const std::runtime_error& error) {
+    return Status::Error(error.what());
 }
 
 Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
@@ -2702,15 +2913,9 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
         auto& points_by_series = impl_->shards[shard_id]->series;
         for (auto series_it = points_by_series.begin();
              series_it != points_by_series.end();) {
-            // Probe first: only clone the series that actually lose a point.
-            bool expiring = false;
-            for (const auto& [timestamp, _value] : *series_it->second) {
-                if (timestamp < cutoff) {
-                    expiring = true;
-                    break;
-                }
-            }
-            if (!expiring) {
+            // 有序 buffer 只需检查首点；仅复制确实需要删除前缀的 series。
+            if (series_it->second->empty() ||
+                series_it->second->front().point.timestamp_ms >= cutoff) {
                 ++series_it;
                 continue;
             }
@@ -2719,15 +2924,7 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
                     std::make_shared<SeriesPoints>(*series_it->second);
             }
             auto& points = *series_it->second;
-            size_t removed = 0;
-            for (auto point_it = points.begin(); point_it != points.end();) {
-                if (point_it->first < cutoff) {
-                    point_it = points.erase(point_it);
-                    ++removed;
-                } else {
-                    ++point_it;
-                }
-            }
+            const size_t removed = points.ExpireBefore(cutoff);
             if (removed > 0) {
                 impl_->memtable_bytes -= removed * kRecordBytes;
                 impl_->hot_series_points[series_it->first] -= removed;
@@ -2791,7 +2988,7 @@ Status Engine::FlushLocked(bool incremental) {
                 return;
             }
             for (const auto& [_, points] : job->data->series) {
-                for (const auto& [__, value] : *points) {
+                for (const auto& value : *points) {
                     if (value.version <= impl_->last_flushed_version) continue;
                     writer.Append(value.point.series_id,
                                   value.point.timestamp_ms, value.point.value,
@@ -3126,8 +3323,7 @@ SeriesBufferInfo InspectSeriesBuffer(const Engine& engine, uint64_t series_id) {
     const auto& series = impl.shards[shard_id]->series;
     const auto it = series.find(series_id);
     if (it == series.end() || !it->second) return {};
-    // Ordered-map layout: there is no capacity to grow.
-    return {it->second->size(), std::nullopt};
+    return {it->second->size(), it->second->capacity()};
 }
 
 }  // namespace testing

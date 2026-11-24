@@ -945,6 +945,65 @@ void TestCompactionMergesSstables(const std::filesystem::path& path) {
     AssertOk(reopened->Close());
 }
 
+void TestCompactionLargeHotSeries(const std::filesystem::path& path) {
+    const Options options{.shard_count = 1,
+                          .memtable_max_points = 100000,
+                          .enable_background_compaction = false,
+                          .enable_background_gc = false};
+    constexpr uint64_t series_id = std::numeric_limits<uint64_t>::max();
+    constexpr int64_t per_file = 60001;
+    constexpr int64_t total = 8 * per_file;
+    constexpr int64_t base = -400000;
+    constexpr int64_t expired = total / 3;
+    Status status;
+    auto engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    for (int64_t file = 0; file < 8; ++file) {
+        std::vector<DataPoint> batch;
+        batch.reserve(per_file);
+        for (int64_t i = file * per_file; i < (file + 1) * per_file; ++i) {
+            batch.push_back({series_id, base + i, static_cast<double>(i)});
+        }
+        AssertOk(engine->WriteBatch(batch));
+        AssertOk(engine->Flush());
+    }
+    EngineStats stats;
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.live_sstable_count == 8);
+    std::unique_ptr<Cursor> held;
+    AssertOk(engine->Scan({series_id}, base, base + total, &held));
+    AssertOk(engine->ExpireBefore(base + expired));
+    AssertOk(engine->Compact());
+    AssertOk(engine->GarbageCollect());
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.live_sstable_count == 1 && stats.compaction_count == 1);
+    CHECK(stats.obsolete_sstable_count == 8 && stats.active_read_views == 1);
+    const auto check_points = [&](Cursor* cursor, int64_t first) {
+        for (int64_t i = first; i < total; ++i) {
+            const auto point = cursor->NextPoint();
+            CHECK(point && point->series_id == series_id);
+            CHECK(point->timestamp_ms == base + i);
+            CHECK(point->value == static_cast<double>(i));
+        }
+        CHECK(!cursor->NextPoint());
+    };
+    // 合并和过期之后才继续读取旧视图，包含未预取且已过期的全部输入页。
+    check_points(held.get(), 0);
+    held->Close();
+    AssertOk(engine->GarbageCollect());
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.obsolete_sstable_count == 0 && stats.sstable_count == 1);
+    std::unique_ptr<Cursor> current;
+    AssertOk(engine->Scan({series_id}, base, base + total, &current));
+    check_points(current.get(), expired);
+    AssertOk(engine->Close());
+    engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    AssertOk(engine->Scan({series_id}, base, base + total, &current));
+    check_points(current.get(), expired);
+    AssertOk(engine->Close());
+}
+
 void TestCompactionDropsExpired(const std::filesystem::path& path) {
     Status status;
     auto engine = Engine::Open(path, Options{4, 100000}, &status);
@@ -1431,6 +1490,185 @@ void WriteWalSegment(const std::filesystem::path& db_path, uint64_t number,
     out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
 }
 
+using CompactionTestPoint = std::pair<DataPoint, CommitVersion>;
+
+// 公共写接口禁止旧时间戳；直接构造带有效校验和的 SST 来覆盖跨文件版本重叠。
+void WriteCompactionSstable(const std::filesystem::path& path, size_t number,
+                            const std::vector<CompactionTestPoint>& points,
+                            bool raw) {
+    std::filesystem::create_directories(path / "sst");
+    std::string payload;
+    for (const auto& [point, version] : points) {
+        if (raw) {
+            AppendRaw(&payload, point.series_id);
+            AppendRaw(&payload, point.timestamp_ms);
+        } else {
+            payload += EncodeUvarint(point.series_id);
+            const uint64_t zigzag =
+                (static_cast<uint64_t>(point.timestamp_ms) << 1) ^
+                static_cast<uint64_t>(point.timestamp_ms >> 63);
+            payload += EncodeUvarint(zigzag);
+        }
+        AppendRaw(&payload, point.value);
+        if (raw) AppendRaw(&payload, version);
+        else payload += EncodeUvarint(version);
+    }
+    std::string bytes;
+    AppendRaw(&bytes, raw ? kWalMagicBytes : uint32_t{0x53535445});
+    AppendRaw(&bytes, static_cast<uint64_t>(points.size()));
+    bytes += payload;
+    AppendRaw(&bytes, Fnv1a(payload));
+    std::ofstream out(path / "sst" / ("shard-00-" + std::to_string(number) + ".sst"),
+                      std::ios::binary | std::ios::trunc);
+    CHECK(out);
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    out.close();
+    CHECK(out);
+}
+
+void WriteCompactionManifest(const std::filesystem::path& path, size_t files,
+                             CommitVersion next_version) {
+    std::string payload = std::to_string(std::numeric_limits<int64_t>::min()) +
+                          " " + std::to_string(next_version) + " " +
+                          std::to_string(files + 1) + "\n";
+    for (size_t i = 1; i <= files; ++i) {
+        payload += "0 sst/shard-00-" + std::to_string(i) + ".sst\n";
+    }
+    std::ofstream out(path / "MANIFEST");
+    CHECK(out);
+    out << payload << "CHECKSUM " << Fnv1a(payload) << '\n';
+    out.close();
+    CHECK(out);
+}
+
+void TestCompactionOverlappingVersions(const std::filesystem::path& path) {
+    constexpr uint64_t hot_series = std::numeric_limits<uint64_t>::max();
+    constexpr CommitVersion version_base = uint64_t{1} << 63;
+    constexpr int64_t count = 7001;
+    constexpr int64_t base = -3500;
+    for (size_t source = 0; source < 8; ++source) {
+        std::vector<CompactionTestPoint> points;
+        points.push_back({{7 + source, 0, static_cast<double>(source)}, 1});
+        if (source % 2 == 0) points.push_back({{100, 1, 100.0}, 2});
+        for (int64_t i = 0; i < count; ++i) {
+            const auto version = version_base + (i + source) % 8 + 1;
+            points.push_back({{hot_series, base + i,
+                               static_cast<double>(source * 100000 + i)}, version});
+            if (i % 128 == 0) {
+                // 同一输入里的重复时间戳也必须参与最大版本去重。
+                points.push_back({{hot_series, base + i, -1.0}, 0});
+            }
+        }
+        WriteCompactionSstable(path, source + 1, points, source % 3 == 0);
+    }
+    WriteCompactionManifest(path, 8, version_base + 9);
+    const Options options{.shard_count = 1,
+                          .enable_background_compaction = false,
+                          .enable_background_gc = false};
+    Status status;
+    auto engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    const auto check_hot = [&](Cursor* cursor, int64_t first) {
+        for (int64_t i = first; i < count; ++i) {
+            const auto point = cursor->NextPoint();
+            const int64_t source = 7 - i % 8;
+            CHECK(point && point->series_id == hot_series);
+            CHECK(point->timestamp_ms == base + i);
+            CHECK(point->value == static_cast<double>(source * 100000 + i));
+        }
+        CHECK(!cursor->NextPoint());
+    };
+    std::unique_ptr<Cursor> held;
+    AssertOk(engine->Scan({hot_series}, base, base + count, &held));
+    constexpr int64_t cutoff = -37;
+    AssertOk(engine->ExpireBefore(cutoff));
+    AssertOk(engine->Compact());
+    AssertOk(engine->GarbageCollect());
+    check_hot(held.get(), 0);
+    held->Close();
+    AssertOk(engine->GarbageCollect());
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({hot_series}, base, base + count, &cursor));
+    check_hot(cursor.get(), cutoff - base);
+    AssertOk(engine->Scan({7, 8, 9, 10, 11, 12, 13, 14, 100}, -1, 2, &cursor));
+    const auto cold = Read(cursor.get());
+    CHECK(cold.size() == 9);
+    for (size_t i = 0; i < 8; ++i) {
+        CHECK(cold[i].series_id == 7 + i && cold[i].timestamp_ms == 0);
+        CHECK(cold[i].value == static_cast<double>(i));
+    }
+    CHECK(cold.back().series_id == 100 && cold.back().value == 100.0);
+    AssertOk(engine->Close());
+    engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    AssertOk(engine->Scan({hot_series}, base, base + count, &cursor));
+    check_hot(cursor.get(), cutoff - base);
+    AssertOk(engine->Close());
+}
+
+void TestCompactionReadFailure(const std::filesystem::path& path) {
+    for (size_t mode = 0; mode < 4; ++mode) {
+        const auto db = path / std::to_string(mode);
+        std::vector<CompactionTestPoint> points;
+        for (int64_t i = 0; i < 5001; ++i) {
+            points.push_back({{std::numeric_limits<uint64_t>::max(), i,
+                               static_cast<double>(i)}, 1});
+        }
+        const bool raw = mode == 1;
+        WriteCompactionSstable(db, 1, points, raw);
+        WriteCompactionSstable(db, 2, points, raw);
+        WriteCompactionManifest(db, 2, 2);
+        const Options options{.shard_count = 1,
+                              .enable_background_compaction = false,
+                              .enable_background_gc = false};
+        Status status;
+        auto engine = Engine::Open(db, options, &status);
+        AssertOk(status);
+        std::ifstream manifest_before(db / "MANIFEST");
+        const std::string before(std::istreambuf_iterator<char>(manifest_before), {});
+        manifest_before.close();
+        const auto source = db / "sst" / "shard-00-1.sst";
+        const auto backup = source.string() + ".backup";
+        std::filesystem::rename(source, backup);
+        if (mode < 2) {
+            std::filesystem::copy_file(backup, source);
+            // 第一缓冲完整可读，第二次 refill 后遇到截断，而不是只测打开失败。
+            std::filesystem::resize_file(source, 12 + 64 * 1024 + 1);
+        } else if (mode == 3) {
+            // open 目录会成功，但 pread 返回负值，不能转换为无符号的记录数。
+            CHECK(std::filesystem::create_directory(source));
+        }
+        const auto compact_status = engine->Compact();
+        CHECK(!compact_status.ok);
+        CHECK(compact_status.message.find(mode == 2 ? "compaction open failed" :
+                                                     "compaction read failed") !=
+              std::string::npos);
+        std::ifstream manifest_after(db / "MANIFEST");
+        const std::string after(std::istreambuf_iterator<char>(manifest_after), {});
+        CHECK(before == after);
+        for (const auto& file : std::filesystem::directory_iterator(db / "sst")) {
+            CHECK(file.path().extension() != ".tmp");
+        }
+        if (mode == 3) CHECK(std::filesystem::remove(source));
+        std::filesystem::rename(backup, source);
+        CHECK(!engine->Close().ok);
+        engine.reset();
+        engine = Engine::Open(db, options, &status);
+        AssertOk(status);
+        AssertOk(engine->Compact());
+        std::unique_ptr<Cursor> cursor;
+        AssertOk(engine->Scan({std::numeric_limits<uint64_t>::max()}, 0, 5001,
+                              &cursor));
+        const auto recovered = Read(cursor.get());
+        CHECK(recovered.size() == points.size());
+        for (size_t i = 0; i < recovered.size(); ++i) {
+            CHECK(recovered[i].timestamp_ms == static_cast<int64_t>(i));
+            CHECK(recovered[i].value == static_cast<double>(i));
+        }
+        AssertOk(engine->Close());
+    }
+}
+
 // Normal append keeps the per-series buffer time-ordered, including across the
 // vector growth boundary and with two series interleaved in one batch.
 void TestVectorAppendOrder(const std::filesystem::path& path) {
@@ -1492,6 +1730,9 @@ void TestVectorReplayOrder(const std::filesystem::path& path) {
     EngineStats replayed;
     AssertOk(engine->GetStats(&replayed));
     CHECK(replayed.wal_bytes_replayed > 0);
+    // SST 中的最大时间是 300，乱序恢复不能把写入水位退到 100。
+    CHECK(!engine->Put({7, 250, 25.0}).ok);
+    CHECK(!engine->Put({7, 300, 30.0}).ok);
     std::unique_ptr<Cursor> cursor;
     AssertOk(engine->Scan({7}, 0, 1000, &cursor));
     const auto points = Read(cursor.get());
@@ -1511,6 +1752,158 @@ void TestVectorReplayOrder(const std::filesystem::path& path) {
         CHECK(flushed_points[i].timestamp_ms ==
                100 + static_cast<int64_t>(i) * 100);
     }
+    AssertOk(engine->Close());
+}
+
+// 同一 memtable 内乱序恢复重复 timestamp，必须保留最高 version 且只计一个点。
+void TestVectorReplayDedupAndAccounting(const std::filesystem::path& path) {
+    constexpr size_t kPointBytes = sizeof(DataPoint) + sizeof(CommitVersion);
+    const Options options{.shard_count = 1,
+                          .memtable_max_points = 100000,
+                          .enable_background_compaction = false,
+                          .max_memtable_bytes = 5 * kPointBytes,
+                          .hot_series_point_limit = 5};
+    Status status;
+    {
+        auto engine = Engine::Open(path, options, &status);
+        AssertOk(status);
+        AssertOk(engine->Close());
+    }
+    WriteWalSegment(path, 1, TxnRecordBytes(1, 7, 300, 3.0) +
+                                 TxnRecordBytes(4, 7, 100, 4.0) +
+                                 TxnRecordBytes(5, 7, 300, 5.0) +
+                                 TxnRecordBytes(2, 7, 100, 2.0) +
+                                 TxnRecordBytes(3, 7, 200, 3.0) +
+                                 TxnRecordBytes(4, 7, 300, 4.0) +
+                                 TxnRecordBytes(7, 7, 200, 7.0) +
+                                 TxnRecordBytes(6, 7, 50, 0.6) +
+                                 TxnRecordBytes(6, 7, 50, 60.0));
+    auto engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    EngineStats stats;
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.wal_bytes_replayed > 0);
+    CHECK(stats.visible_version == 7);
+    CHECK(stats.mutable_points == 4);
+    CHECK(stats.memtable_bytes == 4 * kPointBytes);
+    CHECK(stats.flush_count == 0);
+    const auto buffer = testing::InspectSeriesBuffer(*engine, 7);
+    CHECK(buffer.point_count == 4);
+    CHECK(buffer.capacity.has_value() && *buffer.capacity >= 4);
+
+    std::unique_ptr<Cursor> all;
+    AssertOk(engine->Scan({7}, 0, 400, &all));
+    const auto points = Read(all.get());
+    CHECK(points.size() == 4);
+    CHECK(points[0].timestamp_ms == 50 && points[0].value == 0.6);
+    CHECK(points[1].timestamp_ms == 100 && points[1].value == 4.0);
+    CHECK(points[2].timestamp_ms == 200 && points[2].value == 7.0);
+    CHECK(points[3].timestamp_ms == 300 && points[3].value == 5.0);
+    CHECK(!engine->Put({7, 250, 25.0}).ok);
+    CHECK(!engine->Put({7, 300, 30.0}).ok);
+    // 四个唯一点尚有一个位置，重复 WAL 不能制造内存或热点背压。
+    AssertOk(engine->Put({7, 301, 301.0}));
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.mutable_points == 5 && stats.memtable_bytes == 5 * kPointBytes);
+    CHECK(stats.flush_count == 0);
+
+    std::unique_ptr<Cursor> snapshot;
+    AssertOk(engine->Scan({7}, 100, 301, &snapshot));
+    AssertOk(engine->ExpireBefore(200));
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.mutable_points == 3 && stats.memtable_bytes == 3 * kPointBytes);
+    const auto retained_snapshot = Read(snapshot.get());
+    CHECK(retained_snapshot.size() == 3);
+    CHECK(retained_snapshot[0].timestamp_ms == 100 &&
+          retained_snapshot[0].value == 4.0);
+    CHECK(retained_snapshot[1].timestamp_ms == 200 &&
+          retained_snapshot[1].value == 7.0);
+    CHECK(retained_snapshot[2].timestamp_ms == 300 &&
+          retained_snapshot[2].value == 5.0);
+    std::unique_ptr<Cursor> narrowed;
+    AssertOk(engine->Scan({7}, 100, 301, &narrowed));
+    const auto narrowed_points = Read(narrowed.get());
+    CHECK(narrowed_points.size() == 2);
+    CHECK(narrowed_points[0].timestamp_ms == 200);
+    CHECK(narrowed_points[1].timestamp_ms == 300);
+    AssertOk(engine->Scan({7}, 0, 100, &narrowed));
+    CHECK(Read(narrowed.get()).empty());
+
+    // 前缀删除也要释放逻辑计数，填满后再添一个点才触发自动 flush。
+    AssertOk(engine->Put({7, 302, 302.0}));
+    AssertOk(engine->Put({7, 303, 303.0}));
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.mutable_points == 5 && stats.memtable_bytes == 5 * kPointBytes);
+    CHECK(stats.flush_count == 0);
+    AssertOk(engine->Put({7, 304, 304.0}));
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.flush_count == 1);
+    CHECK(stats.mutable_points == 1 && stats.memtable_bytes == kPointBytes);
+    AssertOk(engine->Close());
+
+    auto reopened = Engine::Open(path, options, &status);
+    AssertOk(status);
+    std::unique_ptr<Cursor> flushed;
+    AssertOk(reopened->Scan({7}, 0, 400, &flushed));
+    const auto flushed_points = Read(flushed.get());
+    CHECK(flushed_points.size() == 6);
+    CHECK(flushed_points[0].timestamp_ms == 200 && flushed_points[0].value == 7.0);
+    CHECK(flushed_points[1].timestamp_ms == 300 && flushed_points[1].value == 5.0);
+    for (size_t i = 2; i < flushed_points.size(); ++i) {
+        CHECK(flushed_points[i].timestamp_ms == 299 + static_cast<int64_t>(i));
+        CHECK(flushed_points[i].value == static_cast<double>(flushed_points[i].timestamp_ms));
+    }
+    AssertOk(reopened->Close());
+}
+
+// 恢复得到的唯一点必须计入 memtable_max_points 的自动 flush 阈值。
+void TestVectorReplayFlushThreshold(const std::filesystem::path& path) {
+    const Options options{.shard_count = 1,
+                          .memtable_max_points = 4,
+                          .enable_background_compaction = false};
+    Status status;
+    {
+        auto engine = Engine::Open(path, options, &status);
+        AssertOk(status);
+        AssertOk(engine->Close());
+    }
+    WriteWalSegment(path, 1, TxnRecordBytes(1, 8, 400, 4.0) +
+                                 TxnRecordBytes(2, 8, 100, 1.0) +
+                                 TxnRecordBytes(3, 8, 300, 3.0) +
+                                 TxnRecordBytes(4, 8, 200, 2.0) +
+                                 TxnRecordBytes(5, 8, 100, 5.0));
+    auto engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    EngineStats stats;
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.mutable_points == 4 && stats.flush_count == 0);
+    std::mutex hook_mutex;
+    std::condition_variable hook_cv;
+    bool flush_reached = false;
+    testing::SetFaultHook([&](const char* stage) {
+        if (std::strcmp(stage, "sstable_before_rename") != 0) return;
+        std::lock_guard lock(hook_mutex);
+        flush_reached = true;
+        hook_cv.notify_one();
+    });
+    AssertOk(engine->Put({8, 401, 401.0}));
+    bool notified = false;
+    {
+        std::unique_lock lock(hook_mutex);
+        notified = hook_cv.wait_for(lock, std::chrono::seconds(2), [&] {
+            return flush_reached;
+        });
+    }
+    testing::SetFaultHook({});
+    AssertOk(engine->GetStats(&stats));
+    CHECK(notified);
+    CHECK(stats.flush_count >= 1);
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({8}, 0, 500, &cursor));
+    const auto points = Read(cursor.get());
+    CHECK(points.size() == 5);
+    CHECK(points[0].timestamp_ms == 100 && points[0].value == 5.0);
+    CHECK(points.back().timestamp_ms == 401);
     AssertOk(engine->Close());
 }
 
@@ -1741,16 +2134,10 @@ void TestCowVectorReallocation(const std::filesystem::path& path) {
     const auto before = testing::InspectSeriesBuffer(*engine, 77);
     CHECK(before.point_count == static_cast<size_t>(kInitial));
 
-    // The vector layout reports the capacity the snapshot buffer actually has, so
-    // growing one past it is what forces the reallocation. The ordered-map layout
-    // has no capacity; there the write only has to be large enough to exercise
-    // the COW clone.
-    const bool measurable = before.capacity.has_value();
-    size_t target = static_cast<size_t>(2 * kInitial + 1);
-    if (measurable) {
-        CHECK(*before.capacity >= before.point_count);
-        target = *before.capacity + 1;
-    }
+    // 必须测得真实 vector capacity，不能用 map 路径绕过重分配验证。
+    CHECK(before.capacity.has_value());
+    CHECK(*before.capacity >= before.point_count);
+    const size_t target = *before.capacity + 1;
     CHECK(target > before.point_count);
     std::vector<DataPoint> second;
     second.reserve(target - before.point_count);
@@ -1762,12 +2149,9 @@ void TestCowVectorReallocation(const std::filesystem::path& path) {
 
     const auto after = testing::InspectSeriesBuffer(*engine, 77);
     CHECK(after.point_count == target);
-    if (measurable) {
-        // Proof that the write outgrew the buffer the snapshot holds.
-        CHECK(after.point_count > *before.capacity);
-        CHECK(after.capacity.has_value());
-        CHECK(*after.capacity >= after.point_count);
-    }
+    CHECK(after.point_count > *before.capacity);
+    CHECK(after.capacity.has_value());
+    CHECK(*after.capacity >= after.point_count);
 
     const auto old_points = Read(old_view.get());
     CHECK(old_points.size() == static_cast<size_t>(kInitial));
@@ -1792,6 +2176,86 @@ void TestCowVectorReallocation(const std::filesystem::path& path) {
     for (size_t i = 0; i < flushed_points.size(); ++i) {
         CHECK(flushed_points[i].timestamp_ms == static_cast<int64_t>(i));
     }
+    AssertOk(engine->Close());
+}
+
+void TestCowSameShardSharedSeries(const std::filesystem::path& path) {
+    const Options options{.shard_count = 1,
+                          .memtable_max_points = 100000,
+                          .enable_background_compaction = false,
+                          .enable_background_gc = false};
+    constexpr uint64_t series_a = 77;
+    constexpr uint64_t series_b = 78;
+    constexpr size_t initial = 100;
+    Status status;
+    auto engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    std::vector<DataPoint> first;
+    for (size_t i = 0; i < initial; ++i) {
+        first.push_back({series_a, static_cast<int64_t>(i), static_cast<double>(i)});
+        first.push_back({series_b, static_cast<int64_t>(i), 1000.0 + i});
+    }
+    AssertOk(engine->WriteBatch(first));
+    const auto before_a = testing::InspectSeriesBuffer(*engine, series_a);
+    const auto before_b = testing::InspectSeriesBuffer(*engine, series_b);
+    CHECK(before_a.point_count == initial && before_b.point_count == initial);
+    CHECK(before_a.capacity.has_value() && before_b.capacity.has_value());
+    CHECK(*before_a.capacity >= initial && *before_b.capacity >= initial);
+
+    // A cursor 只选 A，但 view pin 整个 shard；B cursor 独立捕获同一旧 shard。
+    std::unique_ptr<Cursor> old_a;
+    std::unique_ptr<Cursor> old_b;
+    AssertOk(engine->Scan({series_a}, 0, 100000, &old_a));
+    AssertOk(engine->Scan({series_b}, 0, 100000, &old_b));
+    const auto grow = [&](uint64_t series, size_t target, double base) {
+        std::vector<DataPoint> batch;
+        for (size_t i = initial; i < target; ++i) {
+            batch.push_back({series, static_cast<int64_t>(i), base + i});
+        }
+        AssertOk(engine->WriteBatch(batch));
+    };
+    const size_t target_a = *before_a.capacity + 1;
+    grow(series_a, target_a, 0.0);
+    const auto after_a = testing::InspectSeriesBuffer(*engine, series_a);
+    CHECK(after_a.point_count == target_a && after_a.capacity.has_value());
+    CHECK(*after_a.capacity > *before_a.capacity);
+
+    // 写 A 已克隆外层 shard。期间不捕获新 view，live shard 独占而 B still shared。
+    const auto untouched_b = testing::InspectSeriesBuffer(*engine, series_b);
+    CHECK(untouched_b.point_count == before_b.point_count);
+    CHECK(untouched_b.capacity == before_b.capacity);
+    const size_t target_b = *untouched_b.capacity + 1;
+    grow(series_b, target_b, 1000.0);
+    const auto after_b = testing::InspectSeriesBuffer(*engine, series_b);
+    CHECK(after_b.point_count == target_b && after_b.capacity.has_value());
+    CHECK(after_b.point_count > *untouched_b.capacity);
+    CHECK(*after_b.capacity > *untouched_b.capacity);
+
+    // 后续前缀删除也不能改变两个旧 cursor 的点和值。
+    constexpr size_t cutoff = 50;
+    AssertOk(engine->ExpireBefore(cutoff));
+    const auto check = [&](Cursor* cursor, uint64_t series, size_t lo,
+                           size_t hi, double base) {
+        const auto points = Read(cursor);
+        CHECK(points.size() == hi - lo);
+        for (size_t i = 0; i < points.size(); ++i) {
+            CHECK(points[i].series_id == series);
+            CHECK(points[i].timestamp_ms == static_cast<int64_t>(lo + i));
+            CHECK(points[i].value == base + lo + i);
+        }
+        CHECK(cursor->closed());
+    };
+    check(old_a.get(), series_a, 0, initial, 0.0);
+    check(old_b.get(), series_b, 0, initial, 1000.0);
+    EngineStats stats;
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.active_read_views == 0);
+    CHECK(stats.mutable_points == target_a + target_b - 2 * cutoff);
+    std::unique_ptr<Cursor> fresh;
+    AssertOk(engine->Scan({series_a}, 0, 100000, &fresh));
+    check(fresh.get(), series_a, cutoff, target_a, 0.0);
+    AssertOk(engine->Scan({series_b}, 0, 100000, &fresh));
+    check(fresh.get(), series_b, cutoff, target_b, 1000.0);
     AssertOk(engine->Close());
 }
 
@@ -1905,6 +2369,343 @@ void TestAggregateInvalidOutput(const std::filesystem::path& path) {
     AssertOk(engine->Close());
 }
 
+void TestQueryBufferBoundaries(const std::filesystem::path& path) {
+    constexpr uint64_t series = std::numeric_limits<uint64_t>::max();
+    constexpr int64_t first = std::numeric_limits<int64_t>::min();
+    constexpr size_t count = 4096;
+    const double values[] = {-0.0, std::numeric_limits<double>::max(),
+                             std::numeric_limits<double>::lowest(),
+                             std::numeric_limits<double>::denorm_min(), 0.125};
+    std::vector<DataPoint> batch;
+    bool crossed[3] = {};
+    size_t offset = 0;
+    for (size_t i = 0; i < count; ++i) {
+        batch.push_back({series, first + static_cast<int64_t>(i), values[i % 5]});
+        // 每条记录：10 字节 series、10 字节负时间戳、double、1 字节版本。
+        const size_t lengths[] = {10, 10, sizeof(double), 1};
+        for (size_t field = 0; field < 4; ++field) {
+            if (field < 3 && offset / 8192 != (offset + lengths[field] - 1) / 8192) {
+                crossed[field] = true;
+            }
+            offset += lengths[field];
+        }
+    }
+    CHECK(crossed[0] && crossed[1] && crossed[2]);
+    Status status;
+    const Options options{.shard_count = 1, .memtable_max_points = 100000,
+                          .enable_background_compaction = false,
+                          .enable_background_gc = false};
+    auto engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    AssertOk(engine->WriteBatch(batch));
+    AssertOk(engine->Flush());
+    const auto check = [&](Engine* db, size_t lo, size_t hi) {
+        std::unique_ptr<Cursor> cursor;
+        AssertOk(db->Scan({series}, first + static_cast<int64_t>(lo),
+                          first + static_cast<int64_t>(hi), &cursor));
+        const auto points = Read(cursor.get());
+        CHECK(points.size() == hi - lo);
+        for (size_t i = 0; i < points.size(); ++i) {
+            CHECK(points[i].series_id == series);
+            CHECK(points[i].timestamp_ms == batch[lo + i].timestamp_ms);
+            CHECK(std::memcmp(&points[i].value, &batch[lo + i].value,
+                              sizeof(double)) == 0);
+        }
+    };
+    check(engine.get(), 0, count);
+    check(engine.get(), 127, 513);
+    check(engine.get(), 511, 1537);
+    check(engine.get(), 2049, 2050);
+    check(engine.get(), count - 1, count);
+    AssertOk(engine->Close());
+    engine.reset();
+    engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    check(engine.get(), 0, count);
+    check(engine.get(), 255, 1025);
+    AssertOk(engine->Close());
+}
+
+void TestQueryLegacySequential(const std::filesystem::path& path) {
+    constexpr uint64_t count = 800;
+    const Options options{.shard_count = 1, .memtable_max_points = 100000,
+                          .enable_background_compaction = false,
+                          .enable_background_gc = false};
+    std::vector<DataPoint> batch;
+    std::string payload;
+    for (uint64_t series = 1; series <= 2; ++series) {
+        for (uint64_t i = 0; i < count; ++i) {
+            const int64_t timestamp = static_cast<int64_t>(i) - 400;
+            const double value = static_cast<double>(series * 1000 + i) + 0.25;
+            batch.push_back({series, timestamp, value});
+            AppendRaw(&payload, series);
+            AppendRaw(&payload, timestamp);
+            AppendRaw(&payload, value);
+            AppendRaw(&payload, CommitVersion{1});
+        }
+    }
+    Status status;
+    auto engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    AssertOk(engine->WriteBatch(batch));
+    AssertOk(engine->Close());
+    engine.reset();
+    std::filesystem::path sstable;
+    for (const auto& entry : std::filesystem::directory_iterator(path / "sst")) {
+        if (entry.path().extension() == ".sst") {
+            CHECK(sstable.empty());
+            sstable = entry.path();
+        }
+    }
+    CHECK(!sstable.empty());
+    std::string bytes;
+    AppendRaw(&bytes, kWalMagicBytes);
+    AppendRaw(&bytes, count * 2);
+    bytes += payload;
+    AppendRaw(&bytes, Fnv1a(payload));
+    {
+        std::ofstream out(sstable, std::ios::binary | std::ios::trunc);
+        CHECK(out);
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        CHECK(out);
+    }
+    engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    for (const auto range : {std::pair<int64_t, int64_t>{-400, 400},
+                             {-117, 123}, {398, 400}}) {
+        std::unique_ptr<Cursor> cursor;
+        AssertOk(engine->Scan({2, 1}, range.first, range.second, &cursor));
+        const auto points = Read(cursor.get());
+        CHECK(points.size() == static_cast<size_t>(range.second - range.first) * 2);
+        for (size_t i = 0; i < points.size(); ++i) {
+            const uint64_t series = i % 2 + 1;
+            const int64_t timestamp = range.first + static_cast<int64_t>(i / 2);
+            CHECK(points[i].series_id == series);
+            CHECK(points[i].timestamp_ms == timestamp);
+            CHECK(points[i].value == static_cast<double>(series * 1000 + timestamp + 400) + 0.25);
+        }
+    }
+    AssertOk(engine->Close());
+}
+
+void TestCursorReleasesCaptures() {
+    for (int mode = 0; mode < 3; ++mode) {
+        int callbacks = 0;
+        auto points = std::make_shared<std::vector<DataPoint>>(1, DataPoint{1, 2, 3.0});
+        auto callback_resource = std::make_shared<int>(42);
+        std::weak_ptr<std::vector<DataPoint>> weak_points = points;
+        std::weak_ptr<int> weak_callback = callback_resource;
+        {
+            Cursor cursor(
+                [points, mode, first = true]() mutable -> std::optional<DataPoint> {
+                    if (mode == 2) throw std::runtime_error("测试生成器错误");
+                    if (!first) return std::nullopt;
+                    first = false;
+                    return points->front();
+                },
+                [callback_resource, &callbacks] { ++callbacks; });
+            points.reset();
+            callback_resource.reset();
+            CHECK(!weak_points.expired() && !weak_callback.expired());
+            if (mode == 0) {
+                cursor.Close();
+            } else if (mode == 1) {
+                CHECK(cursor.NextPoint().has_value());
+                CHECK(!cursor.NextPoint().has_value());
+            } else {
+                bool failed = false;
+                try { cursor.NextPoint(); }
+                catch (const std::runtime_error&) { failed = true; }
+                CHECK(failed);
+            }
+            CHECK(cursor.closed());
+            CHECK(weak_points.expired() && weak_callback.expired());
+            CHECK(callbacks == 1);
+            cursor.Close();
+            CHECK(!cursor.NextPoint().has_value());
+            CHECK(callbacks == 1);
+        }
+        CHECK(callbacks == 1);
+    }
+    auto resource = std::make_shared<int>(1);
+    std::weak_ptr<int> weak = resource;
+    Cursor no_callback([resource]() -> std::optional<DataPoint> { return std::nullopt; });
+    resource.reset();
+    CHECK(!no_callback.NextPoint().has_value());
+    CHECK(weak.expired());
+}
+
+void TestQueryReleasesDescriptors(const std::filesystem::path& path) {
+#if defined(__linux__)
+    const auto descriptors = [&] {
+        size_t count = 0;
+        for (const auto& entry : std::filesystem::directory_iterator("/proc/self/fd")) {
+            std::error_code ec;
+            const auto target = std::filesystem::read_symlink(entry.path(), ec);
+            if (!ec && target.string().find(path.string()) == 0 &&
+                target.extension() == ".sst") ++count;
+        }
+        return count;
+    };
+    Status status;
+    auto engine = Engine::Open(path, Options{.shard_count = 1,
+        .memtable_max_points = 100000, .enable_background_compaction = false,
+        .enable_background_gc = false}, &status);
+    AssertOk(status);
+    AssertOk(engine->Put({1, 100, 1.0}));
+    AssertOk(engine->Flush());
+    AssertOk(engine->Put({1, 200, 2.0}));
+    AssertOk(engine->Flush());
+    AssertOk(engine->Put({1, 300, 3.0}));
+    CHECK(descriptors() == 0);
+    for (bool eof : {false, true}) {
+        std::unique_ptr<Cursor> cursor;
+        AssertOk(engine->Scan({1}, 0, 400, &cursor));
+        CHECK(descriptors() == 2);
+        if (eof) CHECK(Read(cursor.get()).size() == 3);
+        else cursor->Close();
+        CHECK(cursor != nullptr && cursor->closed());
+        CHECK(descriptors() == 0);
+        EngineStats stats;
+        AssertOk(engine->GetStats(&stats));
+        CHECK(stats.active_read_views == 0);
+    }
+    AssertOk(engine->Close());
+#else
+    (void)path;
+#endif
+}
+
+void TestQueryTruncatedReadIsError(const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(path, Options{.shard_count = 1,
+        .memtable_max_points = 100000, .enable_background_compaction = false,
+        .enable_background_gc = false}, &status);
+    AssertOk(status);
+    constexpr uint64_t series = std::numeric_limits<uint64_t>::max();
+    constexpr int64_t first = std::numeric_limits<int64_t>::min();
+    std::vector<DataPoint> batch;
+    for (int i = 0; i < 2048; ++i) batch.push_back({series, first + i, i + 0.25});
+    AssertOk(engine->WriteBatch(batch));
+    AssertOk(engine->Flush());
+    std::filesystem::path sstable;
+    for (const auto& entry : std::filesystem::directory_iterator(path / "sst")) {
+        if (entry.path().extension() == ".sst") sstable = entry.path();
+    }
+    CHECK(!sstable.empty());
+    // 截断发生于 metadata 校验后：完整第一页仍可被窄查询读取。
+    std::filesystem::resize_file(sstable, 12 + 128 * 29);
+    std::unique_ptr<Cursor> narrow;
+    AssertOk(engine->Scan({series}, first + 127, first + 128, &narrow));
+    const auto point = narrow->NextPoint();
+    CHECK(point && point->timestamp_ms == first + 127);
+    CHECK(!narrow->NextPoint().has_value());
+    // 初次 pread 返回正数短读，后续 refill 的 0 必须报截断，不能正常 EOF。
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({series}, first, first + 2048, &cursor));
+    size_t decoded = 0;
+    bool failed = false;
+    try { while (cursor->NextPoint()) ++decoded; }
+    catch (const std::runtime_error&) { failed = true; }
+    CHECK(failed && decoded < 2048 && cursor->closed());
+    EngineStats stats;
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.active_read_views == 0);
+    // 多次首条解码失败不得泄漏 gate；次数超过并发上限。
+    for (int i = 0; i < 32; ++i) {
+        std::unique_ptr<Cursor> broken;
+        const auto result = engine->Scan({series}, first + 1000, first + 1001, &broken);
+        CHECK(!result.ok && result.message.find("truncated") != std::string::npos);
+        CHECK(!broken);
+        AssertOk(engine->GetStats(&stats));
+        CHECK(stats.active_read_views == 0);
+    }
+    const auto saved = sstable.string() + ".saved";
+    std::filesystem::rename(sstable, saved);
+    std::unique_ptr<Cursor> missing;
+    const auto open_error = engine->Scan({series}, first, first + 2048, &missing);
+    CHECK(!open_error.ok && open_error.message.find("open SST query") != std::string::npos);
+    CHECK(!missing);
+    // open 目录成功，但 pread 必须报告 EISDIR 而不是空结果。
+    std::filesystem::create_directory(sstable);
+    std::unique_ptr<Cursor> unreadable;
+    const auto read_error = engine->Scan({series}, first, first + 2048, &unreadable);
+    CHECK(!read_error.ok && read_error.message.find("pread SST query") != std::string::npos);
+    CHECK(!unreadable);
+    std::filesystem::remove(sstable);
+    std::filesystem::rename(saved, sstable);
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.active_read_views == 0);
+    AssertOk(engine->Close());
+}
+
+void TestAggregateTruncatedReadIsError(const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(path, Options{.shard_count = 1,
+        .memtable_max_points = 100000, .enable_background_compaction = false,
+        .enable_background_gc = false}, &status);
+    AssertOk(status);
+    constexpr uint64_t series = std::numeric_limits<uint64_t>::max();
+    constexpr int64_t first = std::numeric_limits<int64_t>::min();
+    constexpr int64_t count = 2048;
+    std::vector<DataPoint> batch;
+    for (int64_t i = 0; i < count; ++i) batch.push_back({series, first + i, i + 0.25});
+    AssertOk(engine->WriteBatch(batch));
+    AssertOk(engine->Flush());
+    std::filesystem::path sstable;
+    for (const auto& entry : std::filesystem::directory_iterator(path / "sst")) {
+        if (entry.path().extension() == ".sst") {
+            CHECK(sstable.empty());
+            sstable = entry.path();
+        }
+    }
+    CHECK(!sstable.empty());
+    // 保留头部和完整 8 KiB 缓冲，首条解码成功，后续 refill 才遇到截断。
+    constexpr uint64_t retained = sizeof(uint32_t) + sizeof(uint64_t) + 8 * 1024;
+    CHECK(std::filesystem::file_size(sstable) > retained);
+    std::filesystem::resize_file(sstable, retained);
+    std::unique_ptr<Cursor> scan;
+    AssertOk(engine->Scan({series}, first, first + count, &scan));
+    const auto point = scan->NextPoint();
+    CHECK(point && point->timestamp_ms == first && point->value == 0.25);
+    scan->Close();
+    EngineStats stats;
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.active_read_views == 0);
+    for (const auto operation : {AggregateOp::Count, AggregateOp::Sum}) {
+        for (const bool reuse_output : {false, true}) {
+            std::unique_ptr<Cursor> cursor;
+            if (reuse_output) {
+                cursor = std::make_unique<Cursor>(std::vector<AggregateResult>{
+                    {series, first, first + 1, -1.0, 1}});
+            }
+            const auto* original = cursor.get();
+            Status result;
+            bool threw = false;
+            try {
+                result = engine->Aggregate({series}, first, first + count, 128,
+                                           operation, &cursor);
+            } catch (...) {
+                threw = true;
+            }
+            CHECK(!threw);
+            CHECK(!result.ok && result.message.find("truncated") != std::string::npos);
+            // 失败不发布已累积的桶；空输出仍为空，已有游标及其结果保持原样。
+            CHECK(cursor.get() == original);
+            if (cursor) {
+                const auto previous = cursor->NextAggregate();
+                CHECK(previous && previous->series_id == series &&
+                      previous->bucket_start == first && previous->bucket_end == first + 1 &&
+                      previous->result == -1.0 && previous->count == 1);
+                CHECK(!cursor->NextAggregate().has_value());
+            }
+            AssertOk(engine->GetStats(&stats));
+            CHECK(stats.active_read_views == 0);
+        }
+    }
+    AssertOk(engine->Close());
+}
+
 void TestLatencySampling() {
     std::vector<double> values{1, 2, 3, 4};
     CHECK(bench::Percentile(&values, 0.50) == 2);
@@ -1955,6 +2756,9 @@ int main(int argc, char** argv) {
         {"large_series_paging", [&] { TestLargeSeriesPaging(root / "large_series_paging"); }},
         {"large_series_streaming", [&] { TestLargeSeriesStreaming(root / "large_series_streaming"); }},        {"flush_clears_memtable", [&] { TestFlushClearsMemtable(root / "flush_clears_memtable"); }},
         {"compaction_merges", [&] { TestCompactionMergesSstables(root / "compaction_merges"); }},
+        {"compaction_large_hot_series", [&] { TestCompactionLargeHotSeries(root / "compaction_large_hot_series"); }},
+        {"compaction_overlapping_versions", [&] { TestCompactionOverlappingVersions(root / "compaction_overlapping_versions"); }},
+        {"compaction_read_failure", [&] { TestCompactionReadFailure(root / "compaction_read_failure"); }},
         {"compaction_drops_expired", [&] { TestCompactionDropsExpired(root / "compaction_drops_expired"); }},
         {"multi_level_compaction", [&] { TestMultiLevelCompaction(root / "multi_level_compaction"); }},
         {"negative_ts_recovery", [&] { TestNegativeTimestampRecovery(root / "negative_ts_recovery"); }},
@@ -1970,6 +2774,8 @@ int main(int argc, char** argv) {
         {"wal_separate_dir", [&] { TestWalOnSeparateDir(root / "wal_separate"); }},
         {"vector_append_order", [&] { TestVectorAppendOrder(root / "vector_append"); }},
         {"vector_replay_order", [&] { TestVectorReplayOrder(root / "vector_replay"); }},
+        {"vector_replay_dedup_accounting", [&] { RunWithTimeout([&] { TestVectorReplayDedupAndAccounting(root / "vector_replay_dedup"); }); }},
+        {"vector_replay_flush_threshold", [&] { RunWithTimeout([&] { TestVectorReplayFlushThreshold(root / "vector_replay_flush"); }); }},
         {"duplicate_version_dedup", [&] { TestDuplicateVersionDedup(root / "version_dedup"); }},
         {"cow_read_view_isolation", [&] { TestCowReadViewIsolation(root / "cow_view"); }},
         {"empty_dataset", [&] { TestEmptyDataset(root / "empty_dataset"); }},
@@ -1978,6 +2784,13 @@ int main(int argc, char** argv) {
         {"cow_vector_reallocation", [&] { TestCowVectorReallocation(root / "cow_realloc"); }},
         {"aggregate_extreme_range", [&] { TestAggregateExtremeRange(root / "aggregate_extreme"); }},
         {"zigzag_boundaries", [&] { TestZigzagBoundaries(root / "zigzag"); }},
+        {"query_buffer_boundaries", [&] { TestQueryBufferBoundaries(root / "query_buffer"); }},
+        {"query_legacy_sequential", [&] { TestQueryLegacySequential(root / "query_legacy"); }},
+        {"cursor_releases_captures", [&] { TestCursorReleasesCaptures(); }},
+        {"query_releases_descriptors", [&] { TestQueryReleasesDescriptors(root / "query_descriptors"); }},
+        {"query_truncated_read_is_error", [&] { RunWithTimeout([&] { TestQueryTruncatedReadIsError(root / "query_truncated"); }); }},
+        {"aggregate_truncated_read_is_error", [&] { RunWithTimeout([&] { TestAggregateTruncatedReadIsError(root / "aggregate_truncated"); }); }},
+        {"cow_same_shard_shared_series", [&] { TestCowSameShardSharedSeries(root / "cow_same_shard"); }},
     };
     const std::string filter = argc > 1 ? argv[1] : std::string();
     size_t ran = 0;

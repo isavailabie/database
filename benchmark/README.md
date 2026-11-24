@@ -8,7 +8,7 @@
 | 目录 | 用途 |
 | --- | --- |
 | `benchmark/` | 评测运行器，负责构建、执行、汇总 |
-| `benchmarks/` | 工作负载程序（`tsdb_bench`、`tsdb_mixed_bench`、`tsdb_recover`） |
+| `benchmarks/` | 工作负载程序（`tsdb_bench`、`tsdb_mixed_bench`、`tsdb_recover`、`tsdb_design_bench`） |
 | `src/`、`include/` | 引擎实现与接口 |
 
 ## 运行
@@ -63,11 +63,50 @@ python3 benchmark/runner.py --source "$PWD" --output "$PWD/build/eval-one" \
 
 `--sample-interval` 设置采样间隔（秒，默认 10）；结束时即时唤醒采样线程。
 混合输出 `initial_points` 与 `historical_read_points`，证明预载规模及实际读取历史数据。
-恢复输出校验所有配置序列，`--expected-points` 可要求最低恢复点数；空库和错误返回非零。
+恢复输出校验所有配置序列，`--expected-points` 要求精确匹配恢复点数；空库和错误返回非零。
 读写延迟分位来自每线程最多 50000 个全时段蓄水池样本，采用 nearest-rank。
 混合结果合并各线程样本，是近似估计；线程样本上限不表示累计操作数。
 `rss_bytes` 在历史 metrics 中仍表示整进程峰值，采样中的 `current_rss_bytes`
 才是当前 RSS；驱动与引擎同进程，不能据此宣称严格分离了驱动内存。
 
 报告应给出多轮重复的中位数和波动。吞吐包含驱动侧的数据生成与校验，峰值 RSS 为引擎进程整体
-（驱动只保留一个小批次），磁盘占用为数据库目录下全部文件之和。
+（包括驱动批次、读取校验及混合延迟样本），磁盘占用为数据库目录下全部文件之和。
+
+## 设计级 A/B 对照
+
+`compare.py` 面向基线与候选 Release 二进制，用相同驱动、输入与同步持久化语义执行
+AB / BA / AB 三轮交替。不会复用已有输出或数据目录，也不会用失败、缺指标、非有限值、
+恢复丢点或混合读写错误的结果生成成功摘要。每次的命令、状态、原始输出和多轮中位数
+保存在 `results.json` 与对应日志中。默认六种场景，可用 `--cases` 选择子集。
+
+```bash
+python3 benchmark/compare.py \
+  --baseline /tmp/tsdb-baseline-build --candidate /tmp/tsdb-candidate-build \
+  --output "$PWD/build/perf-ab" --data-root /tmp/tsdb-perf-ab \
+  --points 10000000 --hot-points 3000000 --seconds 30 --repeat 3
+```
+
+**数据目录必须位于被测 Linux 文件系统**；先用 `stat -f -c %T /tmp` 验证，不能假设
+`/tmp` 总是磁盘，也不要把宿主共享挂载与 Linux 容器数据层混在同一组比较中。
+测试时不并行构建、跑回归或启动其他负载。交替顺序降低但不能完全消除磁盘缓存、
+fsync、后台维护和温度漂移的影响；需要同时报告每轮结果，不宣称统计显著性。
+
+| 场景 | 驱动与口径 |
+| --- | --- |
+| uniform / hot | 单写线程、1000 点/批、10000 Series；`seconds` 包括写入及最终 drain；热点为 8 Series 占 50% |
+| append | 单热点驻留追加，最多 100 万点，禁后台合并；`append_seconds` 只测 WriteBatch 循环 |
+| compact | 单热点每 10 万点 Flush、禁后台合并；单独计时显式 Compact，随后逐点校验完整扫描和重开 |
+| scan | 单热点 Flush 后完整扫描三遍；不是点查，也不是冷缓存随机 I/O |
+| mixed | 每版本先预载 N 点，再在同库 4 写 16 读，逐条扫描指定 Series；报告读写吞吐与 p95/p99 |
+
+`tsdb_design_bench append|compact|scan points path repeats` 拒绝已有数据库，正常与
+恢复扫描均校验每点的 Series、timestamp、value 和总点数。`rss_bytes` / `rss_scope`
+表示含写入、扫描、关闭和恢复阶段的整进程峰值，不是合并步骤单独的净内存。
+`recover_seconds` 只测 Open；导入驱动的 `recovery_seconds` 包含 Open 和全库恢复扫描，
+两者不能直接比较。`speedup_percent` 为基线耗时/候选耗时减一，或候选吞吐/基线吞吐
+减一；**速度提升百分比不等于耗时减少百分比**。
+
+设计级驱动必须用同一份 `benchmarks/design.cpp` 分别链接两个版本的库。基线源码没有
+该新驱动时，可在其构建后手动编译，具体命令见
+[`doc/性能优化-2026-11-25.md`](../doc/性能优化-2026-11-25.md)。该报告及其原始指标为本轮数据，
+不能与历史 WSL2 或 macOS 报告拼接成同一实验。

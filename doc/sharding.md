@@ -26,17 +26,19 @@ shard_id = splitmix64(series_id) % 4
 
 ## 2. 内存分片
 
-每个分片一棵**独立的 MemTable**，写时复制（Copy-on-Write）到 Series 粒度：
+每个分片一份**独立的 MemTable**，写时复制（Copy-on-Write）到 Series 粒度：
 
 ```
 ShardData
-└─ map< series_id, shared_ptr< map<timestamp, {value, commit_version}> > >
+└─ map< series_id, shared_ptr< vector<{point, commit_version}> > >
 ```
 
-- 提交时只克隆"本批写到的 Series"，成本与 MemTable 总点数无关；
+- 无快照时递增写入直接追加 vector；共享时仅克隆本批涉及的 Series，复制成本仍与该 Series 驻留点数有关；
+- shard 独占并不表示其全部 Series 独占：先写 A 克隆 shard 后，B 仍可能被旧快照共享，必须再次检查 Series 的 COW；
+- 恢复允许乱序二分定位后插入、重复 timestamp 取最高版本；唯一 timestamp 才增加点数额度，正常追加为摊销 O(1)，大量逆序恢复最坏 O(n²)；
 - 快照（ReadView）持有旧指针，旧查询继续读旧数据；
 - 全局累计 100k 点触发一次 Flush，Flush 后整片清空，内存不随数据总量增长；
-- 每个分片另有 2500 条 `series_id → last_timestamp`，用于顺序校验。
+- 全局保存 `series_id → last_timestamp` 水位表，顺序校验结合 pending 队列；写入准入只投影候选批次涉及的热点计数，不复制完整活跃 Series 表。
 
 示例：`WriteBatch[(101,1000,10.0), (205,1500,20.0), (306,1200,30.0)]`
 
@@ -74,6 +76,11 @@ shard-03-101.sst
 Compaction 是**分片内、分层**的：同片同层 ≥8 个文件归并成一个下一层文件，归并时按
 `commit_version` 去重、丢弃 `ts < cutoff` 的点。不同分片互不影响。
 
+当前归并以 Series 索引堆选择下一条序列，再用时间戳点堆归并；每输入 SST 复用一个
+fd 和 64 KiB 缓冲。点归并临时空间随输入文件数 k 增长，不随热点序列的点数增长，
+但输出 Series/page 索引仍随输出规模增长。查询使用独立的 8 KiB 缓冲，每个
+(series, SST) 源占一个 fd；16 并发游标上限不代表查询源数或 fd 总量已经严格受限。
+
 ## 4. 写入路径（分片并行）
 
 ```
@@ -97,7 +104,7 @@ Compaction 是**分片内、分层**的：同片同层 ≥8 个文件归并成�
         visible_version → V（本批对读可见）→ 返回客户端
 ```
 
-- **并行的是"执行"**：4 个分片的 apply、Flush、Compaction 互不阻塞；
+- **并行的是分片执行**：各 shard apply，以及一次 Flush 内的分片 SST 写入可以并行；Compaction 归并 I/O 在全局锁外。当前 Flush 仍由全局锁串行协调，会阻塞前台写入，并未实现 immutable MemTable 锁外 Flush；
 - **串行的是"提交顺序"**：一个协调线程负责版本分配与 WAL 追加，保证跨分片批次的原子性；
 - 读路径：锁内只取快照（分片指针 + SSTable 引用计数），物化/归并在锁外，长查询不阻塞写入。
 
@@ -112,7 +119,7 @@ Compaction 是**分片内、分层**的：同片同层 ≥8 个文件归并成�
 | Flush 次数 | 约 1,000 次（每 100k 点一次） | 每次每片一个 L0 文件 |
 | 稳态文件数 | 每层 ≤8 个，几百个量级 | — |
 | 磁盘 | — | 约 13 B/点 → **1.3 GB** |
-| 峰值 RSS | — | 实测 48–80 MiB（512 MiB 上限内） |
+| 峰值 RSS | — | 历史测量曾为 48–80 MiB；不能代表当前亿点库，2026-11-25 实测与边界见性能报告 |
 
 ## 6. WAL 的取舍：全局 vs 分片
 

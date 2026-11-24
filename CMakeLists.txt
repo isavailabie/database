@@ -36,6 +36,9 @@ target_link_libraries(tsdb_mixed_bench PRIVATE tsdb)
 add_executable(tsdb_recover benchmarks/recover.cpp)
 target_link_libraries(tsdb_recover PRIVATE tsdb)
 
+add_executable(tsdb_design_bench benchmarks/design.cpp)
+target_link_libraries(tsdb_design_bench PRIVATE tsdb)
+
 add_executable(tsdb_fault_test tests/fault_injection.cpp)
 target_link_libraries(tsdb_fault_test PRIVATE tsdb)
 
@@ -48,4 +51,12 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME benchmark_runner_tests
     COMMAND ${Python3_EXECUTABLE} -m unittest discover
       -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_benchmark_runner.py -v)
+  add_test(NAME benchmark_compare_tests
+    COMMAND ${Python3_EXECUTABLE} -m unittest discover
+      -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_benchmark_compare.py -v)
+  add_test(NAME benchmark_design_smoke
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_benchmark_compare.py
+      --design-binary $<TARGET_FILE:tsdb_design_bench>)
+  set_tests_properties(benchmark_compare_tests PROPERTIES TIMEOUT 30)
+  set_tests_properties(benchmark_design_smoke PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
 endif()
