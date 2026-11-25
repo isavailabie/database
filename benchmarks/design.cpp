@@ -5,11 +5,17 @@
 #include <limits>
 #include <stdexcept>
 
+namespace {
+constexpr uint64_t kNarrowWindow = 128;
+constexpr uint64_t kNarrowStride = 997;
+}  // namespace
+
 // Deterministic design-level benchmark. Link this exact driver against both
 // revisions: input, API calls, fsync semantics and validation stay identical.
 int main(int argc, char** argv) {
     try {
-        if (argc != 5) throw std::runtime_error("usage: tsdb_design_bench append|compact|scan points path repeats");
+        if (argc != 5)
+            throw std::runtime_error("usage: tsdb_design_bench append|compact|scan|narrow points path repeats");
         const auto positive_integer = [](const std::string& text) {
             if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos)
                 throw std::runtime_error("invalid positive integer: " + text);
@@ -21,10 +27,18 @@ int main(int argc, char** argv) {
         const uint64_t points = positive_integer(argv[2]);
         const std::filesystem::path path = argv[3];
         const uint64_t repeats = positive_integer(argv[4]);
-        if ((mode != "append" && mode != "compact" && mode != "scan") || path.empty() ||
+        const bool narrow = mode == "narrow";
+        if ((!narrow && mode != "append" && mode != "compact" && mode != "scan") || path.empty() ||
             points > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
             repeats > std::numeric_limits<uint64_t>::max() / points)
             throw std::runtime_error("invalid arguments");
+        // 每个窄查询窗口 [lo, lo + kNarrowWindow) 必须落在 [0, points) 内。
+        if (narrow) {
+            const uint64_t half = points - points / 2;
+            if (half < kNarrowWindow ||
+                (repeats - 1) > (half - kNarrowWindow) / kNarrowStride)
+                throw std::runtime_error("invalid arguments");
+        }
         // 不删除已有数据库；悬空链接也不视为新路径。
         if (std::filesystem::exists(path)) throw std::runtime_error("path must be new");
         for (auto part = std::filesystem::absolute(path);; part = part.parent_path()) {
@@ -33,7 +47,7 @@ int main(int argc, char** argv) {
             if (part == part.parent_path()) break;
         }
         tsdb::Options options;
-        options.memtable_max_points = mode == "append" ? points + 1 : 100000;
+        options.memtable_max_points = (mode == "append" || narrow) ? points + 1 : 100000;
         options.enable_background_compaction = false;
         options.enable_background_gc = false;
         options.hot_series_point_limit = points + 1;
@@ -49,6 +63,7 @@ int main(int argc, char** argv) {
             for (uint64_t j = 0; j < 1000 && i < points; ++j, ++i)
                 batch.push_back({1, static_cast<int64_t>(i), static_cast<double>(i % 97)});
             require(engine->WriteBatch(batch));
+            // 仅 compact 分段 Flush；narrow 依赖末尾单次 Flush 形成单个 SST。
             if (mode == "compact" && i % 100000 == 0) require(engine->Flush());
         }
         const double append_seconds = bench::Seconds(bench::Clock::now() - start);
@@ -62,16 +77,22 @@ int main(int argc, char** argv) {
         const auto scan_begin = bench::Clock::now();
         uint64_t scanned = 0;
         for (uint64_t iteration = 0; iteration < repeats; ++iteration) {
+            // narrow 在单个 SST/单个 series chunk 上做独立窄范围查询，lo 随迭代线性前移；
+            // 其余模式做整段全扫描。两者都逐点校验 series/timestamp/value 与点数。
+            const int64_t lo = narrow
+                ? static_cast<int64_t>(points / 2 + iteration * kNarrowStride) : 0;
+            const uint64_t expected = narrow ? kNarrowWindow : points;
             std::unique_ptr<tsdb::Cursor> cursor;
-            require(engine->Scan({1}, 0, static_cast<int64_t>(points), &cursor));
+            require(engine->Scan({1}, lo, lo + static_cast<int64_t>(expected), &cursor));
             uint64_t count = 0;
             while (const auto point = cursor->NextPoint()) {
-                if (point->series_id != 1 || point->timestamp_ms != static_cast<int64_t>(count) ||
-                    point->value != static_cast<double>(count % 97))
+                const int64_t timestamp = lo + static_cast<int64_t>(count);
+                if (point->series_id != 1 || point->timestamp_ms != timestamp ||
+                    point->value != static_cast<double>(timestamp % 97))
                     throw std::runtime_error("scan data mismatch");
                 ++count;
             }
-            if (count != points) throw std::runtime_error("missing points");
+            if (count != expected) throw std::runtime_error("missing points");
             scanned += count;
         }
         const double scan_seconds = bench::Seconds(bench::Clock::now() - scan_begin);

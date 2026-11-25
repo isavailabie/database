@@ -63,8 +63,38 @@ Compaction 和 8 KiB 查询解码；WAL 锁外流水线因混合吞吐退化未�
 最终版本另在相同限额下验证 1 亿点均匀/热点导入：71.24 / 76.70 秒，峰值 RSS
 152.08 / 168.11 MiB；同库各 60 秒混合零读写错误，峰值最高 184.36 MiB。
 异常退出后 WAL 重放与全库校验均少于 8 秒，精确恢复全部已确认点。
-**尚未完成亿点库上的 60 分钟持续混合**；热点一次扫描最大延迟约 1.968 秒，详见报告。
+**该轮尚未完成亿点库上的 60 分钟持续混合**；热点一次扫描最大延迟约 1.968 秒，详见报告。
 以上为 Docker Linux overlayfs 数据层测量，不是历史 WSL2 或裸机 SSD 数据。
+60 分钟验收在后续第 1 轮迭代补齐，见下一节；两轮实验不混算。
+
+## 性能迭代验证（2026-11-25，第 1 轮）
+
+基线为上一轮已推送的 `c99b8ab`。本轮保留的确定项是**资源生命周期与并发正确性修复**，
+唯一可重复证明的吞吐收益来自长序列尾部窄范围查询：
+
+| 项目 | 结果 |
+| --- | --- |
+| 300 万点单 chunk、800 次 128 点尾部窄查询 | 三轮 AB/BA **+78.29%**，独立五轮复测 **+67.36%**，八轮方向一致 |
+| 其余六场景（导入、合并、追加、全扫描、mixed） | 在噪声范围内持平，不宣称提速 |
+| 100 万点驻留追加 | 三轮 -11.15% / 五轮 +35.31%，方向反转，判定为 0.3 秒级短操作噪声，两次原始结果均保留 |
+| 1 亿点均匀 / 热点导入（512 MiB、无交换空间） | 83.40 / 69.86 秒，峰值 RSS 182,411,264 / 204,124,160 B，恢复 11.02 / 9.20 秒，精确恢复 1 亿点 |
+
+四项保留改动：Expire 后闲置 vector capacity 按阈值回收且过期时不再无条件复制
+shard 外层 map；页索引改用 `lower_bound` 跳过不可能命中的页并提前终止；
+`Scan` 先在 16 名额 gate 排队再取 ReadView，避免等待者固定旧快照；
+`Close` 唤醒 gate 等待者，消除关闭后查询永久阻塞。
+
+回归：Release / Debug / ASan+UBSan 各自 CTest 5/5，68 个功能用例、
+180 次真实进程崩溃、50 次文件损坏、42 个 Python 协议用例、6 个设计烟测，
+Release 功能套件连续 10 轮通过。新增 `scan_gate_close_wakeup_stress` 覆盖
+`Close` 与查询准入等待之间的丢失唤醒竞态。完整逐轮数据、噪声判读、边界与收敛判据见
+[`doc/性能优化-迭代-2026-11-25.md`](doc/性能优化-迭代-2026-11-25.md)，
+原始指标见 `doc/performance-results-round1-*.json`。
+
+**1 亿点库 60 分钟混合验收已补齐**：均匀 / 热点库各连续 3600 秒，
+两组 `scan_errors=0`、`write_errors=0`，峰值 RSS 分别 296.20 / 299.44 MiB，
+分别追加 221,834,000 / 296,278,000 点、完成 11,070,223 / 10,354,781 次扫描。
+过程采样与完整指标见 `doc/性能优化-迭代-2026-11-25.md` §1.4。
 
 ## 基准
 
@@ -117,15 +147,20 @@ python3 benchmark/runner.py --source "$PWD" --output build/eval-quick --profile 
 - WAL 校验、持久 fd 和小批量 Group Commit
 - 增量 Flush、SSTable、Manifest 和尾部 WAL 重放
 - 无损 timestamp/value 编码（zigzag varint + 原始 float64 位）
-- SSTable SeriesIndex（含字节长度）和按需磁盘分页读取；每查询源固定 8 KiB pread 缓冲，
-  Open 校验保留，游标 Close/EOF/异常即时释放快照与 fd，聚合读取错误通过 Status 返回
+- SSTable SeriesIndex（含字节长度）和按需磁盘分页读取；页索引用 `lower_bound` 跳过
+  `max_timestamp < max(start, cutoff)` 的页并在越过 `end` 时提前终止；每查询源固定
+  8 KiB pread 缓冲，Open 校验保留，游标 Close/EOF/异常即时释放快照与 fd，
+  聚合读取错误通过 Status 返回
 - Compaction：按 Series 索引堆与时间戳点堆流式归并、过滤过期点；每输入 SST 使用
   64 KiB 缓冲，点归并临时空间为 O(fan-in)，不物化整条热点 Series；输出索引仍随规模增长
 - Size-tiered Compaction：按层级归并，避免 O(N²) 写放大
 - Compaction 归并 I/O 期间释放全局锁，不阻塞前台写入
 - 后台 Flush、阈值触发 Compaction 和后台 GC
 - 引用计数 GC：读取并发下也能回收过期 SSTable 文件
-- ReadView、过期视图和物理过期清理
+- ReadView、过期视图和物理过期清理；`ExpireBefore` 先只读探测再按需 COW，
+  前缀删除后按阈值重建闲置 vector capacity，避免逻辑额度已归还但实际 RSS 滞留
+- 查询先在 16 名额 gate 取得准入再取 ReadView，等待者不固定旧快照；
+  `Close` 唤醒 gate 等待者并返回错误，避免关闭后永久阻塞
 - 队列、MemTable 和热点容量触发阻塞背压；等待后重新校验批次，单批超限直接拒绝
 - SST 压力下强制低阈值合并；不可再归并的文件集合采用软上限，避免永久等待
 - Linux 协调/刷盘/合并线程进行亲和绑定；验收用容器 `--cpus=4` 限制全部线程

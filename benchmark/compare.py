@@ -36,6 +36,12 @@ points repeats append_seconds compact_seconds scan_seconds scan_points
  recovered_points
 """.split())
 
+kNarrowWindow = 128
+# 尾部窄查询需要足够多次独立 Scan 才能把页索引遍历成本从噪声中分离出来。
+# 上限受 design.cpp 的 (points/2 - window)/stride 约束；800 在 2M 规模下也合法。
+kNarrowQueries = 800
+VALID_CASES = ("uniform", "hot", "compact", "append", "scan", "narrow", "mixed")
+
 
 def metrics(text):
     result = {}
@@ -94,7 +100,8 @@ def validate_metrics(data, case, points, repeats=3):
         elif data["compact_seconds"] != 0:
             raise ValueError("unexpected compaction timing")
         expected = {"points": points, "repeats": repeats, "recovered_points": points,
-                    "scan_points": points * repeats, "mode": case}
+                    "scan_points": repeats * kNarrowWindow if case == "narrow" else points * repeats,
+                    "mode": case}
         if "rss_scope" in data and data["rss_scope"] != "process_peak_bytes":
             raise ValueError("unexpected RSS scope")
     for key in positive:
@@ -128,7 +135,8 @@ def main(argv=None):
     parser.add_argument("--hot-points", type=int, default=3000000)
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--seconds", type=int, default=15)
-    parser.add_argument("--cases", default="uniform,hot,compact,append,scan,mixed")
+    parser.add_argument("--cases", default=",".join(VALID_CASES),
+                        help="comma-separated cases: " + ",".join(VALID_CASES))
     args = parser.parse_args(argv)
     names = args.cases.split(",")
     if min(args.points, args.hot_points, args.repeat, args.seconds) <= 0:
@@ -138,8 +146,8 @@ def main(argv=None):
         parser.error("size or duration exceeds benchmark range")
     if any(not name for name in names) or len(names) != len(set(names)):
         parser.error("cases must be nonempty and unique")
-    if set(names) - {"uniform", "hot", "compact", "append", "scan", "mixed"}:
-        parser.error("unknown case")
+    if set(names) - set(VALID_CASES):
+        parser.error("unknown case (valid: " + ",".join(VALID_CASES) + ")")
     if path_present(args.output):
         parser.error("output must not exist")
     out = args.output.resolve()
@@ -164,7 +172,7 @@ def main(argv=None):
     def save():
         (out / "results.json").write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
 
-    def run(command, label, case, points):
+    def run(command, label, case, points, repeats=3):
         command = [str(x) for x in command]
         execution = {"label": label, "command": command, "status": "running",
                      "returncode": None, "log": str(out / (label + ".log"))}
@@ -186,7 +194,7 @@ def main(argv=None):
                     try:
                         data = metrics(proc.stdout)
                         data["wall_seconds"] = time.monotonic() - started
-                        validate_metrics(data, case, points)
+                        validate_metrics(data, case, points, repeats)
                     except (ValueError, OverflowError) as error:
                         execution["status"] = "protocol_failure"
                         raise RuntimeError(f"{label}: {error}") from error
@@ -236,8 +244,10 @@ def main(argv=None):
                                         "--path", db, "--keep", "--expected-points", args.points],
                                        label, name, args.points)
                     else:
-                        size = args.hot_points if name in ("compact", "scan") else min(args.hot_points, 1000000)
-                        data = run([binary / "tsdb_design_bench", name, size, db, 3], label, name, size)
+                        size = args.hot_points if name in ("compact", "scan", "narrow") else min(args.hot_points, 1000000)
+                        queries = kNarrowQueries if name == "narrow" else 3
+                        data = run([binary / "tsdb_design_bench", name, size, db, queries],
+                                   label, name, size, queries)
                     result["records"].append({"case": name, "version": version,
                                               "repeat": repeat + 1, "metrics": data})
                     save()
@@ -251,7 +261,8 @@ def main(argv=None):
                 by_version[version] = {key: statistics.median([x[key] for x in rows])
                                        for key in sorted(keys) if all(isinstance(x[key], (float, int)) for x in rows)}
             key = {"uniform": "seconds", "hot": "seconds", "compact": "compact_seconds",
-                   "append": "append_seconds", "scan": "scan_seconds", "mixed": "write_throughput"}[name]
+                   "append": "append_seconds", "scan": "scan_seconds", "narrow": "scan_seconds",
+                   "mixed": "write_throughput"}[name]
             base, candidate = by_version["baseline"][key], by_version["candidate"][key]
             gain = (candidate / base - 1) if name == "mixed" else (base / candidate - 1)
             rss_change = by_version["candidate"]["rss_bytes"] / by_version["baseline"]["rss_bytes"] - 1

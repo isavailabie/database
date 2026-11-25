@@ -1292,6 +1292,229 @@ void TestPageIndexSelectiveScan(const std::filesystem::path& path) {
     AssertOk(engine->Close());
 }
 
+// 过期释放的是逻辑点数额度；vector::erase 不缩 capacity，多条 series 各留下
+// 少量点时会累积闲置分配。这里验证显著闲置时确实重建且旧快照不受影响。
+void TestExpireReclaimsIdleCapacity(const std::filesystem::path& path) {
+    Options options;
+    options.shard_count = 1;
+    options.memtable_max_points = 100000;
+    options.hot_series_point_limit = 100000;
+    options.enable_background_compaction = false;
+    options.enable_background_gc = false;
+    Status status;
+    auto engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    constexpr int64_t kPoints = 20000;
+    std::vector<DataPoint> batch;
+    batch.reserve(1000);
+    for (int64_t i = 0; i < kPoints; ++i) {
+        batch.push_back({501, i, static_cast<double>(i % 97)});
+        if (batch.size() == 1000) {
+            AssertOk(engine->WriteBatch(batch));
+            batch.clear();
+        }
+    }
+    if (!batch.empty()) AssertOk(engine->WriteBatch(batch));
+    const auto before = testing::InspectSeriesBuffer(*engine, 501);
+    CHECK(before.point_count == static_cast<size_t>(kPoints) &&
+          before.capacity.has_value());
+    CHECK(*before.capacity >= 4096);
+
+    // 旧游标固定整个 shard：过期必须先 COW，且不能改变旧视图的点。
+    std::unique_ptr<Cursor> snapshot;
+    AssertOk(engine->Scan({501}, 0, kPoints, &snapshot));
+    AssertOk(engine->ExpireBefore(kPoints - 1));
+    const auto after = testing::InspectSeriesBuffer(*engine, 501);
+    CHECK(after.point_count == 1 && after.capacity.has_value());
+    CHECK(*after.capacity >= 1 && *after.capacity * 2 < *before.capacity);
+    CHECK(Read(snapshot.get()).size() == static_cast<size_t>(kPoints));
+
+    EngineStats stats;
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.mutable_points == 1);
+    CHECK(stats.memtable_bytes == sizeof(DataPoint) + sizeof(CommitVersion));
+    AssertOk(engine->Put({501, kPoints, 7.0}));
+    std::unique_ptr<Cursor> fresh;
+    AssertOk(engine->Scan({501}, 0, kPoints + 1, &fresh));
+    CHECK(Read(fresh.get()).size() == 2);
+    AssertOk(engine->Close());
+
+    engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    std::unique_ptr<Cursor> reopened;
+    AssertOk(engine->Scan({501}, 0, kPoints + 1, &reopened));
+    const auto recovered = Read(reopened.get());
+    CHECK(recovered.size() == 2 && recovered[0].timestamp_ms == kPoints - 1);
+    AssertOk(engine->Close());
+}
+
+// 单 series 多页时，尾部窄范围查询不应线性遍历前面的页索引；重开后页索引
+// 由磁盘重建，必须覆盖同一路径。
+void TestPageIndexTailNarrowScan(const std::filesystem::path& path) {
+    Options options;
+    options.shard_count = 1;
+    options.memtable_max_points = 20000;
+    options.hot_series_point_limit = 20000;
+    options.enable_background_compaction = false;
+    options.enable_background_gc = false;
+    Status status;
+    auto engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    constexpr int64_t kPoints = 8000;
+    std::vector<DataPoint> batch;
+    batch.reserve(1000);
+    for (int64_t i = 0; i < kPoints; ++i) {
+        batch.push_back({777, i, static_cast<double>(i % 13)});
+        if (batch.size() == 1000) {
+            AssertOk(engine->WriteBatch(batch));
+            batch.clear();
+        }
+    }
+    if (!batch.empty()) AssertOk(engine->WriteBatch(batch));
+    AssertOk(engine->Flush());
+    const auto narrow = [&](int64_t lo) {
+        std::unique_ptr<Cursor> cursor;
+        AssertOk(engine->Scan({777}, lo, lo + 128, &cursor));
+        const auto points = Read(cursor.get());
+        CHECK(points.size() == 128);
+        for (size_t j = 0; j < points.size(); ++j) {
+            CHECK(points[j].timestamp_ms == lo + static_cast<int64_t>(j));
+            CHECK(points[j].value ==
+                  static_cast<double>((lo + static_cast<int64_t>(j)) % 13));
+        }
+    };
+    narrow(0);
+    narrow(127);
+    narrow(4096);
+    narrow(7800);
+    narrow(kPoints - 128);
+    std::unique_ptr<Cursor> beyond;
+    AssertOk(engine->Scan({777}, kPoints, kPoints + 128, &beyond));
+    CHECK(Read(beyond.get()).empty());
+    AssertOk(engine->ExpireBefore(6000));
+    std::unique_ptr<Cursor> expired;
+    AssertOk(engine->Scan({777}, 7800, 7928, &expired));
+    CHECK(Read(expired.get()).size() == 128);
+    AssertOk(engine->Close());
+
+    engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    std::unique_ptr<Cursor> reopened;
+    AssertOk(engine->Scan({777}, 7800, 7928, &reopened));
+    CHECK(Read(reopened.get()).size() == 128);
+    AssertOk(engine->Close());
+}
+
+// gate 占满时，等待中的 Scan 不能提前固定 ReadView；名额释放后正常成功。
+void TestScanGateWaiterHoldsNoView(const std::filesystem::path& path) {
+    Options options;
+    options.shard_count = 1;
+    options.enable_background_compaction = false;
+    options.enable_background_gc = false;
+    Status status;
+    auto engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    AssertOk(engine->WriteBatch({{1, 10, 1.0}, {1, 20, 2.0}}));
+    std::vector<std::unique_ptr<Cursor>> held;
+    for (size_t i = 0; i < 16; ++i) {
+        std::unique_ptr<Cursor> cursor;
+        AssertOk(engine->Scan({1}, 0, 100, &cursor));
+        held.push_back(std::move(cursor));
+    }
+    std::atomic<bool> done{false};
+    std::atomic<bool> failed{false};
+    std::thread waiter([&] {
+        std::unique_ptr<Cursor> cursor;
+        failed.store(!engine->Scan({1}, 0, 100, &cursor).ok);
+        done.store(true);
+    });
+    for (int i = 0; i < 100 && !done.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    EngineStats stats;
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.active_read_views == 16);
+    held.back()->Close();
+    waiter.join();
+    CHECK(done.load() && !failed.load());
+    AssertOk(engine->GetStats(&stats));
+    // Close() 归还了一个名额和一份 view，waiter 的游标析构归还另一份。
+    CHECK(stats.active_read_views == 15);
+    held.clear();
+    AssertOk(engine->Close());
+}
+
+// Close 必须唤醒阻塞在查询准入 gate 的 Scan，且等待者返回错误而非半个快照。
+void TestScanGateCloseWakesWaiter(const std::filesystem::path& path) {
+    Options options;
+    options.shard_count = 1;
+    options.enable_background_compaction = false;
+    options.enable_background_gc = false;
+    Status status;
+    auto engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    AssertOk(engine->WriteBatch({{1, 10, 1.0}, {1, 20, 2.0}}));
+    std::vector<std::unique_ptr<Cursor>> held;
+    for (size_t i = 0; i < 16; ++i) {
+        std::unique_ptr<Cursor> cursor;
+        AssertOk(engine->Scan({1}, 0, 100, &cursor));
+        held.push_back(std::move(cursor));
+    }
+    std::atomic<bool> done{false};
+    std::atomic<bool> failed{false};
+    std::thread waiter([&] {
+        std::unique_ptr<Cursor> cursor;
+        failed.store(!engine->Scan({1}, 0, 100, &cursor).ok);
+        done.store(true);
+    });
+    for (int i = 0; i < 100 && !done.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    EngineStats stats;
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.active_read_views == 16);
+    // 不释放任何名额直接关闭；修复前 waiter 永不醒来，join 会挂住。
+    AssertOk(engine->Close());
+    waiter.join();
+    CHECK(done.load() && failed.load());
+    held.clear();
+}
+
+// Close 与「刚判定谓词为假、尚未进入 condition_variable::wait」的查询反复竞争。
+// 修复前 notify_all 可能落在两者之间而丢失；这里用多轮 + 多等待者放大窗口，
+// 由 RunWithTimeout 保证真正丢失唤醒时测试集失败而不是挂住。
+void TestScanGateCloseWakeupStress(const std::filesystem::path& path) {
+    Options options;
+    options.shard_count = 1;
+    options.enable_background_compaction = false;
+    options.enable_background_gc = false;
+    constexpr int kRounds = 24;
+    constexpr int kWaiters = 3;
+    for (int round = 0; round < kRounds; ++round) {
+        const auto db = path / ("round_" + std::to_string(round));
+        Status status;
+        auto engine = Engine::Open(db, options, &status);
+        AssertOk(status);
+        AssertOk(engine->WriteBatch({{1, 10, 1.0}, {1, 20, 2.0}}));
+        std::vector<std::unique_ptr<Cursor>> held;
+        for (size_t i = 0; i < 16; ++i) {
+            std::unique_ptr<Cursor> cursor;
+            AssertOk(engine->Scan({1}, 0, 100, &cursor));
+            held.push_back(std::move(cursor));
+        }
+        std::atomic<int> returned{0};
+        std::vector<std::thread> waiters;
+        for (int i = 0; i < kWaiters; ++i) {
+            waiters.emplace_back([&] {
+                std::unique_ptr<Cursor> cursor;
+                if (!engine->Scan({1}, 0, 100, &cursor).ok) ++returned;
+            });
+        }
+        AssertOk(engine->Close());
+        for (auto& thread : waiters) thread.join();
+        CHECK(returned.load() == kWaiters);
+        held.clear();
+    }
+}
+
 void TestCrashRecovery(const std::filesystem::path& path) {
     const pid_t pid = fork();
     CHECK(pid >= 0);
@@ -2768,6 +2991,11 @@ int main(int argc, char** argv) {
         {"torn_wal_tail", [&] { TestTornWalTailRecovery(root / "torn_wal_tail"); }},
         {"concurrent_compaction_stress", [&] { TestConcurrentCompactionStress(root / "concurrent_compaction_stress"); }},
         {"page_index_selective_scan", [&] { TestPageIndexSelectiveScan(root / "page_index_selective"); }},
+        {"expire_reclaims_idle_capacity", [&] { TestExpireReclaimsIdleCapacity(root / "expire_capacity"); }},
+        {"page_index_tail_narrow_scan", [&] { TestPageIndexTailNarrowScan(root / "page_tail"); }},
+        {"scan_gate_waiter_holds_no_view", [&] { RunWithTimeout([&] { TestScanGateWaiterHoldsNoView(root / "scan_gate_view"); }); }},
+        {"scan_gate_close_wakes_waiter", [&] { RunWithTimeout([&] { TestScanGateCloseWakesWaiter(root / "scan_gate_close"); }); }},
+        {"scan_gate_close_wakeup_stress", [&] { RunWithTimeout([&] { TestScanGateCloseWakeupStress(root / "scan_gate_stress"); }); }},
         {"sstable_checksum", [&] { TestSstableChecksum(root / "checksum"); }},
         {"cursor_outlives_engine", [&] { TestCursorOutlivesEngine(root / "cursor_lifetime"); }},
         {"sharded_wal", [&] { TestShardedWal(root / "sharded_wal"); }},

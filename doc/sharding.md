@@ -38,7 +38,9 @@ ShardData
 - 恢复允许乱序二分定位后插入、重复 timestamp 取最高版本；唯一 timestamp 才增加点数额度，正常追加为摊销 O(1)，大量逆序恢复最坏 O(n²)；
 - 快照（ReadView）持有旧指针，旧查询继续读旧数据；
 - 全局累计 100k 点触发一次 Flush，Flush 后整片清空，内存不随数据总量增长；
-- 全局保存 `series_id → last_timestamp` 水位表，顺序校验结合 pending 队列；写入准入只投影候选批次涉及的热点计数，不复制完整活跃 Series 表。
+- 全局保存 `series_id → last_timestamp` 水位表，顺序校验结合 pending 队列；写入准入只投影候选批次涉及的热点计数，不复制完整活跃 Series 表；
+- `ExpireBefore` 先只读探测各 shard 的 series 首点，整片都无需过期时不复制外层 map、也不打断与旧快照的 shard 共享；只有旧 ReadView 仍持有整片时才复制外层 map，随后仍按 Series 逐条 COW；
+- `SeriesPoints::ExpireBefore` 用前缀 erase 归还逻辑点数额度后，若闲置 capacity ≥4096 且超过保留点数 4 倍，会用复制构造 + `swap` 重建 buffer。否则 `vector::erase` 不释放分配，多条 series 各留少量点会让实际 RSS 绕过逻辑容量背压。该收缩不改变背压阈值本身。
 
 示例：`WriteBatch[(101,1000,10.0), (205,1500,20.0), (306,1200,30.0)]`
 
@@ -81,6 +83,12 @@ fd 和 64 KiB 缓冲。点归并临时空间随输入文件数 k 增长，不随
 但输出 Series/page 索引仍随输出规模增长。查询使用独立的 8 KiB 缓冲，每个
 (series, SST) 源占一个 fd；16 并发游标上限不代表查询源数或 fd 总量已经严格受限。
 
+页索引定位不是线性扫描：series chunk 内点按时间递增、页 `max_timestamp` 单调不减，
+因此从当前位置用 `lower_bound` 一次性跳过所有在 `max(start, cutoff)` 之前结束的页；
+首个候选页若 `min_timestamp >= end`，后续页同样不可能命中，直接终止该源。
+这让长 chunk 上的尾部窄窗口查询与页总数解耦；全量扫描仍逐页推进，行为不变。
+legacy raw 源不建页索引，也不走该路径。
+
 ## 4. 写入路径（分片并行）
 
 ```
@@ -106,7 +114,9 @@ fd 和 64 KiB 缓冲。点归并临时空间随输入文件数 k 增长，不随
 
 - **并行的是分片执行**：各 shard apply，以及一次 Flush 内的分片 SST 写入可以并行；Compaction 归并 I/O 在全局锁外。当前 Flush 仍由全局锁串行协调，会阻塞前台写入，并未实现 immutable MemTable 锁外 Flush；
 - **串行的是"提交顺序"**：一个协调线程负责版本分配与 WAL 追加，保证跨分片批次的原子性；
-- 读路径：锁内只取快照（分片指针 + SSTable 引用计数），物化/归并在锁外，长查询不阻塞写入。
+- 读路径：锁内只取快照（分片指针 + SSTable 引用计数），物化/归并在锁外，长查询不阻塞写入；
+- `Scan` 先在 16 名额的准入 gate 排队，拿到名额后才在全局锁内取 ReadView。等待中的查询因此不会提前固定旧 MemTable、索引与待回收 SST——否则旧快照的生命周期不受游标名额约束；
+- `Close` 置 `scan_gate_stopping` 并唤醒 gate 条件变量，等待者返回 `Status::Error` 而不是永久阻塞。gate 与全局锁从不同时持有，名额由 RAII lease 在失败路径归还。
 
 ## 5. 规模示例（1 亿点 / 1 万 Series / 4 分片）
 

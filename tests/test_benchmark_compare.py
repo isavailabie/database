@@ -46,9 +46,10 @@ def mixed_payload(points=101):
 
 
 def design_payload(mode="scan", points=103, repeats=3):
+    scan_points = repeats * compare.kNarrowWindow if mode == "narrow" else points * repeats
     return dict(mode=mode, points=points, repeats=repeats, append_seconds=1,
                 compact_seconds=0.1 if mode == "compact" else 0, scan_seconds=0.2,
-                scan_points=points * repeats, scan_points_per_second=points * repeats / 0.2,
+                scan_points=scan_points, scan_points_per_second=scan_points / 0.2,
                 rss_bytes=1000, compaction_count=1 if mode == "compact" else 0,
                 flush_count=1, recover_seconds=0.1, recovered_points=points)
 
@@ -132,6 +133,42 @@ class BenchmarkCompareTests(unittest.TestCase):
     def test_append_keeps_small_requested_scale(self):
         self.invoke(["--cases", "append"])
         self.assertEqual([c[2] for c in self.commands], ["103", "103"])
+
+    def test_narrow_command_uses_full_hot_points_scale(self):
+        self.invoke(["--cases", "narrow", "--hot-points", "2000001"])
+        self.assertEqual(len(self.commands), 2)
+        for command in self.commands:
+            self.assertEqual(Path(command[0]).name, "tsdb_design_bench")
+            self.assertEqual(command[1], "narrow")
+            self.assertEqual(command[2], "2000001")
+            self.assertEqual(command[4], str(compare.kNarrowQueries))
+        self.assertEqual(self.result()["status"], "pass")
+        self.assertEqual(len(self.result()["records"]), 2)
+
+    def test_narrow_success_validates_with_window_scan_points(self):
+        data = design_payload("narrow")
+        self.assertEqual(data["scan_points"], 3 * compare.kNarrowWindow)
+        compare.validate_metrics(data, "narrow", 103, repeats=3)
+        compare.validate_metrics(dict(data, rss_scope="process_peak_bytes"), "narrow", 103,
+                                 repeats=3)
+        self.invoke(["--cases", "narrow"])
+        self.assertEqual(self.result()["status"], "pass")
+        self.assertTrue(all(x["status"] == "pass" for x in self.result()["executions"]))
+
+    def test_narrow_validation_rejects_wrong_window_and_mode(self):
+        payload = design_payload("narrow")
+        for changes in ({"scan_points": 103 * 3},
+                        {"scan_points": 3 * compare.kNarrowWindow + 1},
+                        {"scan_points": 3 * compare.kNarrowWindow - 1},
+                        {"mode": "scan"}, {"mode": "append"}, {"mode": "compact"}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                compare.validate_metrics(dict(payload, **changes), "narrow", 103, repeats=3)
+
+    def test_narrow_summary_primary_metric_is_scan_seconds(self):
+        self.invoke(["--cases", "narrow"])
+        summary = self.result()["summary"]
+        self.assertIn("narrow", summary)
+        self.assertEqual(summary["narrow"]["primary_metric"], "scan_seconds")
 
     def test_mixed_preloads_each_database_in_ab_ba_order(self):
         self.invoke(["--cases", "mixed", "--repeat", "2"])
@@ -460,6 +497,14 @@ class DesignSmokeTests(unittest.TestCase):
 
     def test_scan(self):
         self.check_mode("scan")
+
+    def test_narrow(self):
+        # narrow 的窗口必须落在 points/2 之后，3000 点才容得下 2 次查询。
+        result = self.run_design("narrow", 3000, self.work / "narrow", 2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = compare.metrics(result.stdout)
+        compare.validate_metrics(data, "narrow", 3000, repeats=2)
+        self.assertEqual(data["rss_scope"], "process_peak_bytes")
 
     def test_invalid_arguments_do_not_create_database(self):
         values = ("-1", "+1", "1x", "1.0", " 1", "", "0", str(1 << 64))

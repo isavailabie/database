@@ -77,7 +77,8 @@ python3 benchmark/runner.py --source "$PWD" --output "$PWD/build/eval-one" \
 `compare.py` 面向基线与候选 Release 二进制，用相同驱动、输入与同步持久化语义执行
 AB / BA / AB 三轮交替。不会复用已有输出或数据目录，也不会用失败、缺指标、非有限值、
 恢复丢点或混合读写错误的结果生成成功摘要。每次的命令、状态、原始输出和多轮中位数
-保存在 `results.json` 与对应日志中。默认六种场景，可用 `--cases` 选择子集。
+保存在 `results.json` 与对应日志中。默认七种场景（uniform / hot / append /
+compact / scan / narrow / mixed），可用 `--cases` 选择子集。
 
 ```bash
 python3 benchmark/compare.py \
@@ -97,10 +98,18 @@ fsync、后台维护和温度漂移的影响；需要同时报告每轮结果，
 | append | 单热点驻留追加，最多 100 万点，禁后台合并；`append_seconds` 只测 WriteBatch 循环 |
 | compact | 单热点每 10 万点 Flush、禁后台合并；单独计时显式 Compact，随后逐点校验完整扫描和重开 |
 | scan | 单热点 Flush 后完整扫描三遍；不是点查，也不是冷缓存随机 I/O |
+| narrow | 单热点一次性 Flush 成单个 SST / 单个 series chunk，执行 800 次独立的 128 点尾部窄窗口查询；用于把页索引的定位成本从噪声中分离出来 |
 | mixed | 每版本先预载 N 点，再在同库 4 写 16 读，逐条扫描指定 Series；报告读写吞吐与 p95/p99 |
 
-`tsdb_design_bench append|compact|scan points path repeats` 拒绝已有数据库，正常与
-恢复扫描均校验每点的 Series、timestamp、value 和总点数。`rss_bytes` / `rss_scope`
+`narrow` 的查询次数由 `compare.py` 的 `kNarrowQueries = 800` 固定；每次查询逐点
+校验 Series、timestamp、value 且必须恰好命中 128 点，`scan_points` 期望值为
+`repeats × 128`，不是 `points × repeats`。窗口起点沿系列后半段按 997 点步长推进，
+因此它测的是「长 series chunk 里跳过大量不可能命中的页」，而不是磁盘 I/O 吞吐。
+`compare.py` 会把该场景的主指标记为 `scan_seconds`。
+
+`tsdb_design_bench append|compact|scan|narrow points path repeats` 拒绝已有数据库，
+正常与恢复扫描均校验每点的 Series、timestamp、value 和总点数；`narrow` 关闭后重开
+还会逐点校验全部点数。`rss_bytes` / `rss_scope`
 表示含写入、扫描、关闭和恢复阶段的整进程峰值，不是合并步骤单独的净内存。
 `recover_seconds` 只测 Open；导入驱动的 `recovery_seconds` 包含 Open 和全库恢复扫描，
 两者不能直接比较。`speedup_percent` 为基线耗时/候选耗时减一，或候选吞吐/基线吞吐
@@ -108,5 +117,10 @@ fsync、后台维护和温度漂移的影响；需要同时报告每轮结果，
 
 设计级驱动必须用同一份 `benchmarks/design.cpp` 分别链接两个版本的库。基线源码没有
 该新驱动时，可在其构建后手动编译，具体命令见
-[`doc/性能优化-2026-11-25.md`](../doc/性能优化-2026-11-25.md)。该报告及其原始指标为本轮数据，
-不能与历史 WSL2 或 macOS 报告拼接成同一实验。
+[`doc/性能优化-2026-11-25.md`](../doc/性能优化-2026-11-25.md)。该报告及其原始指标为
+上一轮数据，不能与历史 WSL2 或 macOS 报告拼接成同一实验。
+
+`c99b8ab` 之后的持续迭代（含 `narrow` 场景的引入、三轮 AB/BA、五轮复测、
+1 亿点库 60 分钟混合验收与收敛判据）见
+[`doc/性能优化-迭代-2026-11-25.md`](../doc/性能优化-迭代-2026-11-25.md)，
+原始指标为 `performance-results-round1-*.json`。每轮实验各自独立，不与上一轮混算。

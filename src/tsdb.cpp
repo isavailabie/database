@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cerrno>
 #include <cctype>
@@ -310,6 +311,10 @@ struct VersionedPoint {
 
 class SeriesPoints {
 public:
+    // 只有闲置容量足够大时才重建，避免小 buffer 反复过期引起分配震荡。
+    static constexpr size_t kShrinkCapacityThreshold = 4096;
+    static constexpr size_t kShrinkCapacityRatio = 4;
+
     size_t size() const { return points_.size(); }
     size_t capacity() const { return points_.capacity(); }
     bool empty() const { return points_.empty(); }
@@ -345,6 +350,16 @@ public:
     size_t ExpireBefore(int64_t cutoff) {
         const size_t removed = LowerBoundIndex(cutoff);
         points_.erase(points_.begin(), points_.begin() + removed);
+        // vector::erase 不释放 capacity：逻辑点数额度已经归还，但多条 series
+        // 各留下少量点时闲置缓冲会长期累积，实际 RSS 可以绕过内存背压。
+        // 调用方必须先经 COW 保证本 buffer 独占；这里只在闲置显著时重建。
+        // size 受 512 MiB 预算约束，size * ratio 不会溢出 size_t。
+        if (!points_.empty() &&
+            points_.capacity() >= kShrinkCapacityThreshold &&
+            points_.capacity() > points_.size() * kShrinkCapacityRatio) {
+            std::vector<VersionedPoint> compacted(points_.begin(), points_.end());
+            points_.swap(compacted);
+        }
         return removed;
     }
 
@@ -977,6 +992,10 @@ struct Engine::Impl {
     std::mutex scan_mu;
     std::condition_variable scan_cv;
     size_t active_scans{0};
+    // Close 必须唤醒等待准入的查询，否则 gate 占满时关闭会永久阻塞。
+    // 读（等待谓词）与写（Close）都必须在 scan_mu 下发生：否则通知可能落在
+    // 「谓词求值」与「进入 wait」之间，notify_all 丢失，等待者永不醒来。
+    std::atomic<bool> scan_gate_stopping{false};
 
     size_t ShardFor(uint64_t series_id) const {
         uint64_t value = series_id;
@@ -2522,6 +2541,21 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
     };
     auto lease = std::make_shared<ScanLease>();
     lease->impl = impl_;
+    // 先在 gate 排队，等待期间不持有 ReadView：否则大量等待中的查询会
+    // 固定旧 memtable、索引与待回收 SST，旧快照生命周期不受 16 名额约束。
+    // 名额到手后再取同一可见版本快照；失败路径由 lease 归还名额。
+    {
+        std::unique_lock gate(impl_->scan_mu);
+        impl_->scan_cv.wait(gate, [&] {
+            return impl_->active_scans < Impl::kMaxConcurrentScans ||
+                   impl_->scan_gate_stopping.load();
+        });
+        if (impl_->scan_gate_stopping.load()) {
+            return Status::Error("engine is closed");
+        }
+        ++impl_->active_scans;
+        lease->active_scan = true;
+    }
     std::unique_lock lock(impl_->mutex);
     if (impl_->closed || impl_->closing) return Status::Error("engine is closed");
     if (!impl_->storage_error.ok) return impl_->storage_error;
@@ -2533,16 +2567,6 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
     // cursor decodes and merges without the global lock: a long scan no longer
     // blocks writers, and its memory does not grow with the result size.
     lock.unlock();
-
-    // Bound the number of cursors that can hold decoder state at once.
-    {
-        std::unique_lock gate(impl_->scan_mu);
-        impl_->scan_cv.wait(gate, [&] {
-            return impl_->active_scans < Impl::kMaxConcurrentScans;
-        });
-        ++impl_->active_scans;
-        lease->active_scan = true;
-    }
 
     // Streaming scan: one source per (series, SSTable) plus one per series for
     // the memtable snapshot. Sources decode on demand and are merged by
@@ -2660,26 +2684,32 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
                 // Encoded sources advance page by page, seeking past pages that
                 // do not intersect [start, end) (or are fully expired).
                 if (source.raw || !source.pages) return;
-                bool found = false;
-                while (source.page_index < source.pages->size()) {
-                    const auto& page = (*source.pages)[source.page_index];
-                    ++source.page_index;
-                    if (page.max_timestamp < state->start ||
-                        page.min_timestamp >= state->end ||
-                        page.max_timestamp < cutoff) {
-                        continue;
-                    }
-                    // 窄查询预读截止于选中页，不把后续未命中页带入缓冲。
-                    const uint64_t page_end =
-                        source.page_index < source.pages->size()
-                            ? (*source.pages)[source.page_index].offset
-                            : source.file_end;
-                    source.file->Seek(page.offset, page_end);
-                    source.remaining = page.point_count;
-                    found = true;
-                    break;
+                // series chunk 内点按时间递增，页 max_timestamp 单调不减。
+                // 从当前位置二分跳过所有在 max(start, cutoff) 之前结束的页；
+                // 首个候选页若已越过 end，后续页同样不可能命中，提前终止。
+                const auto& pages = *source.pages;
+                const int64_t threshold = std::max(state->start, cutoff);
+                const auto begin = pages.begin() +
+                    static_cast<std::ptrdiff_t>(source.page_index);
+                const auto first = std::lower_bound(
+                    begin, pages.end(), threshold,
+                    [](const SstablePageIndexEntry& page, int64_t value) {
+                        return page.max_timestamp < value;
+                    });
+                source.page_index = static_cast<size_t>(first - pages.begin());
+                if (first == pages.end() || first->min_timestamp >= state->end) {
+                    source.page_index = pages.size();
+                    return;
                 }
-                if (!found) return;
+                const auto& page = *first;
+                ++source.page_index;
+                // 窄查询预读截止于选中页，不把后续未命中页带入缓冲。
+                const uint64_t page_end =
+                    source.page_index < pages.size()
+                        ? pages[source.page_index].offset
+                        : source.file_end;
+                source.file->Seek(page.offset, page_end);
+                source.remaining = page.point_count;
             }
             if (source.raw) {
                 constexpr size_t kRecord = sizeof(uint64_t) + sizeof(int64_t) +
@@ -2908,9 +2938,24 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
     constexpr size_t kRecordBytes = sizeof(DataPoint) + sizeof(CommitVersion);
     for (size_t shard_id = 0; shard_id < impl_->shards.size(); ++shard_id) {
         std::lock_guard shard_lock(*impl_->shard_mutex[shard_id]);
-        impl_->shards[shard_id] =
-            std::make_shared<ShardData>(*impl_->shards[shard_id]);
-        auto& points_by_series = impl_->shards[shard_id]->series;
+        auto& shard = impl_->shards[shard_id];
+        // 先只读探测：若没有 series 需要过期，不复制整张 series map，也不
+        // 打断与旧快照共享的 shard。一次过期通常只影响少数 shard。
+        bool needs_expire = false;
+        for (const auto& [_, buffer] : shard->series) {
+            if (!buffer->empty() &&
+                buffer->front().point.timestamp_ms < cutoff) {
+                needs_expire = true;
+                break;
+            }
+        }
+        if (!needs_expire) continue;
+        // 只有旧 ReadView 仍持有整个 shard 时才复制外层 map；独占时直接
+        // 对受影响的 series 做 COW。
+        if (shard.use_count() != 1) {
+            shard = std::make_shared<ShardData>(*shard);
+        }
+        auto& points_by_series = shard->series;
         for (auto series_it = points_by_series.begin();
              series_it != points_by_series.end();) {
             // 有序 buffer 只需检查首点；仅复制确实需要删除前缀的 series。
@@ -3165,6 +3210,14 @@ Status Engine::Close() {
         impl_->flush_cv.notify_all();
         impl_->stopping_compaction = true;
         impl_->compaction_cv.notify_all();
+        // 唤醒阻塞在查询准入 gate 的 Scan；否则 gate 占满时 Close 会永久等待。
+        // 状态变更必须与等待谓词在同一把 scan_mu 下串行化，避免 notify_all
+        // 发生在等待者「判定谓词为假」与「真正进入 wait」之间而丢失唤醒。
+        {
+            std::lock_guard gate(impl_->scan_mu);
+            impl_->scan_gate_stopping.store(true);
+        }
+        impl_->scan_cv.notify_all();
     }
     // The coordinator drains the queue first; only after it is gone may the
     // shard workers be told to stop, otherwise a fragment could be queued for a
