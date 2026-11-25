@@ -15,6 +15,8 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -22,6 +24,7 @@
 
 #include "check.h"
 
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -2943,6 +2946,221 @@ void TestLatencySampling() {
     CHECK(bench::Percentile(&samples, 0.95) == 100.0);
 }
 
+std::set<std::string> SstFilesOnDisk(const std::filesystem::path& db) {
+    std::set<std::string> names;
+    for (const auto& entry : std::filesystem::directory_iterator(db / "sst")) {
+        if (entry.is_regular_file() && entry.path().extension() == ".sst") {
+            names.insert(entry.path().filename().string());
+        }
+    }
+    return names;
+}
+
+std::set<std::string> SstFilesInManifest(const std::filesystem::path& db) {
+    std::ifstream in(db / "MANIFEST");
+    CHECK(in.is_open());
+    std::set<std::string> names;
+    std::string line;
+    std::getline(in, line);  // cutoff / next_version / next_file_number
+    while (std::getline(in, line)) {
+        if (line.rfind("WAL_", 0) == 0 || line.rfind("COVERED ", 0) == 0 ||
+            line.rfind("CHECKSUM ", 0) == 0) {
+            continue;
+        }
+        std::istringstream row(line);
+        size_t index = 0;
+        std::string file;
+        CHECK(static_cast<bool>(row >> index >> file));
+        names.insert(std::filesystem::path(file).filename().string());
+    }
+    return names;
+}
+
+// 查询持有旧文件时合并：被替换的输入当时无法 GC，原实现 Close 不做 GC、
+// 待删除列表只在内存中、Open 只清 *.tmp，这些文件会永久留在磁盘上。
+void TestOrphanSstablesReclaimed(const std::filesystem::path& path) {
+    const Options options{.shard_count = 1,
+                          .enable_background_compaction = false,
+                          .enable_background_gc = false};
+    Status status;
+    auto engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    for (int64_t file = 0; file < 3; ++file) {
+        std::vector<DataPoint> batch;
+        for (int64_t i = 0; i < 100; ++i) {
+            const int64_t timestamp = file * 1000 + i;
+            batch.push_back({1, timestamp, static_cast<double>(timestamp)});
+        }
+        AssertOk(engine->WriteBatch(batch));
+        AssertOk(engine->Flush());
+    }
+    std::unique_ptr<Cursor> held;
+    AssertOk(engine->Scan({1}, 0, 100000, &held));
+    AssertOk(engine->Compact());
+    AssertOk(engine->GarbageCollect());
+    CHECK(SstFilesOnDisk(path).size() == 4);
+    CHECK(SstFilesInManifest(path).size() == 1);
+    CHECK(Read(held.get()).size() == 300);
+    held.reset();
+    AssertOk(engine->Close());
+    engine.reset();
+    // Close 在最终 Flush 后回收已无引用的旧文件。
+    CHECK(SstFilesOnDisk(path) == SstFilesInManifest(path));
+
+    // 模拟崩溃遗留：已改名就位却未登记进 Manifest 的输出；非 .sst 文件不动。
+    const auto live = *SstFilesInManifest(path).begin();
+    std::filesystem::copy_file(path / "sst" / live, path / "sst" / "shard-00-999.sst");
+    std::filesystem::copy_file(path / "sst" / live, path / "sst" / "keep.backup");
+    engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    CHECK(SstFilesOnDisk(path) == SstFilesInManifest(path));
+    CHECK(std::filesystem::exists(path / "sst" / "keep.backup"));
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({1}, 0, 100000, &cursor));
+    const auto points = Read(cursor.get());
+    CHECK(points.size() == 300);
+    for (size_t i = 0; i < points.size(); ++i) {
+        const int64_t expected = static_cast<int64_t>(i / 100) * 1000 +
+                                 static_cast<int64_t>(i % 100);
+        CHECK(points[i].timestamp_ms == expected);
+        CHECK(points[i].value == static_cast<double>(expected));
+    }
+    cursor.reset();
+    EngineStats stats;
+    AssertOk(engine->GetStats(&stats));
+    CHECK(stats.sstable_count == stats.live_sstable_count);
+    AssertOk(engine->Close());
+}
+
+// CURRENT 存在而 MANIFEST 丢失只能是外部损坏：不能按空库打开，更不能把 SST
+// 当作孤儿删掉。
+void TestMissingManifestRejected(const std::filesystem::path& path) {
+    const Options options{.shard_count = 1,
+                          .enable_background_compaction = false,
+                          .enable_background_gc = false};
+    Status status;
+    auto engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    AssertOk(engine->Put({1, 10, 1.0}));
+    AssertOk(engine->Flush());
+    AssertOk(engine->Close());
+    engine.reset();
+    const auto before = SstFilesOnDisk(path);
+    CHECK(!before.empty());
+    CHECK(std::filesystem::exists(path / "CURRENT"));
+    CHECK(std::filesystem::remove(path / "MANIFEST"));
+    engine = Engine::Open(path, options, &status);
+    CHECK(engine == nullptr && !status.ok);
+    CHECK(status.message.find("Manifest missing") != std::string::npos);
+    CHECK(SstFilesOnDisk(path) == before);
+}
+
+// 过期不仅回收数据，也要回收只增不减的写入跟踪表；严格递增与 cutoff 校验不变。
+void TestExpirePrunesWriteTracking(const std::filesystem::path& path) {
+    const Options options{.shard_count = 2,
+                          .enable_background_compaction = false,
+                          .enable_background_gc = false};
+    Status status;
+    auto engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    std::vector<DataPoint> batch;
+    for (uint64_t series = 0; series < 1000; ++series) {
+        batch.push_back({series, static_cast<int64_t>(series), 1.0});
+    }
+    AssertOk(engine->WriteBatch(batch));
+    auto tracking = testing::InspectWriteTracking(*engine);
+    CHECK(tracking.last_timestamp_entries == 1000);
+    CHECK(tracking.hot_series_entries == 1000);
+    AssertOk(engine->ExpireBefore(500));
+    tracking = testing::InspectWriteTracking(*engine);
+    CHECK(tracking.last_timestamp_entries == 500);
+    CHECK(tracking.hot_series_entries == 500);
+    AssertOk(engine->Put({3, 500, 2.0}));     // 已过期 series 可从 cutoff 继续写
+    CHECK(!engine->Put({4, 499, 2.0}).ok);    // cutoff 之前仍拒绝
+    CHECK(!engine->Put({700, 700, 2.0}).ok);  // 存活 series 仍要求严格递增
+    AssertOk(engine->Put({700, 701, 2.0}));
+
+    // SST 仍覆盖到 999，因而保留；重启时从 SST 恢复的跟踪项也要按 cutoff 裁剪。
+    AssertOk(engine->Flush());
+    AssertOk(engine->ExpireBefore(800));
+    tracking = testing::InspectWriteTracking(*engine);
+    CHECK(tracking.last_timestamp_entries == 200);
+    CHECK(tracking.hot_series_entries == 0);
+    AssertOk(engine->Close());
+    engine.reset();
+    engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    tracking = testing::InspectWriteTracking(*engine);
+    CHECK(tracking.last_timestamp_entries == 200);
+    AssertOk(engine->Put({600, 800, 3.0}));
+    CHECK(!engine->Put({900, 900, 3.0}).ok);
+    std::unique_ptr<Cursor> cursor;
+    AssertOk(engine->Scan({600, 900}, 0, 2000, &cursor));
+    const auto points = Read(cursor.get());
+    CHECK(points.size() == 2);
+    CHECK(points[0].series_id == 600 && points[0].timestamp_ms == 800);
+    CHECK(points[1].series_id == 900 && points[1].timestamp_ms == 900);
+    cursor.reset();
+    AssertOk(engine->Close());
+}
+
+// 统计采样与 Flush / Compaction / GC 并发：目录项被并发改名删除时不能抛出，
+// 文件大小读取失败也不能把 (uintmax_t)-1 累加进 sstable_bytes。
+void TestStatsDuringChurn(const std::filesystem::path& path) {
+    Options options;
+    options.shard_count = 2;
+    options.compaction_sstable_threshold = 2;
+    Status status;
+    auto engine = Engine::Open(path, options, &status);
+    AssertOk(status);
+    std::atomic<bool> stop{false};
+    std::atomic<bool> bad{false};
+    std::atomic<size_t> calls{0};
+    std::thread sampler([&] {
+        while (!stop.load()) {
+            EngineStats stats;
+            const auto result = engine->GetStats(&stats);
+            if (!result.ok || stats.sstable_bytes > (uint64_t{1} << 40)) bad = true;
+            ++calls;
+        }
+    });
+    for (int64_t round = 0; round < 40; ++round) {
+        std::vector<DataPoint> points;
+        for (int64_t i = 0; i < 200; ++i) {
+            points.push_back({static_cast<uint64_t>(i % 4), round * 1000 + i, 1.0});
+        }
+        AssertOk(engine->WriteBatch(points));
+        AssertOk(engine->Flush());
+    }
+    AssertOk(engine->Compact());
+    stop = true;
+    sampler.join();
+    CHECK(!bad.load() && calls.load() > 0);
+    AssertOk(engine->Close());
+}
+
+// 空闲引擎不应周期性唤醒：原写协调线程每 200 µs 超时一次并争抢全局锁。
+void TestIdleCoordinatorSleeps(const std::filesystem::path& path) {
+    Status status;
+    auto engine = Engine::Open(path, Options{}, &status);
+    AssertOk(status);
+    AssertOk(engine->Put({1, 1, 1.0}));  // 确认协调线程已就绪并完成过一组
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    rusage before{};
+    rusage after{};
+    CHECK(::getrusage(RUSAGE_SELF, &before) == 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    CHECK(::getrusage(RUSAGE_SELF, &after) == 0);
+    const long switches = after.ru_nvcsw - before.ru_nvcsw;
+    if (switches >= 50) std::cerr << "idle voluntary switches=" << switches << '\n';
+    CHECK(switches < 50);
+    // 唤醒仍然及时：空闲之后的单次写入立即完成。
+    const auto started = std::chrono::steady_clock::now();
+    AssertOk(engine->Put({1, 2, 2.0}));
+    CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(2));
+    AssertOk(engine->Close());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -3019,6 +3237,11 @@ int main(int argc, char** argv) {
         {"query_truncated_read_is_error", [&] { RunWithTimeout([&] { TestQueryTruncatedReadIsError(root / "query_truncated"); }); }},
         {"aggregate_truncated_read_is_error", [&] { RunWithTimeout([&] { TestAggregateTruncatedReadIsError(root / "aggregate_truncated"); }); }},
         {"cow_same_shard_shared_series", [&] { TestCowSameShardSharedSeries(root / "cow_same_shard"); }},
+        {"orphan_sstables_reclaimed", [&] { RunWithTimeout([&] { TestOrphanSstablesReclaimed(root / "orphan_sst"); }); }},
+        {"missing_manifest_rejected", [&] { RunWithTimeout([&] { TestMissingManifestRejected(root / "missing_manifest"); }); }},
+        {"expire_prunes_write_tracking", [&] { RunWithTimeout([&] { TestExpirePrunesWriteTracking(root / "expire_tracking"); }); }},
+        {"stats_during_churn", [&] { RunWithTimeout([&] { TestStatsDuringChurn(root / "stats_churn"); }); }},
+        {"idle_coordinator_sleeps", [&] { RunWithTimeout([&] { TestIdleCoordinatorSleeps(root / "idle_coordinator"); }); }},
     };
     const std::string filter = argc > 1 ? argv[1] : std::string();
     size_t ran = 0;

@@ -922,6 +922,10 @@ struct Engine::Impl {
     std::condition_variable compaction_done_cv;
     std::thread compaction_worker;
     std::condition_variable write_cv;
+    // 写协调线程专用：只在队列由空变非空、停止或存储失败时通知。原先与等待
+    // done/容量的写线程共用 write_cv，notify_one 可能唤醒别的等待者，只能靠
+    // 200 µs 超时轮询兜底，空闲时每秒数千次空唤醒并争抢全局锁。
+    std::condition_variable coordinator_cv;
     std::thread write_worker;
     std::deque<std::shared_ptr<PendingWrite>> write_queue;
     bool stopping_write{false};
@@ -976,6 +980,7 @@ struct Engine::Impl {
     void RecordStorageError(Status status) {
         if (storage_error.ok) storage_error = std::move(status);
         write_cv.notify_all();
+        coordinator_cv.notify_all();
         compaction_done_cv.notify_all();
     }
     std::unordered_map<uint64_t, uint64_t> hot_series_points;
@@ -1088,6 +1093,27 @@ struct Engine::Impl {
         }
         for (const auto& point : points) {
             AppendToMemtable(point.series_id, point.timestamp_ms, point, version);
+        }
+    }
+
+    // 清理失效的写入跟踪项。last_timestamps 只用于拒绝不递增的写入，而早于
+    // cutoff 的时间戳本就会被 ValidateBatch 拒绝：last < cutoff 的条目对任何
+    // 判定都不再起作用。计数归零的热点项同理。否则 series 持续更替时两张表
+    // 只增不减（过期只回收数据，不回收跟踪项）。
+    void PruneWriteTrackingLocked() {
+        for (auto it = last_timestamps.begin(); it != last_timestamps.end();) {
+            if (it->second < cutoff) {
+                it = last_timestamps.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = hot_series_points.begin(); it != hot_series_points.end();) {
+            if (it->second == 0) {
+                it = hot_series_points.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
 
@@ -1414,6 +1440,43 @@ struct Engine::Impl {
         return result;
     }
 
+    // 启动时回收孤儿 SST：被 Compaction / 过期替换、当时仍被查询引用而来不及
+    // GC 的旧文件（待删除列表只在内存中，重启即丢失），以及已改名就位但
+    // Manifest 尚未发布就崩溃留下的 Flush / Compaction 输出。前提是 Manifest
+    // 已成功加载；删除前先持久化读到的 Manifest 与根目录项，保证删除依据的
+    // 文件集合在掉电后不会回退到仍引用这些文件的旧 Manifest。未发布输出的数据
+    // 仍在 WAL 中（WAL 只在 Manifest 发布后轮转），删除不丢已确认写入。
+    Status RemoveOrphanSstables() {
+        if (!SyncFile(manifest_path) || !SyncDirectory(root)) {
+            return Status::Error("cannot persist Manifest before orphan cleanup");
+        }
+        std::unordered_set<std::string> live;
+        for (const auto& file : current_files) {
+            live.insert(file.lexically_normal().string());
+        }
+        const auto dir = root / "sst";
+        std::vector<std::filesystem::path> orphans;
+        std::error_code ec;
+        std::filesystem::directory_iterator it(dir, ec);
+        for (; !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+            std::error_code entry_ec;
+            if (!it->is_regular_file(entry_ec) || entry_ec) continue;
+            const auto& path = it->path();
+            if (path.extension() != ".sst") continue;
+            if (live.count(path.lexically_normal().string()) == 0) {
+                orphans.push_back(path);
+            }
+        }
+        // 列目录或删除失败都只影响空间回收：已识别的照删，其余留给下次打开。
+        bool removed = false;
+        for (const auto& path : orphans) {
+            std::error_code remove_ec;
+            if (std::filesystem::remove(path, remove_ec)) removed = true;
+        }
+        if (removed) (void)SyncDirectory(dir);
+        return Status::Ok();
+    }
+
     Status PublishManifestLocked(
         const std::vector<std::filesystem::path>& files) {
         const auto manifest_tmp = manifest_path.string() + ".tmp";
@@ -1605,7 +1668,15 @@ struct Engine::Impl {
             std::getline(current, name);
             if (name == "MANIFEST") active_manifest = manifest_path;
         }
-        if (!std::filesystem::exists(active_manifest)) return Status::Ok();
+        if (!std::filesystem::exists(active_manifest)) {
+            // CURRENT 只在 MANIFEST 改名就位之后才写入，所以 CURRENT 存在而
+            // MANIFEST 缺失只能是外部删除或损坏。按空库打开会静默丢掉全部 SST，
+            // 启动清理还会把它们当作孤儿删除，因此拒绝打开。
+            if (std::filesystem::exists(current_path)) {
+                return Status::Error("Manifest missing although CURRENT exists");
+            }
+            return Status::Ok();
+        }
         std::ifstream in(active_manifest);
         if (!in) return Status::Error("cannot read Manifest");
         size_t shard_id = 0;
@@ -2115,7 +2186,8 @@ Engine::Engine(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {
         PinCurrentThread(impl_->options.cpu_budget, 0);
         while (true) {
             std::unique_lock lock(impl_->mutex);
-            impl_->write_cv.wait_for(lock, std::chrono::microseconds(200), [&] {
+            // 谓词与所有通知点都在全局 mutex 下修改，不会丢失唤醒，无需超时。
+            impl_->coordinator_cv.wait(lock, [&] {
                 return !impl_->write_queue.empty() || impl_->stopping_write;
             });
             if (impl_->stopping_write && impl_->write_queue.empty()) return;
@@ -2137,7 +2209,7 @@ Engine::Engine(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {
             // The lock is released while waiting, so the writers can enqueue.
             const size_t target = std::min<size_t>(impl_->active_writers, 8);
             if (target > 1) {
-                impl_->write_cv.wait_for(lock, std::chrono::milliseconds(2), [&] {
+                impl_->coordinator_cv.wait_for(lock, std::chrono::milliseconds(2), [&] {
                     return impl_->write_queue.size() >= target ||
                            impl_->stopping_write;
                 });
@@ -2387,6 +2459,10 @@ std::unique_ptr<Engine> Engine::Open(const std::filesystem::path& path,
         impl->wal_format != (options.sharded_wal ? 2u : 1u)) {
         return fail(Status::Error("WAL format mismatch"));
     }
+    if (std::filesystem::exists(impl->manifest_path)) {
+        load_status = impl->RemoveOrphanSstables();
+        if (!load_status.ok) return fail(load_status);
+    }
     if (options.sharded_wal) {
         impl->shard_wal_fd.assign(options.shard_count, -1);
         impl->shard_wal_segment.assign(options.shard_count, 1);
@@ -2395,12 +2471,14 @@ std::unique_ptr<Engine> Engine::Open(const std::filesystem::path& path,
         if (!impl->OpenShardedWalFds()) {
             return fail(Status::Error("cannot open shard WAL"));
         }
+        impl->PruneWriteTrackingLocked();
         impl->visible_version = impl->next_version - 1;
         if (status) *status = Status::Ok();
         return std::unique_ptr<Engine>(new Engine(std::move(impl)));
     }
     load_status = impl->ReplayWal();
     if (!load_status.ok) return fail(load_status);
+    impl->PruneWriteTrackingLocked();
     impl->visible_version = impl->next_version - 1;
     // Drop a torn tail in the newest segment before appending again: otherwise
     // the next crash would leave a valid record behind a malformed one and the
@@ -2505,7 +2583,7 @@ Status Engine::WriteBatch(const std::vector<DataPoint>& points,
     // Lets the coordinator know how many writers a group can contain, so it
     // waits for them instead of committing one request per WAL fsync.
     ++impl_->active_writers;
-    impl_->write_cv.notify_one();
+    impl_->coordinator_cv.notify_one();
     impl_->write_cv.wait(lock, [&] { return request->done; });
     --impl_->active_writers;
     if (request->status.ok && version) *version = request->version;
@@ -2982,6 +3060,7 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
             }
         }
     }
+    impl_->PruneWriteTrackingLocked();
     impl_->visible_version = commit;
     impl_->write_cv.notify_all();
     if (version) *version = commit;
@@ -3206,6 +3285,7 @@ Status Engine::Close() {
         FaultPoint("close_begin");
         impl_->stopping_write = true;
         impl_->write_cv.notify_all();
+        impl_->coordinator_cv.notify_all();
         impl_->stopping_flush = true;
         impl_->flush_cv.notify_all();
         impl_->stopping_compaction = true;
@@ -3237,6 +3317,11 @@ Status Engine::Close() {
     if (impl_->compaction_worker.joinable()) impl_->compaction_worker.join();
     std::lock_guard lock(impl_->mutex);
     auto status = FlushLocked(true);
+    // 关闭前回收已无查询引用的过期 / 被合并 SST。后台 GC 只在 Flush 或
+    // Compaction 之后运行；若最后一次 Compaction 时恰有查询持有旧文件，它们
+    // 会一直留到下次打开。存储错误时 GC 自行跳过；仍被存活游标引用或删除
+    // 失败的文件由下次 Open 的孤儿清理回收，所以这里只做尽力而为。
+    if (status.ok) (void)impl_->GarbageCollectLocked();
     // Always release descriptors and mark closed, even if the final flush fails.
     // Otherwise destruction leaves a permanently closing, half-stopped engine.
     impl_->closed = true;
@@ -3261,18 +3346,19 @@ Status Engine::Close() {
 
 Status Engine::GetStats(EngineStats* stats) const {
     if (!stats) return Status::Error("stats output is null");
-    std::lock_guard lock(impl_->mutex);
-    stats->visible_version = impl_->visible_version;
-    stats->expiration_cutoff = impl_->cutoff;
-    stats->mutable_points = 0;
-    for (size_t i = 0; i < impl_->shards.size(); ++i) {
-        std::lock_guard shard_lock(*impl_->shard_mutex[i]);
-        stats->mutable_points += impl_->shards[i]->point_count();
-    }
-    stats->immutable_points = 0;
+    // 目录遍历与进程内存采样只读文件系统 / 内核，不读可变引擎状态（目录路径、
+    // 分片数与 WAL 模式在 Open 后不变），放在全局锁外，避免高频采样阻塞写入。
+    // 遍历期间文件可能被并发 Flush / Compaction / GC 改名或删除：一律使用
+    // error_code 版本，失败只让该项统计偏小，不能把文件系统异常抛给调用方。
     uint64_t wal_bytes = 0;
     auto add_dir_bytes = [&wal_bytes](const std::filesystem::path& dir) {
-        for (const uint64_t number : ListSegmentNumbers(dir)) {
+        std::vector<uint64_t> segments;
+        try {
+            segments = ListSegmentNumbers(dir);
+        } catch (const std::filesystem::filesystem_error&) {
+            return;
+        }
+        for (const uint64_t number : segments) {
             std::error_code ec;
             const auto size = std::filesystem::file_size(
                 WalSegmentPath(dir, number), ec);
@@ -3287,6 +3373,59 @@ Status Engine::GetStats(EngineStats* stats) const {
     } else {
         add_dir_bytes(impl_->wal_dir);
     }
+    uint64_t sstable_count = 0;
+    uint64_t sstable_bytes = 0;
+    {
+        std::error_code dir_error;
+        std::filesystem::directory_iterator it(impl_->root / "sst", dir_error);
+        for (; !dir_error && it != std::filesystem::directory_iterator();
+             it.increment(dir_error)) {
+            std::error_code entry_error;
+            if (!it->is_regular_file(entry_error) || entry_error) continue;
+            if (it->path().extension() != ".sst") continue;
+            ++sstable_count;
+            const auto size = std::filesystem::file_size(it->path(), entry_error);
+            if (!entry_error) sstable_bytes += static_cast<uint64_t>(size);
+        }
+    }
+    uint64_t peak_rss_bytes = 0;
+    struct rusage usage {};
+    if (::getrusage(RUSAGE_SELF, &usage) == 0) {
+#if defined(__APPLE__)
+        peak_rss_bytes = static_cast<uint64_t>(usage.ru_maxrss);
+#else
+        peak_rss_bytes = static_cast<uint64_t>(usage.ru_maxrss) * 1024ULL;
+#endif
+    }
+    uint64_t rss_bytes = 0;
+#if defined(__linux__)
+    // statm reports current resident pages, not the lifetime ru_maxrss peak.
+    {
+        std::ifstream statm("/proc/self/statm");
+        uint64_t virtual_pages = 0, resident_pages = 0;
+        const long page_size = ::sysconf(_SC_PAGESIZE);
+        if (page_size > 0 && (statm >> virtual_pages >> resident_pages)) {
+            rss_bytes = resident_pages * static_cast<uint64_t>(page_size);
+        }
+    }
+#elif defined(__APPLE__)
+    mach_task_basic_info_data_t info{};
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (::task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                    reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS) {
+        rss_bytes = info.resident_size;
+    }
+#endif
+
+    std::lock_guard lock(impl_->mutex);
+    stats->visible_version = impl_->visible_version;
+    stats->expiration_cutoff = impl_->cutoff;
+    stats->mutable_points = 0;
+    for (size_t i = 0; i < impl_->shards.size(); ++i) {
+        std::lock_guard shard_lock(*impl_->shard_mutex[i]);
+        stats->mutable_points += impl_->shards[i]->point_count();
+    }
+    stats->immutable_points = 0;
     stats->wal_bytes = wal_bytes;
     stats->wal_bytes_replayed = impl_->wal_bytes_replayed;
     stats->wal_syncs = impl_->wal_syncs;
@@ -3311,49 +3450,10 @@ Status Engine::GetStats(EngineStats* stats) const {
     stats->active_read_views = impl_->active_read_views;
     stats->obsolete_sstable_count = impl_->obsolete_sstables.size();
     stats->live_sstable_count = impl_->sstable_metadata.size();
-    stats->sstable_count = 0;
-    stats->sstable_bytes = 0;
-    std::error_code dir_error;
-    const auto sstable_dir = impl_->root / "sst";
-    if (std::filesystem::exists(sstable_dir, dir_error)) {
-        for (const auto& entry :
-             std::filesystem::recursive_directory_iterator(sstable_dir)) {
-            if (!entry.is_regular_file()) continue;
-            if (entry.path().extension() == ".sst") {
-                ++stats->sstable_count;
-                std::error_code size_error;
-                stats->sstable_bytes +=
-                    std::filesystem::file_size(entry.path(), size_error);
-            }
-        }
-    }
-    struct rusage usage {};
-    if (::getrusage(RUSAGE_SELF, &usage) == 0) {
-#if defined(__APPLE__)
-        stats->peak_rss_bytes =
-            static_cast<uint64_t>(usage.ru_maxrss);
-#else
-        stats->peak_rss_bytes =
-            static_cast<uint64_t>(usage.ru_maxrss) * 1024ULL;
-#endif
-    }
-    stats->rss_bytes = 0;
-#if defined(__linux__)
-    // statm reports current resident pages, not the lifetime ru_maxrss peak.
-    std::ifstream statm("/proc/self/statm");
-    uint64_t virtual_pages = 0, resident_pages = 0;
-    const long page_size = ::sysconf(_SC_PAGESIZE);
-    if (page_size > 0 && (statm >> virtual_pages >> resident_pages)) {
-        stats->rss_bytes = resident_pages * static_cast<uint64_t>(page_size);
-    }
-#elif defined(__APPLE__)
-    mach_task_basic_info_data_t info{};
-    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
-    if (::task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
-                    reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS) {
-        stats->rss_bytes = info.resident_size;
-    }
-#endif
+    stats->sstable_count = sstable_count;
+    stats->sstable_bytes = sstable_bytes;
+    stats->peak_rss_bytes = peak_rss_bytes;
+    stats->rss_bytes = rss_bytes;
     stats->engine_threads = 2 +
                             (impl_->options.enable_background_compaction ? 1 : 0) +
                             impl_->shards.size();
@@ -3377,6 +3477,12 @@ SeriesBufferInfo InspectSeriesBuffer(const Engine& engine, uint64_t series_id) {
     const auto it = series.find(series_id);
     if (it == series.end() || !it->second) return {};
     return {it->second->size(), it->second->capacity()};
+}
+
+WriteTrackingInfo InspectWriteTracking(const Engine& engine) {
+    const auto& impl = *engine.impl_;
+    std::lock_guard lock(impl.mutex);
+    return {impl.last_timestamps.size(), impl.hot_series_points.size()};
 }
 
 }  // namespace testing

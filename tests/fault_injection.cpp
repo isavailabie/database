@@ -12,6 +12,8 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -292,9 +294,38 @@ Points AcknowledgedPoints(const std::vector<Acknowledgement>& acks, size_t round
     return expected;
 }
 
+// 磁盘上的 SST 必须恰好是 Manifest 登记的集合：崩溃留下的未发布输出、GC 中途
+// 退出残留的已替换输入，都应在恢复打开时回收，正常关闭后也不得遗留。
+void CheckDiskMatchesManifest(const std::filesystem::path& path) {
+    std::set<std::string> on_disk;
+    for (const auto& entry : std::filesystem::directory_iterator(path / "sst")) {
+        if (entry.is_regular_file() && entry.path().extension() == ".sst") {
+            on_disk.insert(entry.path().filename().string());
+        }
+    }
+    std::ifstream in(path / "MANIFEST");
+    CHECK(in.is_open());
+    std::set<std::string> listed;
+    std::string line;
+    std::getline(in, line);
+    while (std::getline(in, line)) {
+        if (line.rfind("WAL_", 0) == 0 || line.rfind("COVERED ", 0) == 0 ||
+            line.rfind("CHECKSUM ", 0) == 0) {
+            continue;
+        }
+        std::istringstream row(line);
+        size_t index = 0;
+        std::string file;
+        CHECK(static_cast<bool>(row >> index >> file));
+        listed.insert(std::filesystem::path(file).filename().string());
+    }
+    CHECK(on_disk == listed);
+}
+
 void VerifyRecovery(const std::filesystem::path& path, bool sharded_wal,
                     size_t round, Points acknowledged) {
     auto engine = OpenEngine(path, sharded_wal);
+    CheckDiskMatchesManifest(path);
     Points with_candidate = acknowledged;
     Apply(&with_candidate, Batch(4, round, kCandidateVersion));
     const Points recovered = ReadPoints(*engine);
@@ -322,6 +353,7 @@ void VerifyRecovery(const std::filesystem::path& path, bool sharded_wal,
     CheckState(*engine, expected, version, kRecoveryExpirationCutoff);
     CHECK(engine->Close().ok);
     engine.reset();
+    CheckDiskMatchesManifest(path);
 
     engine = OpenEngine(path, sharded_wal);
     CheckState(*engine, expected, version, kRecoveryExpirationCutoff);
@@ -338,6 +370,7 @@ void VerifyRecovery(const std::filesystem::path& path, bool sharded_wal,
     CHECK(engine->GarbageCollect().ok);
     CHECK(engine->Close().ok);
     engine.reset();
+    CheckDiskMatchesManifest(path);
 }
 
 void RunCrashRound(const std::filesystem::path& path, bool sharded_wal,

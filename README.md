@@ -120,6 +120,28 @@ FD 预算、低干扰统计、持久化索引）逐项复核后也因风险/复�
 （各 5/5 通过）与 Release 功能连续 10 轮，隔离变体源码树也重跑完整 CTest。
 本轮仅提交文档与原始数据，未改动引擎代码。
 
+## 第 3 轮复查修复（2026-11-25）
+
+收敛后对全量代码复查，修复 1 个真实资源泄漏和 4 个次要问题：
+
+- **孤儿 SST 永久泄漏**：待删除列表只在内存中，`Close` 不做 GC，`Open` 只清理
+  `.tmp`。热点验收库磁盘上 103 个 SST 只有 55 个登记在 MANIFEST。现在 `Open`
+  先持久化 MANIFEST 再删除未登记的 `.sst`，`Close` 在最终 Flush 后执行一次 GC；
+  在该库副本上回收 48 个文件、27.3 MB，恢复点数与旧引擎一致；
+- CURRENT 存在而 MANIFEST 缺失时拒绝打开（以前会按空库打开）；
+- `GetStats` 改用 `error_code` 版目录遍历，并把文件系统和内存采样移到全局锁外；
+- 写协调线程改用专用条件变量：空闲 5 s 的 CPU 从约 136 ms 降到 0.3 ms 以内，
+  自愿上下文切换从约 13,000 次降到个位数；
+- `last_timestamps` / `hot_series_points` 在过期和重启后收缩。
+
+协调线程的改动同时修掉了组提交等待中的丢失唤醒：千万点 mixed 写吞吐两组独立实验
+**+33.45% / +32.40%**（8/8 轮同向），写入 p50 下降 33–39%，扫描吞吐 −1.8% 到 −3.4%；
+导入与 append 持平。功能用例 68 → 73，新增的 5 个用例中有 4 个在旧引擎上失败；
+故障注入在每次恢复后都核对磁盘 SST 与 MANIFEST 一致。Release / Debug / ASan+UBSan
+各自 CTest 5/5，Release 连续 10 轮通过。详见
+[`doc/性能优化-迭代-2026-11-25.md`](doc/性能优化-迭代-2026-11-25.md) §6，
+原始指标见 `doc/performance-results-round3-*.json`。
+
 ## 基准
 
 可复现的评测由 `benchmark/runner.py` 驱动，目录结构与课程 benchmark 一致：
@@ -168,7 +190,7 @@ python3 benchmark/runner.py --source "$PWD" --output build/eval-quick --profile 
 - `Put`、`WriteBatch`、`Scan`、窗口 `Aggregate`、`ExpireBefore`
 - Series 分片和连续 vector MemTable（递增追加摊销 O(1)，逻辑容量背压，Flush 后清空；
   逻辑点数额度不等同于实际 vector capacity 或 RSS 硬上限）
-- WAL 校验、持久 fd 和小批量 Group Commit
+- WAL 校验、持久 fd 和小批量 Group Commit；写协调线程使用专用条件变量，空闲时不轮询
 - 增量 Flush、SSTable、Manifest 和尾部 WAL 重放
 - 无损 timestamp/value 编码（zigzag varint + 原始 float64 位）
 - SSTable SeriesIndex（含字节长度）和按需磁盘分页读取；页索引用 `lower_bound` 跳过
@@ -181,6 +203,8 @@ python3 benchmark/runner.py --source "$PWD" --output build/eval-quick --profile 
 - Compaction 归并 I/O 期间释放全局锁，不阻塞前台写入
 - 后台 Flush、阈值触发 Compaction 和后台 GC
 - 引用计数 GC：读取并发下也能回收过期 SSTable 文件
+- 孤儿 SST 回收：`Open` 先持久化 MANIFEST 再删除未登记的 `.sst`，`Close` 收尾 GC；
+  CURRENT 存在而 MANIFEST 缺失时拒绝打开
 - ReadView、过期视图和物理过期清理；`ExpireBefore` 先只读探测再按需 COW，
   前缀删除后按阈值重建闲置 vector capacity，避免逻辑额度已归还但实际 RSS 滞留
 - 查询先在 16 名额 gate 取得准入再取 ReadView，等待者不固定旧快照；

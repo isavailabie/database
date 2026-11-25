@@ -138,6 +138,15 @@ struct SeriesBufferInfo {
 
 SeriesBufferInfo InspectSeriesBuffer(const Engine& engine, uint64_t series_id);
 
+// Test-only: sizes of the per-series write-validation tables, so the suite can
+// prove that expiration also releases tracking entries, not just data.
+struct WriteTrackingInfo {
+    size_t last_timestamp_entries{};
+    size_t hot_series_entries{};
+};
+
+WriteTrackingInfo InspectWriteTracking(const Engine& engine);
+
 // Process-local, test-only stage hook. Empty by default. Install before an
 // operation; callbacks may run on worker threads and must not throw or reenter
 // the engine. Used to prove a crash occurs inside a persistence operation.
@@ -182,6 +191,8 @@ private:
     // The test hook above needs the impl to reach the memtable buffer.
     friend testing::SeriesBufferInfo testing::InspectSeriesBuffer(
         const Engine& engine, uint64_t series_id);
+    friend testing::WriteTrackingInfo testing::InspectWriteTracking(
+        const Engine& engine);
 };
 
 }  // namespace tsdb
