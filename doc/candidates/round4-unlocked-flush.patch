@@ -1,0 +1,662 @@
+diff --git a/src/tsdb.cpp b/src/tsdb.cpp
+index 0604880..402a885 100644
+--- a/src/tsdb.cpp
++++ b/src/tsdb.cpp
+@@ -382,6 +382,9 @@ struct ReadView {
+     CommitVersion version{};
+     int64_t cutoff{std::numeric_limits<int64_t>::min()};
+     std::vector<std::shared_ptr<const ShardData>> shards;
++    // 正在落盘的冻结 MemTable（无 Flush 进行时为空）。与 shards 的版本不相交，
++    // 同一时间戳的重复点由查询按版本去重。
++    std::vector<std::shared_ptr<const ShardData>> imm_shards;
+     std::vector<std::shared_ptr<const SstableMetadata>> sstables;
+ };
+ 
+@@ -986,6 +989,18 @@ struct Engine::Impl {
+         compaction_done_cv.notify_all();
+     }
+     std::unordered_map<uint64_t, uint64_t> hot_series_points;
++    // ---- 锁外 Flush ----------------------------------------------------------
++    // Flush 在全局锁内「冻结」当前 MemTable 并切换到新 WAL 段，随后在锁外
++    // 编码、写入并 fsync SST，最后回到锁内发布 Manifest。冻结期间写入继续
++    // 进入新的可变 MemTable 与新 WAL 段；查询同时读可变、冻结两层与 SST。
++    // 同一时刻至多一个 Flush 在途；ExpireBefore 等待在途 Flush 结束，因此
++    // 冻结层在落盘期间不会被修改。
++    std::vector<std::shared_ptr<ShardData>> imm_shards;
++    // 冻结层的逻辑字节与各 series 点数：仍计入背压，直到 SST 发布后才归还。
++    size_t imm_bytes{0};
++    std::unordered_map<uint64_t, uint64_t> imm_hot_series_points;
++    bool flush_inflight{false};
++    std::condition_variable flush_state_cv;
+     std::vector<CommitVersion> covered_commit_versions;
+     CommitVersion metadata_covered_commit_version{0};
+     size_t active_read_views{0};
+@@ -1025,6 +1040,7 @@ struct Engine::Impl {
+             std::lock_guard lock(*shard_mutex[i]);
+             view.shards.push_back(shards[i]);
+         }
++        view.imm_shards.assign(imm_shards.begin(), imm_shards.end());
+         for (const auto& sstable : sstable_metadata) {
+             view.sstables.push_back(sstable);
+             ++sstable->refs;
+@@ -1883,10 +1899,11 @@ struct Engine::Impl {
+         return Status::Ok();
+     }
+ 
+-    // Called by a flush while it holds the global lock and after it published a
+-    // manifest covering every record written so far: the older segments can be
+-    // dropped, and later commits continue in a fresh one.
+-    bool RotateWalLocked() {
++    // 轮转分两步。冻结 MemTable 时（持锁）先切到新段并持久化其目录项：
++    // 此后的提交只进新段，旧段只含版本 <= 冻结点的记录。旧段要等覆盖它们的
++    // Manifest 发布之后才能删除（RetireWalSegmentsLocked）；在此之前崩溃，
++    // 恢复会重放旧段，已写出但未发布的 SST 由启动时的孤儿清理删除。
++    bool OpenNextWalSegmentLocked() {
+         const uint64_t next = wal_segment + 1;
+         const auto path = WalSegmentPath(wal_dir, next);
+         const int fd =
+@@ -1899,15 +1916,55 @@ struct Engine::Impl {
+         if (wal_fd >= 0) ::close(wal_fd);
+         wal_fd = fd;
+         wal_segment = next;
+-        // Deleting the retired segments does not depend on the directory sync
+-        // succeeding: the manifest already covers them either way.
+-        const bool synced = SyncDirectory(wal_dir);
+-        for (const uint64_t number : ListWalSegments()) {
+-            if (number >= wal_segment) continue;
++        return true;
++    }
++
++    // 删除编号小于 keep_from 的段。只在覆盖它们的 Manifest 已发布后调用；
++    // 删除失败只占空间（恢复会按 covered version 跳过已落盘记录）。
++    static void RemoveSegmentsBelow(const std::filesystem::path& dir,
++                                    uint64_t keep_from) {
++        std::vector<uint64_t> segments;
++        try {
++            segments = ListSegmentNumbers(dir);
++        } catch (const std::filesystem::filesystem_error&) {
++            return;
++        }
++        for (const uint64_t number : segments) {
++            if (number >= keep_from) continue;
+             std::error_code ec;
+-            std::filesystem::remove(WalSegmentPath(wal_dir, number), ec);
++            std::filesystem::remove(WalSegmentPath(dir, number), ec);
+         }
+-        return synced;
++    }
++
++    // 冻结时记录的各 WAL 目录新段号：发布后删除更早的段。
++    struct WalRetirePlan {
++        uint64_t global{0};
++        std::vector<uint64_t> shard;
++        uint64_t commit{0};
++    };
++
++    bool OpenNextWalSegmentsLocked(WalRetirePlan* plan) {
++        if (!sharded_wal) {
++            if (!OpenNextWalSegmentLocked()) return false;
++            plan->global = wal_segment;
++            return true;
++        }
++        if (!OpenNextShardedWalSegmentsLocked()) return false;
++        plan->shard = shard_wal_segment;
++        plan->commit = commit_wal_segment;
++        return true;
++    }
++
++    void RetireWalSegmentsLocked(const WalRetirePlan& plan) {
++        if (!sharded_wal) {
++            RemoveSegmentsBelow(wal_dir, plan.global);
++            return;
++        }
++        // 先删分片段再删提交段：中途崩溃只会留下无分片数据的提交范围，无害。
++        for (size_t i = 0; i < plan.shard.size(); ++i) {
++            RemoveSegmentsBelow(ShardWalDir(i), plan.shard[i]);
++        }
++        RemoveSegmentsBelow(commit_wal_dir, plan.commit);
+     }
+ 
+     // ---- sharded WAL -------------------------------------------------------
+@@ -2149,9 +2206,9 @@ struct Engine::Impl {
+                SyncDirectoryChain(wal_dir) && SyncDirectoryChain(root);
+     }
+ 
+-    // Called by a flush while holding the lock and after the manifest covered
+-    // every record written so far.
+-    bool RotateShardedWalLocked() {
++    // 冻结 MemTable 时（持锁）为每个分片与提交日志切到新段；旧段的删除
++    // 推迟到 Manifest 发布之后（RetireWalSegmentsLocked）。
++    bool OpenNextShardedWalSegmentsLocked() {
+         auto rotate = [](const std::filesystem::path& dir, uint64_t* segment,
+                          int* fd) {
+             const uint64_t next = *segment + 1;
+@@ -2166,11 +2223,6 @@ struct Engine::Impl {
+             if (*fd >= 0) ::close(*fd);
+             *fd = new_fd;
+             *segment = next;
+-            for (const uint64_t number : ListSegmentNumbers(dir)) {
+-                if (number >= *segment) continue;
+-                std::error_code ec;
+-                std::filesystem::remove(WalSegmentPath(dir, number), ec);
+-            }
+             return true;
+         };
+         for (size_t i = 0; i < shards.size(); ++i) {
+@@ -2322,7 +2374,7 @@ Engine::Engine(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {
+             });
+             if (impl_->stopping_flush) return;
+             impl_->flush_requested = false;
+-            const auto flush_status = FlushLocked(true);
++            const auto flush_status = FlushLocked(lock);
+             const bool flushed = flush_status.ok;
+             if (!flushed) impl_->RecordStorageError(flush_status);
+             impl_->write_cv.notify_all();
+@@ -2550,8 +2602,14 @@ Status Engine::WriteBatch(const std::vector<DataPoint>& points,
+         for (const auto& [series, count] : counts) {
+             (void)count;
+             const auto current = impl_->hot_series_points.find(series);
+-            projected.emplace(series, current == impl_->hot_series_points.end()
+-                                      ? 0 : current->second);
++            uint64_t resident = current == impl_->hot_series_points.end()
++                                    ? 0 : current->second;
++            // 冻结层落盘前仍占内存，热点额度按两层合计。
++            const auto frozen = impl_->imm_hot_series_points.find(series);
++            if (frozen != impl_->imm_hot_series_points.end()) {
++                resident += frozen->second;
++            }
++            projected.emplace(series, resident);
+         }
+         for (const auto& pending : impl_->write_queue) {
+             reserved_bytes += pending->points.size() * kPointBytes;
+@@ -2696,9 +2754,9 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
+     std::set<uint64_t> unique_series(series_ids.begin(), series_ids.end());
+     for (const auto series_id : unique_series) {
+         const size_t shard_id = impl_->ShardFor(series_id);
+-        const auto& shard_series = view.shards[shard_id]->series;
+-        const auto series_it = shard_series.find(series_id);
+-        if (series_it != shard_series.end() && series_it->second) {
++        auto add_memtable_source = [&](const ShardData& shard) {
++            const auto series_it = shard.series.find(series_id);
++            if (series_it == shard.series.end() || !series_it->second) return;
+             auto source = std::make_shared<Source>();
+             source->series_id = series_id;
+             source->memtable = series_it->second;
+@@ -2706,7 +2764,9 @@ Status Engine::Scan(const std::vector<uint64_t>& series_ids, int64_t start,
+                 std::max(start, view.cutoff));
+             source->mem_end = source->memtable->LowerBoundIndex(end);
+             state->sources.push_back(std::move(source));
+-        }
++        };
++        add_memtable_source(*view.shards[shard_id]);
++        if (!view.imm_shards.empty()) add_memtable_source(*view.imm_shards[shard_id]);
+         for (const auto& sstable : view.sstables) {
+             if (sstable->shard_id != shard_id) continue;
+             const auto entry_it = sstable->series.find(series_id);
+@@ -2959,8 +3019,10 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
+         if (version) *version = impl_->next_version - 1;
+         return Status::Ok();
+     }
++    // 冻结层落盘期间不得修改：等待在途 Flush 发布（发布时会 notify write_cv）。
+     impl_->write_cv.wait(lock, [&] {
+-        return impl_->write_queue.empty() || impl_->closing || !impl_->storage_error.ok;
++        return (impl_->write_queue.empty() && !impl_->flush_inflight) ||
++               impl_->closing || !impl_->storage_error.ok;
+     });
+     if (impl_->closed || impl_->closing) return Status::Error("engine is closed");
+     if (!impl_->storage_error.ok) return impl_->storage_error;
+@@ -3069,11 +3131,17 @@ Status Engine::ExpireBefore(int64_t cutoff, CommitVersion* version) {
+     return Status::Ok();
+ }
+ 
+-Status Engine::FlushLocked(bool incremental) {
+-    const NsTimer flush_timer(&impl_->flush_ns);
+-    (void)incremental;
++Status Engine::FlushLocked(std::unique_lock<std::mutex>& lock) {
++    if (impl_->closed) return Status::Error("engine is closed");
++    if (!impl_->storage_error.ok) return impl_->storage_error;
++    // 至多一个 Flush 在途：后来者等待前一个发布，再冻结自己的 MemTable，
++    // 因此同步 Flush() 返回时，调用前确认的全部写入都已在 SST 中。
++    impl_->flush_state_cv.wait(lock, [&] {
++        return !impl_->flush_inflight || impl_->closed || !impl_->storage_error.ok;
++    });
+     if (impl_->closed) return Status::Error("engine is closed");
+     if (!impl_->storage_error.ok) return impl_->storage_error;
++    const NsTimer flush_timer(&impl_->flush_ns);
+ 
+     struct Job {
+         size_t shard_id{};
+@@ -3085,14 +3153,44 @@ Status Engine::FlushLocked(bool incremental) {
+         std::shared_ptr<SstableMetadata> metadata;
+     };
+ 
++    // ---- 冻结（持锁）：写协调线程在提交全程持有全局锁，此刻没有半应用的
++    // 提交组，next_version - 1 之前的版本全部位于当前 MemTable 或 SST 中。
++    const CommitVersion frozen_version = impl_->next_version - 1;
++    const CommitVersion skip_through = impl_->last_flushed_version;
++    Impl::WalRetirePlan retire;
++    // 先切 WAL 段：失败时 MemTable 原样保留，不产生冻结层。
++    if (!impl_->OpenNextWalSegmentsLocked(&retire)) {
++        auto error = Status::Error("WAL rotation failed; reopen required");
++        impl_->RecordStorageError(error);
++        return error;
++    }
++    impl_->imm_shards.resize(impl_->shards.size());
++    for (size_t shard_id = 0; shard_id < impl_->shards.size(); ++shard_id) {
++        std::lock_guard shard_lock(*impl_->shard_mutex[shard_id]);
++        impl_->imm_shards[shard_id] = std::move(impl_->shards[shard_id]);
++        impl_->shards[shard_id] = std::make_shared<ShardData>();
++    }
++    impl_->imm_bytes = impl_->memtable_bytes;
++    impl_->imm_hot_series_points = std::move(impl_->hot_series_points);
++    impl_->hot_series_points.clear();
++    impl_->points_since_flush = 0;
++    impl_->flush_inflight = true;
++    // 任何返回路径（含异常）都在持锁状态下结束在途标记并唤醒等待者。冻结层
++    // 只在成功发布后释放；失败时已记录存储错误，查询仍可读到冻结层。
++    struct InflightGuard {
++        Impl& impl;
++        ~InflightGuard() {
++            impl.flush_inflight = false;
++            impl.flush_state_cv.notify_all();
++            impl.write_cv.notify_all();
++        }
++    } inflight_guard{*impl_};
++
+     std::vector<std::shared_ptr<Job>> jobs;
+     for (size_t shard_id = 0; shard_id < impl_->shards.size(); ++shard_id) {
+         auto job = std::make_shared<Job>();
+         job->shard_id = shard_id;
+-        {
+-            std::lock_guard shard_lock(*impl_->shard_mutex[shard_id]);
+-            job->data = impl_->shards[shard_id];
+-        }
++        job->data = impl_->imm_shards[shard_id];
+         std::string filename = "shard-";
+         filename += shard_id < 10 ? "0" : "";
+         filename += std::to_string(shard_id);
+@@ -3103,11 +3201,26 @@ Status Engine::FlushLocked(bool incremental) {
+         jobs.push_back(std::move(job));
+     }
+ 
++    // ---- 锁外落盘：冻结层不可变，写入与查询可并发进行。------------------------
+     // The per-shard SSTables are independent, so the four writes run
+     // concurrently instead of rotating through one shard at a time.
++    lock.unlock();
++    {
++    struct Relock {
++        std::unique_lock<std::mutex>& lock;
++        ~Relock() { lock.lock(); }
++    } relock{lock};
+     std::vector<std::thread> writers;
++    struct Joiner {
++        std::vector<std::thread>& threads;
++        ~Joiner() {
++            for (auto& thread : threads) {
++                if (thread.joinable()) thread.join();
++            }
++        }
++    } joiner{writers};
+     for (const auto& job : jobs) {
+-        writers.emplace_back([this, job] {
++        writers.emplace_back([job, skip_through] {
+             SstableWriter writer;
+             if (!writer.Open(job->temp)) {
+                 job->status = Status::Error("cannot create SSTable");
+@@ -3115,7 +3228,7 @@ Status Engine::FlushLocked(bool incremental) {
+             }
+             for (const auto& [_, points] : job->data->series) {
+                 for (const auto& value : *points) {
+-                    if (value.version <= impl_->last_flushed_version) continue;
++                    if (value.version <= skip_through) continue;
+                     writer.Append(value.point.series_id,
+                                   value.point.timestamp_ms, value.point.value,
+                                   value.version);
+@@ -3158,20 +3271,28 @@ Status Engine::FlushLocked(bool incremental) {
+             job->written = true;
+         });
+     }
+-    for (auto& writer : writers) writer.join();
++    }  // joiner 先汇合全部写线程，relock 再取回全局锁。
+ 
++    // ---- 发布（持锁）--------------------------------------------------------
+     std::vector<std::filesystem::path> new_files;
+     std::vector<std::shared_ptr<SstableMetadata>> published_metadata;
+     for (const auto& job : jobs) {
+-        if (!job->status.ok) return job->status;
++        if (!job->status.ok) {
++            // 已写出的 SST 未进入 Manifest，由下次 Open 的孤儿清理回收；数据仍在
++            // 旧 WAL 段中。冻结层保留供查询读取，引擎随即进入故障状态。
++            impl_->RecordStorageError(job->status);
++            return job->status;
++        }
+         if (!job->written) continue;
+         new_files.push_back(job->file);
+         published_metadata.push_back(job->metadata);
+     }
++    if (!impl_->storage_error.ok) return impl_->storage_error;
++    // 只覆盖冻结点：冻结之后的提交位于新 WAL 段与可变 MemTable 中。
+     for (auto& covered : impl_->covered_commit_versions) {
+-        covered = impl_->next_version - 1;
++        covered = frozen_version;
+     }
+-    impl_->metadata_covered_commit_version = impl_->next_version - 1;
++    impl_->metadata_covered_commit_version = frozen_version;
+     impl_->current_files.insert(impl_->current_files.end(),
+                                 new_files.begin(), new_files.end());
+     auto status = impl_->PublishManifestLocked(impl_->current_files);
+@@ -3183,21 +3304,14 @@ Status Engine::FlushLocked(bool incremental) {
+     impl_->sstable_metadata.insert(impl_->sstable_metadata.end(),
+                                    published_metadata.begin(),
+                                    published_metadata.end());
+-    impl_->last_flushed_version = impl_->next_version - 1;
+-    impl_->points_since_flush = 0;
+-    impl_->hot_series_points.clear();
+-    impl_->ClearMemtableLocked();
++    impl_->last_flushed_version = frozen_version;
++    impl_->imm_shards.clear();
++    impl_->memtable_bytes -= std::min(impl_->memtable_bytes, impl_->imm_bytes);
++    impl_->imm_bytes = 0;
++    impl_->imm_hot_series_points.clear();
+     ++impl_->flush_count;
+-    impl_->write_cv.notify_all();
+-    // A failed directory sync can leave the next WAL name non-durable. Do not
+-    // acknowledge further writes to that fd even though this flush is durable.
+-    const bool rotated = impl_->sharded_wal ? impl_->RotateShardedWalLocked()
+-                                            : impl_->RotateWalLocked();
+-    if (!rotated) {
+-        auto error = Status::Error("WAL rotation failed; reopen required");
+-        impl_->RecordStorageError(error);
+-        return error;
+-    }
++    // Manifest 已覆盖冻结点之前的全部记录，旧 WAL 段可以删除。
++    impl_->RetireWalSegmentsLocked(retire);
+     return Status::Ok();
+ }
+ Status Engine::CompactRoundLocked(std::unique_lock<std::mutex>& lock,
+@@ -3248,8 +3362,8 @@ Status Engine::CompactRoundLocked(std::unique_lock<std::mutex>& lock,
+ }
+ 
+ Status Engine::Flush() {
+-    std::lock_guard lock(impl_->mutex);
+-    const auto status = FlushLocked(true);
++    std::unique_lock lock(impl_->mutex);
++    const auto status = FlushLocked(lock);
+     if (!status.ok) impl_->RecordStorageError(status);
+     impl_->write_cv.notify_all();
+     return status;
+@@ -3319,8 +3433,8 @@ Status Engine::Close() {
+     }
+     if (impl_->flush_worker.joinable()) impl_->flush_worker.join();
+     if (impl_->compaction_worker.joinable()) impl_->compaction_worker.join();
+-    std::lock_guard lock(impl_->mutex);
+-    auto status = FlushLocked(true);
++    std::unique_lock lock(impl_->mutex);
++    auto status = FlushLocked(lock);
+     // 关闭前回收已无查询引用的过期 / 被合并 SST。后台 GC 只在 Flush 或
+     // Compaction 之后运行；若最后一次 Compaction 时恰有查询持有旧文件，它们
+     // 会一直留到下次打开。存储错误时 GC 自行跳过；仍被存活游标引用或删除
+@@ -3430,6 +3544,9 @@ Status Engine::GetStats(EngineStats* stats) const {
+         stats->mutable_points += impl_->shards[i]->point_count();
+     }
+     stats->immutable_points = 0;
++    for (const auto& shard : impl_->imm_shards) {
++        if (shard) stats->immutable_points += shard->point_count();
++    }
+     stats->wal_bytes = wal_bytes;
+     stats->wal_bytes_replayed = impl_->wal_bytes_replayed;
+     stats->wal_syncs = impl_->wal_syncs;
+diff --git a/include/tsdb.h b/include/tsdb.h
+index 5dcf333..7ca8d30 100644
+--- a/include/tsdb.h
++++ b/include/tsdb.h
+@@ -181,7 +181,8 @@ public:
+ private:
+     struct Impl;
+     explicit Engine(std::shared_ptr<Impl> impl);
+-    Status FlushLocked(bool incremental = true);
++    // 调用时持有全局锁；SST 编码与 fsync 期间会临时释放，返回时重新持有。
++    Status FlushLocked(std::unique_lock<std::mutex>& lock);
+     Status CompactRoundLocked(std::unique_lock<std::mutex>& lock,
+                               size_t threshold);
+     // Shared so that a Cursor created by Scan can keep the engine state alive
+diff --git a/tests/tsdb_tests.cpp b/tests/tsdb_tests.cpp
+index 2640061..ec6ccbb 100644
+--- a/tests/tsdb_tests.cpp
++++ b/tests/tsdb_tests.cpp
+@@ -2121,8 +2121,14 @@ void TestVectorReplayFlushThreshold(const std::filesystem::path& path) {
+         });
+     }
+     testing::SetFaultHook({});
+-    AssertOk(engine->GetStats(&stats));
+     CHECK(notified);
++    // SST 在全局锁外写出，GetStats 不再被在途 Flush 阻塞：等待自动 Flush 发布。
++    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
++    do {
++        AssertOk(engine->GetStats(&stats));
++        if (stats.flush_count >= 1) break;
++        std::this_thread::sleep_for(std::chrono::milliseconds(1));
++    } while (std::chrono::steady_clock::now() < deadline);
+     CHECK(stats.flush_count >= 1);
+     std::unique_ptr<Cursor> cursor;
+     AssertOk(engine->Scan({8}, 0, 500, &cursor));
+@@ -3139,6 +3145,209 @@ void TestStatsDuringChurn(const std::filesystem::path& path) {
+     AssertOk(engine->Close());
+ }
+ 
++// WAL 目录下（含分片子目录）现存的段文件数。
++size_t WalSegmentCount(const std::filesystem::path& db) {
++    size_t count = 0;
++    for (const auto& entry : std::filesystem::recursive_directory_iterator(db / "wal")) {
++        if (entry.is_regular_file() && entry.path().extension() == ".log") ++count;
++    }
++    return count;
++}
++
++// 校验 series 1/2 恰为 [first, last] 的连续时间戳，值分别为 t 与 -t。
++void CheckTwoSeries(Engine* engine, int64_t first, int64_t last) {
++    std::unique_ptr<Cursor> cursor;
++    AssertOk(engine->Scan({1, 2}, 0, 1000000, &cursor));
++    const auto points = Read(cursor.get());
++    CHECK(points.size() == static_cast<size_t>(2 * (last - first + 1)));
++    size_t index = 0;
++    for (int64_t ts = first; ts <= last; ++ts) {
++        CHECK(points[index].series_id == 1 && points[index].timestamp_ms == ts &&
++              points[index].value == static_cast<double>(ts));
++        ++index;
++        CHECK(points[index].series_id == 2 && points[index].timestamp_ms == ts &&
++              points[index].value == -static_cast<double>(ts));
++        ++index;
++    }
++}
++
++void WriteTwoSeries(Engine* engine, int64_t first, int64_t last) {
++    for (int64_t ts = first; ts <= last; ++ts) {
++        AssertOk(engine->WriteBatch(
++            {{1, ts, static_cast<double>(ts)}, {2, ts, -static_cast<double>(ts)}}));
++    }
++}
++
++// 锁外 Flush：SST 写出期间（冻结层落盘中）写入、查询、统计都不被阻塞；
++// 过期等待在途 Flush 发布；发布后冻结层释放、旧 WAL 段删除；重启数据一致。
++void TestFlushOutsideLock(const std::filesystem::path& path, bool sharded) {
++    Options options;
++    options.shard_count = 2;
++    options.enable_background_compaction = false;
++    options.sharded_wal = sharded;
++    Status status;
++    auto engine = Engine::Open(path, options, &status);
++    AssertOk(status);
++    WriteTwoSeries(engine.get(), 1, 100);
++
++    std::mutex hook_mutex;
++    std::condition_variable hook_cv;
++    bool reached = false;
++    bool release = false;
++    testing::SetFaultHook([&](const char* stage) {
++        if (std::strcmp(stage, "sstable_before_rename") != 0) return;
++        std::unique_lock lock(hook_mutex);
++        reached = true;
++        hook_cv.notify_all();
++        hook_cv.wait(lock, [&] { return release; });
++    });
++    Status flush_status = Status::Error("flush not run");
++    std::thread flusher([&] { flush_status = engine->Flush(); });
++    bool flush_reached = false;
++    {
++        std::unique_lock lock(hook_mutex);
++        flush_reached = hook_cv.wait_for(lock, std::chrono::seconds(5), [&] { return reached; });
++    }
++
++    // 旧实现在 SST 写出与 fsync 期间持有全局锁，这里的写入会一直阻塞。
++    std::atomic<bool> writes_done{false};
++    std::thread writer([&] {
++        WriteTwoSeries(engine.get(), 101, 150);
++        writes_done = true;
++    });
++    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
++    while (!writes_done.load() && std::chrono::steady_clock::now() < deadline) {
++        std::this_thread::sleep_for(std::chrono::milliseconds(1));
++    }
++    const bool writes_progressed = writes_done.load();
++    EngineStats during{};
++    bool scan_ok = false;
++    if (writes_progressed) {
++        // 查询同时读冻结层（1..100）与新的可变层（101..150）。
++        CheckTwoSeries(engine.get(), 1, 150);
++        scan_ok = true;
++        AssertOk(engine->GetStats(&during));
++    }
++    std::atomic<bool> expired{false};
++    Status expire_status = Status::Error("expire not run");
++    std::thread expirer([&] {
++        expire_status = engine->ExpireBefore(51);
++        expired = true;
++    });
++    std::this_thread::sleep_for(std::chrono::milliseconds(100));
++    const bool expire_waited = !expired.load();
++    {
++        std::lock_guard lock(hook_mutex);
++        release = true;
++    }
++    hook_cv.notify_all();
++    flusher.join();
++    writer.join();
++    expirer.join();
++    testing::SetFaultHook({});
++
++    CHECK(flush_reached);
++    CHECK(writes_progressed && scan_ok);
++    CHECK(during.flush_count == 0 && during.immutable_points == 200 &&
++          during.mutable_points == 100);
++    CHECK(expire_waited);
++    AssertOk(flush_status);
++    AssertOk(expire_status);
++    EngineStats after{};
++    AssertOk(engine->GetStats(&after));
++    CHECK(after.flush_count == 1 && after.immutable_points == 0 &&
++          after.mutable_points == 100);
++    CheckTwoSeries(engine.get(), 51, 150);
++    // Manifest 发布后旧段已删：只剩冻结时打开的新段（分片模式每个目录一段）。
++    CHECK(WalSegmentCount(path) == (sharded ? options.shard_count + 1 : 1));
++    AssertOk(engine->Close());
++
++    engine = Engine::Open(path, options, &status);
++    AssertOk(status);
++    CheckTwoSeries(engine.get(), 51, 150);
++    CHECK(SstFilesOnDisk(path) == SstFilesInManifest(path));
++    WriteTwoSeries(engine.get(), 151, 160);
++    AssertOk(engine->Close());
++    engine = Engine::Open(path, options, &status);
++    AssertOk(status);
++    CheckTwoSeries(engine.get(), 51, 160);
++    AssertOk(engine->Close());
++}
++
++// 冻结后、发布前后的真实进程退出：冻结层（旧 WAL 段）与冻结后已确认的写入
++// （新 WAL 段）都必须恢复；未发布的 SST 被清理，已发布但旧段未删的重复点去重。
++void TestCrashDuringUnlockedFlush(const std::filesystem::path& root) {
++    const char* stages[] = {"sstable_before_rename", "sstable_after_rename",
++                            "flush_after_manifest"};
++    size_t case_index = 0;
++    for (const bool sharded : {false, true}) {
++        for (const char* stage : stages) {
++            const auto path = root / ("case-" + std::to_string(case_index++));
++            Options options;
++            options.shard_count = 2;
++            options.enable_background_compaction = false;
++            options.sharded_wal = sharded;
++            const pid_t pid = fork();
++            CHECK(pid >= 0);
++            if (pid == 0) {
++                Status status;
++                auto engine = Engine::Open(path, options, &status);
++                if (!status.ok) _exit(2);
++                // 先发布一次 Manifest，使崩溃发生在「已有 Manifest」的常态库上。
++                WriteTwoSeries(engine.get(), 1, 20);
++                if (!engine->Flush().ok) _exit(3);
++                WriteTwoSeries(engine.get(), 21, 100);
++                std::mutex hook_mutex;
++                std::condition_variable hook_cv;
++                bool reached = false;
++                bool second_batch_acked = false;
++                const std::string target = stage;
++                testing::SetFaultHook([&](const char* current) {
++                    const std::string name = current;
++                    if (name == "sstable_before_rename") {
++                        std::unique_lock lock(hook_mutex);
++                        reached = true;
++                        hook_cv.notify_all();
++                        // 有界等待：旧实现持锁时写入无法推进，最终丢失第二批。
++                        hook_cv.wait_for(lock, std::chrono::seconds(3),
++                                         [&] { return second_batch_acked; });
++                    }
++                    if (name == target) _exit(0);
++                });
++                std::thread flusher([&] { (void)engine->Flush(); });
++                {
++                    std::unique_lock lock(hook_mutex);
++                    hook_cv.wait(lock, [&] { return reached; });
++                }
++                WriteTwoSeries(engine.get(), 101, 150);
++                {
++                    std::lock_guard lock(hook_mutex);
++                    second_batch_acked = true;
++                }
++                hook_cv.notify_all();
++                flusher.join();
++                _exit(5);  // 目标阶段未命中
++            }
++            int child_status = 0;
++            CHECK(waitpid(pid, &child_status, 0) == pid);
++            CHECK(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
++            Status status;
++            auto engine = Engine::Open(path, options, &status);
++            AssertOk(status);
++            CHECK(SstFilesOnDisk(path) == SstFilesInManifest(path));
++            CheckTwoSeries(engine.get(), 1, 150);
++            WriteTwoSeries(engine.get(), 151, 160);
++            AssertOk(engine->Flush());
++            AssertOk(engine->Close());
++            engine = Engine::Open(path, options, &status);
++            AssertOk(status);
++            CheckTwoSeries(engine.get(), 1, 160);
++            CHECK(SstFilesOnDisk(path) == SstFilesInManifest(path));
++            AssertOk(engine->Close());
++        }
++    }
++}
++
+ // 空闲引擎不应周期性唤醒：原写协调线程每 200 µs 超时一次并争抢全局锁。
+ void TestIdleCoordinatorSleeps(const std::filesystem::path& path) {
+     Status status;
+@@ -3242,6 +3451,9 @@ int main(int argc, char** argv) {
+         {"expire_prunes_write_tracking", [&] { RunWithTimeout([&] { TestExpirePrunesWriteTracking(root / "expire_tracking"); }); }},
+         {"stats_during_churn", [&] { RunWithTimeout([&] { TestStatsDuringChurn(root / "stats_churn"); }); }},
+         {"idle_coordinator_sleeps", [&] { RunWithTimeout([&] { TestIdleCoordinatorSleeps(root / "idle_coordinator"); }); }},
++        {"flush_outside_lock", [&] { RunWithTimeout([&] { TestFlushOutsideLock(root / "flush_unlocked", false); }); }},
++        {"flush_outside_lock_sharded", [&] { RunWithTimeout([&] { TestFlushOutsideLock(root / "flush_unlocked_sharded", true); }); }},
++        {"crash_during_unlocked_flush", [&] { RunWithTimeout([&] { TestCrashDuringUnlockedFlush(root / "flush_unlocked_crash"); }); }},
+     };
+     const std::string filter = argc > 1 ? argv[1] : std::string();
+     size_t ran = 0;

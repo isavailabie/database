@@ -142,6 +142,23 @@ FD 预算、低干扰统计、持久化索引）逐项复核后也因风险/复�
 [`doc/性能优化-迭代-2026-11-25.md`](doc/性能优化-迭代-2026-11-25.md) §6，
 原始指标见 `doc/performance-results-round3-*.json`。
 
+## 第 4 轮：锁外 Flush 实测（2026-11-25）
+
+把「Flush 全程持全局锁」拆成「冻结 / 锁外落盘 / 发布」：冻结时先切到新 WAL 段，
+旧段等 MANIFEST 发布后再删除；covered version 只推进到冻结点。方案已完整实现，
+TSan、新增的 3 个崩溃与并发用例、三套 CTest 全部通过，但千万点 A/B 两组会话
+（3 + 5 轮）的主指标没有可重复收益：mixed 写吞吐 −0.56%，uniform 导入 −1.57%
+（两组方向相反），hot 导入 −7.26% 但被离群值主导。只有导入写入 p99 稳定下降
+40–49%。原因是单盘上锁外写 SST 与 WAL fsync 争用磁盘：Flush 总耗时 +12%、
+WAL 同步 +13%；把锁外阶段改成单线程反而更慢。按既定口径**不合入**，补丁保存在
+`doc/candidates/round4-unlocked-flush.patch`，留待 WAL 独立盘环境复测。
+
+同轮修复并提交一个基线就有的问题：`shard_stopping` 原为 `vector<bool>`，`Close` 不持
+分片锁就写入。这是数据竞争（TSan 报 24 条），也可能丢失唤醒，使 Close 卡住。
+现在改为逐字节存储并在 `shard_mutex[i]` 下写入：TSan 零警告，三套 CTest 各 5/5，
+Release 连续 10 轮通过，性能在噪声内。详见
+[`doc/性能优化-迭代-2026-11-25.md`](doc/性能优化-迭代-2026-11-25.md) §7。
+
 ## 基准
 
 可复现的评测由 `benchmark/runner.py` 驱动，目录结构与课程 benchmark 一致：

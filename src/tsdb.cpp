@@ -943,7 +943,9 @@ struct Engine::Impl {
     std::vector<std::unique_ptr<std::condition_variable>> shard_cv;
     std::vector<std::deque<std::shared_ptr<ShardFragment>>> shard_queue;
     std::vector<std::thread> shard_worker;
-    std::vector<bool> shard_stopping;
+    // 每个分片 worker 的停止标志，只在 shard_mutex[i] 下读写。不用
+    // vector<bool>：按位打包会让相邻分片的标志落在同一字节上互相竞争。
+    std::vector<unsigned char> shard_stopping;
     std::mutex ack_mutex;
     std::condition_variable ack_cv;
     size_t inflight_fragments{0};
@@ -2447,7 +2449,7 @@ std::unique_ptr<Engine> Engine::Open(const std::filesystem::path& path,
     impl->shard_mutex.resize(options.shard_count);
     impl->shard_cv.resize(options.shard_count);
     impl->shard_queue.resize(options.shard_count);
-    impl->shard_stopping.assign(options.shard_count, false);
+    impl->shard_stopping.assign(options.shard_count, 0);
     for (size_t i = 0; i < options.shard_count; ++i) {
         impl->shard_mutex[i] = std::make_unique<std::mutex>();
         impl->shard_cv[i] = std::make_unique<std::condition_variable>();
@@ -3303,12 +3305,14 @@ Status Engine::Close() {
     // shard workers be told to stop, otherwise a fragment could be queued for a
     // worker that has already exited.
     if (impl_->write_worker.joinable()) impl_->write_worker.join();
-    {
-        std::lock_guard lock(impl_->mutex);
-        for (size_t i = 0; i < impl_->shard_stopping.size(); ++i) {
-            impl_->shard_stopping[i] = true;
-            impl_->shard_cv[i]->notify_all();
+    // 停止标志必须在对应的 shard_mutex 下写入：worker 在该锁下检查谓词后
+    // 才进入等待，若不持锁写入，既是数据竞争，也可能丢失唤醒导致 Close 卡住。
+    for (size_t i = 0; i < impl_->shard_stopping.size(); ++i) {
+        {
+            std::lock_guard shard_lock(*impl_->shard_mutex[i]);
+            impl_->shard_stopping[i] = 1;
         }
+        impl_->shard_cv[i]->notify_all();
     }
     for (auto& worker : impl_->shard_worker) {
         if (worker.joinable()) worker.join();
