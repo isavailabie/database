@@ -1,6 +1,7 @@
 #include "tsdb.h"
 #include "../benchmarks/bench_util.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -129,6 +130,148 @@ void TestWriteScanAndAtomicValidation(const std::filesystem::path& path) {
     CHECK(points.size() == 2);
     CHECK(points[0].series_id == 2 && points[1].series_id == 1);
     AssertOk(engine->Close());
+}
+
+// 课程要求 F1：「不满足时间戳顺序或过期边界要求的写入返回错误；批次校验失败时
+// 整批不生效」。集中覆盖：批内 / 跨批 / 重复时间戳；过期边界（含恰好等于
+// cutoff）；失败批次中合法序列的点同样不可见、不消耗版本号、不更新递增跟踪、
+// 不进入 WAL；重启后（数据分别位于 SST 与仅位于 WAL）校验状态仍成立；
+// 多写者并发写同一序列时，按提交版本排序的时间戳仍严格递增。
+void TestWriteValidationContract(const std::filesystem::path& path) {
+    const Options options{.shard_count = 4, .memtable_max_points = 1000000,
+                          .enable_background_compaction = false};
+    auto visible = [](Engine* engine) {
+        std::unique_ptr<Cursor> cursor;
+        AssertOk(engine->Scan({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}, 0, 100000,
+                              &cursor));
+        return Read(cursor.get());
+    };
+    const auto db = path / "db";
+    {
+        Status status;
+        auto engine = Engine::Open(db, options, &status);
+        AssertOk(status);
+        CommitVersion version = 0;
+        AssertOk(engine->WriteBatch({{1, 100, 1.0}, {2, 100, 1.0}}, &version));
+        CHECK(version == 1);
+
+        // 跨批：更小、相等（重复的 (series_id, timestamp)）都拒绝。
+        CHECK(!engine->Put({1, 50, 0.0}).ok);
+        CHECK(!engine->Put({1, 100, 0.0}).ok);
+        // 批内：同一序列不严格递增（相等或回退）拒绝。
+        CHECK(!engine->WriteBatch({{1, 200, 0.0}, {1, 200, 0.0}}).ok);
+        CHECK(!engine->WriteBatch({{1, 300, 0.0}, {1, 250, 0.0}}).ok);
+        // 混合批次：前三个点合法，最后一个违规，整批都不可见。
+        CHECK(!engine->WriteBatch(
+                   {{3, 10, 0.0}, {4, 10, 0.0}, {2, 500, 0.0}, {1, 90, 0.0}})
+                   .ok);
+        CHECK(visible(engine.get()).size() == 2);
+        // 失败批次既不消耗版本号，也不推进递增跟踪：2 仍可写 300（< 500）。
+        AssertOk(engine->Put({2, 300, 1.0}, &version));
+        CHECK(version == 2);
+        AssertOk(engine->Put({3, 10, 1.0}, &version));
+        CHECK(version == 3);
+        // 递增只针对同一序列：批内不同序列之间的时间戳无顺序要求。
+        AssertOk(engine->WriteBatch({{5, 1000, 1.0}, {6, 10, 1.0}}, &version));
+        CHECK(version == 4);
+
+        // 过期边界：小于 cutoff 拒绝，恰好等于 cutoff 允许。
+        AssertOk(engine->ExpireBefore(150, &version));
+        CHECK(version == 5);
+        CHECK(!engine->Put({7, 149, 0.0}).ok);
+        AssertOk(engine->Put({7, 150, 1.0}, &version));
+        CHECK(version == 6);
+        // 批内一个点早于 cutoff，整批拒绝，合法序列 8 也不生效。
+        CHECK(!engine->WriteBatch({{8, 200, 0.0}, {9, 100, 0.0}}).ok);
+        AssertOk(engine->Put({8, 160, 1.0}, &version));
+        CHECK(version == 7);
+        // 过期边界只能前进；相同边界幂等。
+        CHECK(!engine->ExpireBefore(100).ok);
+        AssertOk(engine->ExpireBefore(150));
+        AssertOk(engine->Flush());  // 以上数据进入 SST
+        AssertOk(engine->Close());
+    }
+
+    // 子进程只写 WAL 后异常退出：重启时这两条只能从 WAL 重放得到。
+    const pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        Status status;
+        auto engine = Engine::Open(db, options, &status);
+        if (!status.ok) _exit(2);
+        if (!engine->Put({2, 400, 1.0}).ok) _exit(3);
+        if (!engine->Put({11, 1000, 1.0}).ok) _exit(4);
+        if (engine->Put({11, 999, 0.0}).ok) _exit(5);
+        _exit(0);
+    }
+    int child_status = 0;
+    waitpid(pid, &child_status, 0);
+    CHECK(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
+
+    {
+        Status status;
+        auto engine = Engine::Open(db, options, &status);
+        AssertOk(status);
+        CHECK(!engine->Put({2, 400, 0.0}).ok);    // 来自 WAL 重放
+        CHECK(!engine->Put({2, 350, 0.0}).ok);
+        CHECK(!engine->Put({11, 1000, 0.0}).ok);  // 来自 WAL 重放
+        CHECK(!engine->Put({8, 160, 0.0}).ok);    // 来自 SST 索引
+        CHECK(!engine->Put({5, 1000, 0.0}).ok);   // 来自 SST 索引
+        CHECK(!engine->Put({7, 149, 0.0}).ok);    // cutoff 持久化
+        CHECK(!engine->WriteBatch({{2, 500, 0.0}, {11, 999, 0.0}}).ok);
+        AssertOk(engine->Put({2, 401, 1.0}));
+        const auto points = visible(engine.get());
+        const std::vector<std::pair<int64_t, uint64_t>> expected{
+            {150, 7}, {160, 8}, {300, 2}, {400, 2}, {401, 2}, {1000, 5}, {1000, 11}};
+        CHECK(points.size() == expected.size());
+        for (size_t i = 0; i < expected.size(); ++i) {
+            CHECK(points[i].timestamp_ms == expected[i].first &&
+                  points[i].series_id == expected[i].second);
+        }
+        AssertOk(engine->Close());
+    }
+
+    // 4 个写者交错写同一序列：校验同时看已提交与排队中的批次，因此被接受的
+    // 写入按提交版本排序后时间戳严格递增，且全部可见、没有重复。
+    {
+        Status status;
+        auto engine = Engine::Open(path / "concurrent", options, &status);
+        AssertOk(status);
+        std::mutex mutex;
+        std::vector<std::pair<CommitVersion, int64_t>> accepted;
+        std::atomic<size_t> rejected{0};
+        std::vector<std::thread> writers;
+        for (int64_t writer = 0; writer < 4; ++writer) {
+            writers.emplace_back([&, writer] {
+                for (int64_t i = 0; i < 200; ++i) {
+                    const int64_t timestamp = i * 4 + writer;
+                    CommitVersion version = 0;
+                    if (engine->Put({42, timestamp, 1.0}, &version).ok) {
+                        std::lock_guard lock(mutex);
+                        accepted.emplace_back(version, timestamp);
+                    } else {
+                        ++rejected;
+                    }
+                }
+            });
+        }
+        for (auto& writer : writers) writer.join();
+        CHECK(!accepted.empty());
+        CHECK(accepted.size() + rejected.load() == 800);
+        std::sort(accepted.begin(), accepted.end());
+        for (size_t i = 1; i < accepted.size(); ++i) {
+            CHECK(accepted[i].first > accepted[i - 1].first);
+            CHECK(accepted[i].second > accepted[i - 1].second);
+        }
+        std::unique_ptr<Cursor> cursor;
+        AssertOk(engine->Scan({42}, 0, 100000, &cursor));
+        const auto points = Read(cursor.get());
+        CHECK(points.size() == accepted.size());
+        for (size_t i = 0; i < points.size(); ++i) {
+            CHECK(points[i].timestamp_ms == accepted[i].second);
+        }
+        AssertOk(engine->Close());
+    }
 }
 
 void TestReadViewAndExpiration(const std::filesystem::path& path) {
@@ -3174,6 +3317,7 @@ int main(int argc, char** argv) {
         {"aggregate_invalid_output", [&] { TestAggregateInvalidOutput(root / "aggregate_invalid"); }},
         {"timestamp_encoding", [&] { TestTimestampEncodingRoundTrip(); }},
         {"write_scan_atomic", [&] { TestWriteScanAndAtomicValidation(root / "atomic"); }},
+        {"write_validation_contract", [&] { RunWithTimeout([&] { TestWriteValidationContract(root / "write_validation"); }); }},
         {"readview_expiration", [&] { TestReadViewAndExpiration(root / "views"); }},
         {"recovery", [&] { TestRecovery(root / "recovery"); }},
         {"concurrent_group_commit", [&] { TestConcurrentGroupCommit(root / "group_commit"); }},
